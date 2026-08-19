@@ -4,11 +4,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.core.Ordered;
 import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.core.annotation.Order;
 import org.springframework.util.ClassUtils;
 import org.springframework.util.ReflectionUtils;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 
 /**
@@ -30,7 +37,9 @@ public class DisruptorListenerRegistrar implements SmartInitializingSingleton {
 
     @Override
     public void afterSingletonsInstantiated() {
-        int count = 0;
+        // 先收集全部标注方法，再按事件类型分组、组内按 @Order 升序，最后依次注册，
+        // 使 ConsumerRegistry 的追加顺序 = 期望调用顺序。
+        Map<Class<?>, List<ListenerMethod>> grouped = new LinkedHashMap<>();
         for (String beanName : beanFactory.getBeanDefinitionNames()) {
             if (beanFactory.getBeanDefinition(beanName).isAbstract()) {
                 continue;
@@ -49,11 +58,29 @@ public class DisruptorListenerRegistrar implements SmartInitializingSingleton {
                 }
                 Class<?> eventType = method.getParameterTypes()[0];
                 Object bean = beanFactory.getBean(beanName);
-                register(eventType, bean, method);
+                grouped.computeIfAbsent(eventType, k -> new ArrayList<>())
+                        .add(new ListenerMethod(bean, method, orderOf(method)));
+            }
+        }
+
+        int count = 0;
+        for (Map.Entry<Class<?>, List<ListenerMethod>> entry : grouped.entrySet()) {
+            List<ListenerMethod> methods = entry.getValue();
+            methods.sort(Comparator.comparingInt(ListenerMethod::order));
+            for (ListenerMethod lm : methods) {
+                register(entry.getKey(), lm.bean(), lm.method());
                 count++;
             }
         }
         log.debug("已注册 {} 个 @DisruptorListener 监听方法", count);
+    }
+
+    private static int orderOf(Method method) {
+        Order order = AnnotatedElementUtils.findMergedAnnotation(method, Order.class);
+        return order != null ? order.value() : Ordered.LOWEST_PRECEDENCE;
+    }
+
+    private record ListenerMethod(Object bean, Method method, int order) {
     }
 
     @SuppressWarnings("unchecked")

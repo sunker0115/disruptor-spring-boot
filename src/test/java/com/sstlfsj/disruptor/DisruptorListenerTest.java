@@ -54,4 +54,45 @@ class DisruptorListenerTest {
             assertEquals("A-1", AUTO_RECEIVED.get());
         });
     }
+
+    static final java.util.List<String> ORDER_TRACE = new java.util.concurrent.CopyOnWriteArrayList<>();
+    static final CountDownLatch ORDER_LATCH = new CountDownLatch(2);
+
+    public record PayEvent(String id) {
+    }
+
+    @Configuration
+    static class OrderedConfig {
+        @Bean
+        OrderedListeners orderedListeners() {
+            return new OrderedListeners();
+        }
+    }
+
+    static class OrderedListeners {
+        @DisruptorListener
+        @org.springframework.core.annotation.Order(2)
+        public void second(PayEvent e) {
+            ORDER_TRACE.add("second");
+            ORDER_LATCH.countDown();
+        }
+
+        @DisruptorListener
+        @org.springframework.core.annotation.Order(1)
+        public void first(PayEvent e) {
+            ORDER_TRACE.add("first");
+            ORDER_LATCH.countDown();
+        }
+    }
+
+    @Test
+    void listenersRunInOrderAnnotationSequence() {
+        runner.withUserConfiguration(OrderedConfig.class).run(ctx -> {
+            EventPublisher publisher = ctx.getBean(EventPublisher.class);
+            publisher.publish(new PayEvent("P-1"));
+            assertTrue(ORDER_LATCH.await(3, TimeUnit.SECONDS), "两个监听器都应被调用");
+            assertEquals(java.util.List.of("first", "second"), ORDER_TRACE,
+                    "应按 @Order 升序调用：first(1) 先于 second(2)");
+        });
+    }
 }
