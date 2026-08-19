@@ -98,4 +98,36 @@ class DisruptorListenerTest {
                     "应按 @Order 升序调用：order1(@Order 1) 先于 order2(@Order 2)，与方法名/声明序相反");
         });
     }
+
+    @Configuration
+    static class InvalidSignatureConfig {
+        @Bean
+        InvalidListener invalidListener() {
+            return new InvalidListener();
+        }
+    }
+
+    static class InvalidListener {
+        @DisruptorListener
+        public void twoArgs(OrderEvent e, String extra) {
+        }
+    }
+
+    @Test
+    void nonSingleParamMethodFailsFast() {
+        runner.withUserConfiguration(InvalidSignatureConfig.class).run(ctx ->
+                org.junit.jupiter.api.Assertions.assertTrue(
+                        ctx.getStartupFailure() != null
+                                && hasIllegalStateInChain(ctx.getStartupFailure()),
+                        "非单参数 @DisruptorListener 方法应导致启动失败(IllegalStateException)"));
+    }
+
+    private static boolean hasIllegalStateInChain(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof IllegalStateException) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

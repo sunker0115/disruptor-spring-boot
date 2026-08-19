@@ -56,6 +56,11 @@ public class DisruptorListenerRegistrar implements SmartInitializingSingleton {
                 if (AnnotatedElementUtils.findMergedAnnotation(method, DisruptorListener.class) == null) {
                     continue;
                 }
+                if (method.getParameterCount() != 1) {
+                    throw new IllegalStateException(
+                            "@DisruptorListener 方法必须恰好一个参数：" + method.getDeclaringClass().getName()
+                                    + "#" + method.getName() + " 有 " + method.getParameterCount() + " 个参数");
+                }
                 Class<?> eventType = method.getParameterTypes()[0];
                 Object bean = beanFactory.getBean(beanName);
                 grouped.computeIfAbsent(eventType, k -> new ArrayList<>())
