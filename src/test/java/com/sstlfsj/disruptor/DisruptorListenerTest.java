@@ -69,18 +69,21 @@ class DisruptorListenerTest {
         }
     }
 
+    // 方法名的字母序与声明顺序都故意与 @Order 期望顺序相反（aaa 名靠前且先声明但 @Order=2 应后执行，
+    // zzz 名靠后且后声明但 @Order=1 应先执行），确保「无排序」时无论 getMethods 按字母序还是声明序
+    // 都会得到 ["order2","order1"] 而失败，只有 @Order 排序生效才得到期望的 ["order1","order2"]。
     static class OrderedListeners {
         @DisruptorListener
         @org.springframework.core.annotation.Order(2)
-        public void second(PayEvent e) {
-            ORDER_TRACE.add("second");
+        public void aaa(PayEvent e) {
+            ORDER_TRACE.add("order2");
             ORDER_LATCH.countDown();
         }
 
         @DisruptorListener
         @org.springframework.core.annotation.Order(1)
-        public void first(PayEvent e) {
-            ORDER_TRACE.add("first");
+        public void zzz(PayEvent e) {
+            ORDER_TRACE.add("order1");
             ORDER_LATCH.countDown();
         }
     }
@@ -91,8 +94,8 @@ class DisruptorListenerTest {
             EventPublisher publisher = ctx.getBean(EventPublisher.class);
             publisher.publish(new PayEvent("P-1"));
             assertTrue(ORDER_LATCH.await(3, TimeUnit.SECONDS), "两个监听器都应被调用");
-            assertEquals(java.util.List.of("first", "second"), ORDER_TRACE,
-                    "应按 @Order 升序调用：first(1) 先于 second(2)");
+            assertEquals(java.util.List.of("order1", "order2"), ORDER_TRACE,
+                    "应按 @Order 升序调用：order1(@Order 1) 先于 order2(@Order 2)，与方法名/声明序相反");
         });
     }
 }
