@@ -84,6 +84,7 @@ public class OrderSubscriber {
 ```
 
 - **参数校验**：方法参数数不为 1 时，应用启动即失败（fail-fast），不会静默不生效。
+- **仅 public 方法**：只有 public 方法上的 `@DisruptorListener` 会被识别；标在非 public 方法上不生效（也不报错）。
 - **与命令式混用**：`@Order` 只保证注解监听器之间的相对顺序；注解式与命令式 `subscribe`
   混用时，两者的相对先后不保证（命令式按运行时调用时机注册）。
 - **GraalVM native image**：`@DisruptorListener` 已用 Spring `@Reflective` 元注解标注，
