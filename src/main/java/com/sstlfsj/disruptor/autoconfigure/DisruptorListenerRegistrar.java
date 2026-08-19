@@ -1,5 +1,7 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.autoconfigure;
 
+import com.sstlfsj.disruptor.event.ConsumerRegistry;
+import com.sstlfsj.disruptor.event.DisruptorListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;

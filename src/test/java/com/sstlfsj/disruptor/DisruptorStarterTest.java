@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor;
 
-import com.sstlfsj.disruptor.config.DisruptorProperties;
+import com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration;
+import com.sstlfsj.disruptor.autoconfigure.DisruptorProperties;
 import com.sstlfsj.disruptor.event.ConsumerRegistry;
 import com.sstlfsj.disruptor.event.EventPublisher;
 import org.junit.jupiter.api.Test;

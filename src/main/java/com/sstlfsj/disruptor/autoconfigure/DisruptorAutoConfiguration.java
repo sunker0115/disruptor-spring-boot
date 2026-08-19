@@ -1,14 +1,12 @@
-package com.sstlfsj.disruptor;
+package com.sstlfsj.disruptor.autoconfigure;
 
 import com.lmax.disruptor.EventFactory;
 import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.WaitStrategy;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
-import com.sstlfsj.disruptor.config.DisruptorProperties;
 import com.sstlfsj.disruptor.event.ConsumerRegistry;
 import com.sstlfsj.disruptor.event.DefaultConsumerRegistry;
-import com.sstlfsj.disruptor.event.DisruptorListenerRegistrar;
 import com.sstlfsj.disruptor.event.EventPublisher;
 import com.sstlfsj.disruptor.event.EventWrapper;
 import com.sstlfsj.disruptor.event.LoggingExceptionHandler;

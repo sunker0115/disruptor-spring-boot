@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor;
+package com.sstlfsj.disruptor.autoconfigure;
 
 import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;

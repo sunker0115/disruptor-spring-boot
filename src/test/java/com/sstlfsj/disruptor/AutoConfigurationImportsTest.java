@@ -1,5 +1,6 @@
 package com.sstlfsj.disruptor;
 
+import com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;

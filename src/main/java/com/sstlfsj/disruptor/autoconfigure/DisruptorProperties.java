@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.config;
+package com.sstlfsj.disruptor.autoconfigure;
 
 import com.lmax.disruptor.BlockingWaitStrategy;
 import com.lmax.disruptor.BusySpinWaitStrategy;
