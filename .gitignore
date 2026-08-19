@@ -1,0 +1,13 @@
+# 构建产物
+target/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# 任务输入元数据（非项目代码）
+inputs.json
