@@ -8,10 +8,12 @@ import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.config.DisruptorProperties;
 import com.sstlfsj.disruptor.event.ConsumerRegistry;
 import com.sstlfsj.disruptor.event.DefaultConsumerRegistry;
+import com.sstlfsj.disruptor.event.DisruptorListenerRegistrar;
 import com.sstlfsj.disruptor.event.EventPublisher;
 import com.sstlfsj.disruptor.event.EventWrapper;
 import com.sstlfsj.disruptor.event.LoggingExceptionHandler;
 import com.sstlfsj.disruptor.event.RingBufferEventPublisher;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -94,5 +96,12 @@ public class DisruptorAutoConfiguration {
     @ConditionalOnMissingBean
     public EventPublisher eventPublisher(Disruptor<EventWrapper> disruptor) {
         return new RingBufferEventPublisher(disruptor.getRingBuffer());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public DisruptorListenerRegistrar disruptorListenerRegistrar(ConsumerRegistry consumerRegistry,
+                                                                 ConfigurableListableBeanFactory beanFactory) {
+        return new DisruptorListenerRegistrar(consumerRegistry, beanFactory);
     }
 }
