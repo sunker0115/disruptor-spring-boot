@@ -1,5 +1,6 @@
 package com.sstlfsj.disruptor.event;
 
+import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.RingBuffer;
 
 /**
@@ -21,6 +22,27 @@ public class RingBufferEventPublisher implements EventPublisher {
     @Override
     public void publish(Object event) {
         long sequence = ringBuffer.next();
+        writeAndPublish(sequence, event);
+    }
+
+    @Override
+    public boolean tryPublish(Object event) {
+        long sequence;
+        try {
+            sequence = ringBuffer.tryNext();
+        } catch (InsufficientCapacityException e) {
+            return false;
+        }
+        writeAndPublish(sequence, event);
+        return true;
+    }
+
+    @Override
+    public long remainingCapacity() {
+        return ringBuffer.remainingCapacity();
+    }
+
+    private void writeAndPublish(long sequence, Object event) {
         try {
             EventWrapper wrapper = ringBuffer.get(sequence);
             wrapper.setPayload(event);
