@@ -6,6 +6,7 @@
 ## 特性
 
 - **零配置自动装配**：引入依赖即提供 `EventPublisher`、`ConsumerRegistry` 两个 bean，无需 `@Enable` 注解。
+- **声明式监听**：在任意 Spring bean 的方法上加 `@DisruptorListener`，容器启动时自动注册，用法对齐 Spring `@EventListener`。
 - **非阻塞发布**：`publish` 写入 RingBuffer 后立即返回，由后台消费线程异步派发。
 - **按运行时类型路由**：事件按 `getClass()` 精确匹配分发；同一类型可注册多个消费者。
 - **异常隔离**：单个消费者抛异常只记日志并跳过，不影响同类型其它消费者，消费线程不会因此终止。
@@ -59,6 +60,34 @@ public class OrderEventSubscriber {
     }
 }
 ```
+
+### 3.1 声明式监听（推荐）
+
+除手动 `subscribe`，也可在任意 Spring bean 的方法上加 `@DisruptorListener`，容器启动时自动注册。
+方法必须恰好一个参数，参数类型即监听的事件类型：
+
+```java
+@Component
+public class OrderSubscriber {
+
+    @DisruptorListener
+    public void onOrder(OrderCreatedEvent e) {
+        // 处理下单事件
+    }
+
+    @DisruptorListener
+    @Order(1)                 // 同类型多监听器时，值越小越先调用
+    public void audit(OrderCreatedEvent e) {
+        // 审计
+    }
+}
+```
+
+- **参数校验**：方法参数数不为 1 时，应用启动即失败（fail-fast），不会静默不生效。
+- **与命令式混用**：`@Order` 只保证注解监听器之间的相对顺序；注解式与命令式 `subscribe`
+  混用时，两者的相对先后不保证（命令式按运行时调用时机注册）。
+- **GraalVM native image**：`@DisruptorListener` 已用 Spring `@Reflective` 元注解标注，
+  Spring AOT 会在构建期自动注册反射 hints，native 镜像下无需额外配置。
 
 ### 4. 发布事件
 
@@ -124,3 +153,5 @@ public ConsumerRegistry consumerRegistry() {
     return new MyCustomConsumerRegistry();
 }
 ```
+
+> 自动装配还提供 `DisruptorListenerRegistrar`（负责扫描 `@DisruptorListener`），同样可通过声明同类型 bean 覆盖。
