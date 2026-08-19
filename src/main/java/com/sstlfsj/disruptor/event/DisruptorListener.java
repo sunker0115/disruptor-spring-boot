@@ -24,4 +24,10 @@ import java.lang.annotation.Target;
 @Documented
 @Reflective
 public @interface DisruptorListener {
+
+    /**
+     * 所属处理阶段名。空串（默认）归入隐式的 {@code default} 阶段。
+     * 非空时该阶段必须在 {@code disruptor.pipeline} 中声明，否则启动失败。
+     */
+    String stage() default "";
 }
