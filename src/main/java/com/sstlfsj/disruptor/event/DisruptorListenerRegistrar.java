@@ -4,6 +4,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.core.annotation.AnnotatedElementUtils;
+import org.springframework.util.ClassUtils;
 import org.springframework.util.ReflectionUtils;
 
 import java.lang.reflect.Method;
@@ -30,12 +32,19 @@ public class DisruptorListenerRegistrar implements SmartInitializingSingleton {
     public void afterSingletonsInstantiated() {
         int count = 0;
         for (String beanName : beanFactory.getBeanDefinitionNames()) {
-            Class<?> type = beanFactory.getType(beanName);
-            if (type == null) {
+            if (beanFactory.getBeanDefinition(beanName).isAbstract()) {
                 continue;
             }
-            for (Method method : type.getMethods()) {
-                if (!method.isAnnotationPresent(DisruptorListener.class)) {
+            Class<?> beanType = beanFactory.getType(beanName);
+            if (beanType == null) {
+                continue;
+            }
+            Class<?> userType = ClassUtils.getUserClass(beanType);
+            for (Method method : userType.getMethods()) {
+                if (method.isBridge() || method.isSynthetic()) {
+                    continue;
+                }
+                if (AnnotatedElementUtils.findMergedAnnotation(method, DisruptorListener.class) == null) {
                     continue;
                 }
                 Class<?> eventType = method.getParameterTypes()[0];
