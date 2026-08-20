@@ -8,12 +8,10 @@ import com.lmax.disruptor.YieldingWaitStrategy;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 /**
- * Configuration properties for the disruptor starter, bound from the
- * {@code disruptor.*} namespace.
+ * Configuration properties for the disruptor starter, bound from the {@code disruptor.*} namespace.
+ * 全局参数应用于所有管道；处理阶段拓扑由 {@code @DisruptorStage} 注解声明，不在此配置。
  */
 @ConfigurationProperties(prefix = "disruptor")
 public class DisruptorProperties {
@@ -26,24 +24,14 @@ public class DisruptorProperties {
         SLEEPING
     }
 
-    /** Ring buffer size; must be a power of two. */
+    /** Ring buffer size per pipeline; must be a power of two. */
     private int bufferSize = 1024;
 
     /** Wait strategy used by consumers when no event is available. */
     private WaitStrategyType waitStrategy = WaitStrategyType.YIELDING;
 
-    /**
-     * Maximum time to wait for the ring buffer to drain during shutdown before
-     * forcibly halting the disruptor. Bound from {@code disruptor.shutdown-timeout}.
-     */
+    /** Maximum time to wait for each pipeline's ring buffer to drain during shutdown before halting. */
     private Duration shutdownTimeout = Duration.ofSeconds(10);
-
-    /**
-     * 处理阶段流水线：key 为阶段名，值声明该阶段依赖的上游阶段（after）。
-     * 用于表达 Disruptor 消费者依赖图；{@code default} 阶段隐式存在、无需声明。
-     * 未配置时仅有隐式 default 阶段，行为与无流水线一致。
-     */
-    private Map<String, StageDefinition> pipeline = new LinkedHashMap<>();
 
     public int getBufferSize() {
         return bufferSize;
@@ -69,19 +57,8 @@ public class DisruptorProperties {
         this.shutdownTimeout = shutdownTimeout;
     }
 
-    public Map<String, StageDefinition> getPipeline() {
-        return pipeline;
-    }
-
-    public void setPipeline(Map<String, StageDefinition> pipeline) {
-        this.pipeline = pipeline;
-    }
-
     /**
-     * Maps the configured wait strategy to the corresponding LMAX Disruptor
-     * {@link WaitStrategy} implementation.
-     *
-     * @return the Disruptor wait strategy instance
+     * Maps the configured wait strategy to the corresponding LMAX Disruptor {@link WaitStrategy}.
      */
     public WaitStrategy createWaitStrategy() {
         switch (waitStrategy) {
