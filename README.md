@@ -182,10 +182,20 @@ public class OrderEvent implements Resettable {
 }
 ```
 
+**为什么会有残留**：ring buffer 里的事件对象预分配复用——同一实例每隔 `bufferSize` 个事件被重新填一次。
+若某次 filler 没设全字段，未设字段会残留**上一次用该槽位的事件**的值。例如可选字段 `couponCode`：
+
+```java
+publish(e -> { e.setOrderId("A"); e.setCouponCode("SAVE10"); });  // 订单 A 用券
+publish(e -> { e.setOrderId("B"); });                             // 订单 B 没设 couponCode
+```
+
+若订单 B 复用了订单 A 的槽位，会读到残留的 `"SAVE10"`（脏数据）。`reset()` 在每个事件处理完后清空，杜绝残留。
+
 **何时需要**：
 
 - filler 每次都设置**全部**字段 → **不需要** `Resettable`（下一轮发布自然覆盖旧值）。
-- filler **有条件地 / 只设部分**字段（如可选字段），会读到上一轮残留 → 实现 `Resettable` 清空。
+- filler **有条件地 / 只设部分**字段（如上面的可选字段）→ 实现 `Resettable` 清空，避免读到上一轮残留。
 - 事件持有集合、大对象引用，想在处理完及时释放、避免引用滞留延迟 GC → 在 `reset()` 里 `clear()` / 置 `null`。
 
 
