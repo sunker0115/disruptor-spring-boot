@@ -291,4 +291,53 @@ class TypedPipelineTest {
                                     + IDENTITIES.size() + "）");
                 });
     }
+
+    // ---- 阶段异常被隔离：消费线程存活，后续事件继续处理 ----
+    public static class FailEvent {
+        private int n;
+
+        public void setN(int n) {
+            this.n = n;
+        }
+
+        public int getN() {
+            return n;
+        }
+    }
+
+    static final AtomicInteger FAIL_PROCESSED = new AtomicInteger();
+    static final CountDownLatch FAIL_LATCH = new CountDownLatch(4);
+
+    @Configuration
+    static class FailConfig {
+        @Bean
+        FailStages failStages() {
+            return new FailStages();
+        }
+    }
+
+    static class FailStages {
+        @DisruptorStage(pipeline = "fail", name = "process")
+        public void process(FailEvent e) {
+            FAIL_PROCESSED.incrementAndGet();
+            FAIL_LATCH.countDown();
+            if (e.getN() == 0) {
+                throw new RuntimeException("boom");
+            }
+        }
+    }
+
+    @Test
+    void stageExceptionIsIsolatedAndThreadSurvives() {
+        runner.withUserConfiguration(FailConfig.class).run(ctx -> {
+            EventBus bus = ctx.getBean(EventBus.class);
+            for (int i = 0; i < 4; i++) {
+                int v = i;
+                bus.publish(FailEvent.class, e -> e.setN(v));
+            }
+            assertTrue(FAIL_LATCH.await(3, TimeUnit.SECONDS), "首个事件抛异常后，后续事件仍应被处理");
+            assertEquals(4, FAIL_PROCESSED.get(),
+                    "阶段异常应被隔离，消费线程存活，4 个事件全部进入处理");
+        });
+    }
 }

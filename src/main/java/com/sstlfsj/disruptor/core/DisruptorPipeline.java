@@ -14,14 +14,21 @@ import java.util.function.Consumer;
  */
 public class DisruptorPipeline<E> implements EventPublisher<E> {
 
+    private final String name;
     private final Class<E> eventType;
     private final Disruptor<Object> disruptor;
     private final RingBuffer<Object> ringBuffer;
 
-    public DisruptorPipeline(Class<E> eventType, Disruptor<Object> disruptor) {
+    public DisruptorPipeline(String name, Class<E> eventType, Disruptor<Object> disruptor) {
+        this.name = name;
         this.eventType = eventType;
         this.disruptor = disruptor;
         this.ringBuffer = disruptor.getRingBuffer();
+    }
+
+    /** @return 管道名（用于日志与诊断）。 */
+    public String name() {
+        return name;
     }
 
     public Class<E> eventType() {

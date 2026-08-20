@@ -36,10 +36,14 @@ public class DisruptorLifecycle implements SmartLifecycle {
         if (running) {
             return;
         }
+        int count = 0;
         for (DisruptorPipeline<?> pipeline : pipelines.all()) {
             pipeline.disruptor().start();
+            log.info("已启动管道 [{}]（事件类型 {}）", pipeline.name(), pipeline.eventType().getSimpleName());
+            count++;
         }
         running = true;
+        log.info("Disruptor 事件总线已启动，共 {} 条管道", count);
     }
 
     @Override
@@ -48,13 +52,15 @@ public class DisruptorLifecycle implements SmartLifecycle {
             return;
         }
         running = false;
+        log.info("Disruptor 事件总线开始关闭，共 {} 条管道", pipelines.all().size());
         for (DisruptorPipeline<?> pipeline : pipelines.all()) {
             Disruptor<?> disruptor = pipeline.disruptor();
             try {
                 disruptor.shutdown(shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS);
+                log.info("管道 [{}] 已排空并关闭", pipeline.name());
             } catch (TimeoutException e) {
                 log.warn("管道 [{}] 在 {} 内未排空完成，强制停止，可能丢弃未消费事件",
-                        pipeline.eventType().getName(), shutdownTimeout, e);
+                        pipeline.name(), shutdownTimeout, e);
                 disruptor.halt();
             }
         }
