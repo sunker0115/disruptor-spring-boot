@@ -159,6 +159,7 @@ public void process(IngestEvent e) { ... }   // 4 个线程并行，每事件恰
 
 - 默认按发布序 round-robin 分片。
 - 事件实现 `ShardKeyed`（`Object shardKey()`）→ 同 key 落同一分片、按发布顺序处理（保 per-key 顺序）。
+  这正是 Disruptor 官方推荐替代已移除的 `WorkerPool` 的**条带化（striped event handlers）**方案。
 
 ## 事件复用（可选）
 
@@ -240,5 +241,8 @@ logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
 ## 已知限制（设计取舍）
 
 - 一种事件类型一条管道，没有"一个总线随手发任意类型"——这是忠于 Disruptor 强类型/零分配的应有之义。
-- 阶段内并行为分片模型（Disruptor 4.0 已移除 WorkerPool）；不提供动态负载均衡的 work-queue 语义。
+- 阶段内并行采用**条带化（striped）分片**——Disruptor 4.0 已移除 `WorkerPool`/`WorkProcessor`（官方
+  [Issue #323](https://github.com/LMAX-Exchange/disruptor/issues/323)，视其为不再维护、设计有瑕疵的历史包袱），
+  并推荐"按 key 路由、同 key 固定由同一消费者线程处理"的条带化方案替代；本 starter 的 `parallelism` +
+  `ShardKeyed` 即此方案。因此**不提供** WorkerPool 式的动态负载均衡 work-queue（纯任务分发请用 `ThreadPoolExecutor`）。
 - 仅进程内、无持久化/无投递保证（in-process bus，非消息队列）。
