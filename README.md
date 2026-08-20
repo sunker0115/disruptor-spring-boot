@@ -107,6 +107,28 @@ public void notify(OrderEvent e) { ... }   // persist、audit 都完成后才执
 
 阶段间通过同一事件对象传递数据：上游阶段修改事件字段，下游阶段可见。
 
+## 编程式定义（注解的替代）
+
+不想用注解、想用内联 lambda、或需要运行时动态组装时，用 `EventPipeline` fluent builder 在
+`@Configuration` 里定义管道并作为 `@Bean`。与声明式**并存**、共用同一套 DAG 编排与 `EventBus` 发布：
+
+```java
+@Bean
+public EventPipeline<OrderEvent> orderPipeline(OrderService svc) {
+    return EventPipeline.builder("order", OrderEvent.class)
+        .stage("validate", svc::validate)
+        .stage("persist", svc::persist).after("validate")
+        .stage("audit",   svc::audit).after("validate")
+        .stage("notify",  svc::notify).after("persist", "audit")   // 菱形汇聚
+        .parallelism("persist", 4)                                 // 可选：并行分片
+        .build();
+}
+```
+
+- handler 是内联 `Consumer<E>`（方法引用 / lambda），**直接调用、无反射**。
+- 拓扑与注解式相同的 `name`/`after`，共用 DAG 校验与编排（借鉴 Spring Integration 的 fluent `@Bean` builder）。
+- 声明式与编程式可混用；**管道名与事件类型全局唯一**（跨两种来源冲突则启动失败）。
+
 ## 阶段并行
 
 `parallelism > 1` 时该阶段内并行分片，每个事件仅由一个分片处理（分摊阶段内的耗时业务）：
