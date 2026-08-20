@@ -12,6 +12,8 @@
         <module>disruptor-core</module>
         <module>disruptor-spring-boot-autoconfigure</module>
         <module>disruptor-spring-boot-starter</module>
+        <module>disruptor-spring-boot-example</module>
+        <module>disruptor-spring-boot-tutorial</module>
     </modules>
 
     <properties>
@@ -51,6 +53,11 @@
             <dependency>
                 <groupId>com.sstlfsj</groupId>
                 <artifactId>disruptor-spring-boot-autoconfigure</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.sstlfsj</groupId>
+                <artifactId>disruptor-spring-boot-starter</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>
