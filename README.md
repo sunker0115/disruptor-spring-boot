@@ -245,4 +245,6 @@ logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
   [Issue #323](https://github.com/LMAX-Exchange/disruptor/issues/323)，视其为不再维护、设计有瑕疵的历史包袱），
   并推荐"按 key 路由、同 key 固定由同一消费者线程处理"的条带化方案替代；本 starter 的 `parallelism` +
   `ShardKeyed` 即此方案。因此**不提供** WorkerPool 式的动态负载均衡 work-queue（纯任务分发请用 `ThreadPoolExecutor`）。
-- 仅进程内、无持久化/无投递保证（in-process bus，非消息队列）。
+- 仅进程内、无持久化：进程崩溃丢失在途事件；运行期靠 gating sequence 背压**不覆盖未消费槽**，
+  `tryPublish` 满时由调用方决定丢弃。相对 MQ（Kafka 等）无持久化与投递保证——要这些请用消息队列。
+  这些是 Disruptor（进程内内存管道）的固有性质，非本 starter 引入。
