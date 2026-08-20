@@ -203,7 +203,16 @@ if (!eventBus.tryPublish(OrderEvent.class, e -> e.fill(order))) {
 | `disruptor.wait-strategy`    | 枚举     | `YIELDING` | 等待策略：`BLOCKING`/`YIELDING`/`BUSY_SPIN`/`SLEEPING`。 |
 | `disruptor.shutdown-timeout` | Duration | `10s`      | 关闭时每条管道排空的等待上限，超时强制 halt。 |
 
-处理阶段拓扑由 `@DisruptorStage` 注解声明，不在配置里。
+配置示例（`application.yml`，均可选，缺省即用默认值）：
+
+```yaml
+disruptor:
+  buffer-size: 2048          # RingBuffer 大小，必须是 2 的幂；默认 1024
+  wait-strategy: BLOCKING    # BLOCKING / YIELDING(默认) / BUSY_SPIN / SLEEPING
+  shutdown-timeout: 30s      # 关闭排空等待上限；默认 10s
+```
+
+处理阶段拓扑由 `@DisruptorStage` 注解（或编程式 `EventPipeline`）声明，不在配置里。
 
 ## 行为与约束
 
