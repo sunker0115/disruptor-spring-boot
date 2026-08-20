@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.core;
 
 import java.util.ArrayList;
 import java.util.HashMap;

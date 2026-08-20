@@ -1,7 +1,4 @@
-package com.sstlfsj.disruptor.autoconfigure;
-
-import com.sstlfsj.disruptor.event.EventBus;
-import com.sstlfsj.disruptor.event.EventPublisher;
+package com.sstlfsj.disruptor.core;
 
 import java.util.function.Consumer;
 

@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.core;
 
 import com.lmax.disruptor.ExceptionHandler;
 import org.slf4j.Logger;

@@ -1,10 +1,10 @@
 package com.sstlfsj.disruptor;
 
 import com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration;
-import com.sstlfsj.disruptor.event.DisruptorStage;
-import com.sstlfsj.disruptor.event.EventBus;
-import com.sstlfsj.disruptor.event.Resettable;
-import com.sstlfsj.disruptor.event.ShardKeyed;
+import com.sstlfsj.disruptor.core.EventBus;
+import com.sstlfsj.disruptor.core.Resettable;
+import com.sstlfsj.disruptor.core.ShardKeyed;
+import com.sstlfsj.disruptor.spring.DisruptorStage;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;

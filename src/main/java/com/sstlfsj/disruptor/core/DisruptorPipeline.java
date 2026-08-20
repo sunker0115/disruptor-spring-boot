@@ -1,9 +1,8 @@
-package com.sstlfsj.disruptor.autoconfigure;
+package com.sstlfsj.disruptor.core;
 
 import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
-import com.sstlfsj.disruptor.event.EventPublisher;
 
 import java.util.function.Consumer;
 

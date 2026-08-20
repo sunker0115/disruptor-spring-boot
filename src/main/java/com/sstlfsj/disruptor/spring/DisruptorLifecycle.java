@@ -1,7 +1,9 @@
-package com.sstlfsj.disruptor.autoconfigure;
+package com.sstlfsj.disruptor.spring;
 
 import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;
+import com.sstlfsj.disruptor.core.DisruptorPipeline;
+import com.sstlfsj.disruptor.core.Pipelines;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;

@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.core;
 
 /**
  * 事件可实现此接口以支持槽位复用时的字段重置。管道会在 DAG 所有叶子阶段之后接一个单线程

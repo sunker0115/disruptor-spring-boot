@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.autoconfigure;
+package com.sstlfsj.disruptor.core;
 
 import java.util.Collection;
 import java.util.Map;
@@ -13,7 +13,11 @@ public class Pipelines {
     private final Map<Class<?>, DisruptorPipeline<?>> byType = new ConcurrentHashMap<>();
 
     public void register(DisruptorPipeline<?> pipeline) {
-        byType.put(pipeline.eventType(), pipeline);
+        DisruptorPipeline<?> existing = byType.putIfAbsent(pipeline.eventType(), pipeline);
+        if (existing != null) {
+            throw new IllegalStateException("事件类型 " + pipeline.eventType().getName()
+                    + " 已被其它管道注册；一种事件类型仅允许一条管道");
+        }
     }
 
     @SuppressWarnings("unchecked")

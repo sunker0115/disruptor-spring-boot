@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.core;
 
 /**
  * 事件可实现此接口，在阶段并行（{@code parallelism > 1}）时启用<strong>按 key 分片</strong>：

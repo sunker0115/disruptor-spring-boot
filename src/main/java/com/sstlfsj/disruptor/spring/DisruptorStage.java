@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.event;
+package com.sstlfsj.disruptor.spring;
 
 import org.springframework.aot.hint.annotation.Reflective;
 
