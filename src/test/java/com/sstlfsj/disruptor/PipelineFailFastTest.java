@@ -1,8 +1,8 @@
 package com.sstlfsj.disruptor;
 
 import com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration;
+import com.sstlfsj.disruptor.autoconfigure.DisruptorStage;
 import com.sstlfsj.disruptor.core.EventBus;
-import com.sstlfsj.disruptor.spring.DisruptorStage;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;

@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.spring;
+package com.sstlfsj.disruptor.autoconfigure;
 
 import org.springframework.aot.hint.annotation.Reflective;
 

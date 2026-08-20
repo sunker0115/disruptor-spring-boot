@@ -5,8 +5,6 @@ import com.sstlfsj.disruptor.core.DisruptorConfig;
 import com.sstlfsj.disruptor.core.EventBus;
 import com.sstlfsj.disruptor.core.PipelineBuilder;
 import com.sstlfsj.disruptor.core.Pipelines;
-import com.sstlfsj.disruptor.spring.DisruptorLifecycle;
-import com.sstlfsj.disruptor.spring.StagePipelineRegistrar;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;

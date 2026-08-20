@@ -1,4 +1,4 @@
-package com.sstlfsj.disruptor.spring;
+package com.sstlfsj.disruptor.autoconfigure;
 
 import com.sstlfsj.disruptor.core.EventPipeline;
 import com.sstlfsj.disruptor.core.PipelineBuilder;
