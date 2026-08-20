@@ -214,6 +214,21 @@ disruptor:
 
 处理阶段拓扑由 `@DisruptorStage` 注解（或编程式 `EventPipeline`）声明，不在配置里。
 
+**编程方式设置**：声明一个 `DisruptorConfig` bean 覆盖默认（`@ConditionalOnMissingBean`，声明后
+yml 的 `disruptor.*` 即被忽略）：
+
+```java
+@Bean
+public DisruptorConfig disruptorConfig() {
+    return new DisruptorConfig(
+        2048,                                        // buffer-size
+        DisruptorConfig.WaitStrategyType.BLOCKING,   // wait-strategy
+        Duration.ofSeconds(30));                     // shutdown-timeout
+}
+```
+
+脱离 Spring 时直接 `new DisruptorConfig(...)` 传给 `PipelineBuilder`（见「分层结构」）。
+
 ## 行为与约束
 
 - **每种事件类型一条管道**：一种事件类型只能被一个 `pipeline` 使用（否则启动失败）。跨类型交互需多条管道。
