@@ -1,110 +1,89 @@
-# disruptor-spring-boot-example 示例模块设计
+# 示例与教程模块设计(disruptor-spring-boot-example / -tutorial)
 
 日期:2026-08-20
 状态:已确认,待实现
 
 ## 目标
 
-新增一个 Maven 模块 `disruptor-spring-boot-example`,把 README 里的核心用法各写成**一个能跑的**演示。
-一条 `mvn spring-boot:run` 看 Spring 全套特性;单独运行 `PureJavaExample.main` 看无 Spring 的纯 Java 路径。
+新增**两个独立** Maven 模块,把 README 的用法落成"能跑的":
 
-## 硬约束
+1. `disruptor-spring-boot-example` —— **特性演示**。每个核心特性一个自包含、可跑的 console demo,外加一个
+   无 Spring 的纯 Java main。看"每个能力单独怎么用"。
+2. `disruptor-spring-boot-tutorial` —— **真实场景教程**。一个带真实 HTTP 接口的 Spring Boot web 小应用,
+   演示"下单主流程 publish 完立刻返回、副作用后台异步多阶段处理"的实际用法与价值。看"实际应用里怎么落地、有什么用"。
 
-同一 Spring 上下文里**管道名与事件类型全局唯一**(跨声明式/编程式冲突则启动 fail-fast)。因此每个 demo
-使用各自独立的事件类型 + 管道名,六个 demo 可在同一上下文共存。
+两模块互不依赖、各自可独立运行。
 
-## 模块与依赖
+## 硬约束(两模块内各自成立)
 
-- 位置:父 `disruptor-spring-boot` 的新 `<module>`(加入根 pom `<modules>`,置于三模块之后)。
-- 坐标:`com.sstlfsj:disruptor-spring-boot-example`;`<parent>` 版本用 `${revision}`(同其它三模块)。
-- packaging:`jar`。
-- 前置改动:根 pom 的 `<dependencyManagement>` 补一条 `disruptor-spring-boot-starter`(`<version>${revision}</version>`),
-  与已有的 core/autoconfigure 一致,使 example 引用 starter 时不必写版本。
-- 依赖:
-  - `com.sstlfsj:disruptor-spring-boot-starter`(内部模块,版本由父 dependencyManagement 提供,不写版本)。
-  - `org.springframework.boot:spring-boot-starter`(带 spring-context + logback,才能看到 INFO 装配日志;版本由父 BOM 管)。
-  - `org.projectlombok:lombok`(`<optional>true</optional>`;POJO 的 getter/setter 用 `@Getter @Setter`,版本由父 BOM 管)。
-  - 测试:`org.springframework.boot:spring-boot-starter-test`(scope test)。
-- 构建插件:`org.springframework.boot:spring-boot-maven-plugin`,`<version>${spring-boot.version}</version>`
-  (spring-boot-dependencies BOM 只管依赖版本、不管插件版本,故插件版本显式引用 `${spring-boot.version}`);支持 `mvn spring-boot:run`。
-- 此模块为纯示例,不部署(本仓本就不 deploy,无需额外配置)。
+同一 Spring 上下文里**管道名与事件类型全局唯一**(跨声明式/编程式冲突则启动 fail-fast)。example 模块六个
+demo 各用独立事件类型 + 管道名;tutorial 模块只有一条 `order` 管道,不冲突。
 
-## 包结构 `com.sstlfsj.disruptor.example`
+## 前置改动(根 pom)
 
+- `<dependencyManagement>` 补一条 `disruptor-spring-boot-starter`(`<version>${revision}</version>`),与已有
+  core/autoconfigure 一致,使两个新模块引 starter 时不必写版本。
+- `<modules>` 在三模块之后追加 `disruptor-spring-boot-example`、`disruptor-spring-boot-tutorial`。
+
+两模块 pom 共性:`<parent>` 版本用 `${revision}`;packaging `jar`;纯示例不部署;
+`spring-boot-maven-plugin`(`<version>${spring-boot.version}</version>`,BOM 不管插件版本)支持 `mvn spring-boot:run`;
+Lombok(`org.projectlombok:lombok`,`<optional>true</optional>`,版本由父 BOM 管)写 POJO getter/setter。
+
+---
+
+## 模块一:disruptor-spring-boot-example(特性演示,console)
+
+### 依赖
+- `com.sstlfsj:disruptor-spring-boot-starter`(不写版本,父 depMgmt 提供)。
+- `org.springframework.boot:spring-boot-starter`(带 spring-context + logback,看得到 INFO 装配日志)。
+- `org.projectlombok:lombok`(optional)。
+- 测试:`org.springframework.boot:spring-boot-starter-test`(test)。
+
+### 包结构 `com.sstlfsj.disruptor.example`
 ```
-example/
-  ExampleApplication.java            @SpringBootApplication main
-  order/     OrderEvent, OrderPipeline, OrderDemoRunner              (demo1 声明式菱形 DAG)
-  pay/       PayEvent, PayPipelineConfig, PayDemoRunner              (demo2 编程式 builder)
-  ingest/    IngestEvent, IngestPipeline, IngestDemoRunner           (demo3 并行+ShardKeyed)
-  reuse/     ReuseEvent, ReusePipeline, ReuseDemoRunner              (demo4 Resettable)
-  backpressure/ BpEvent, BpPipeline, BackpressureDemoRunner          (demo5 tryPublish 三形态)
-  nospring/  PureJavaExample                                         (demo6 独立 main,仅用 core API)
-  DemoResults.java                   共享结果持有器(供冒烟测试断言各 demo 完成)
-resources/
-  application.yml
+ExampleApplication.java            @SpringBootApplication main(web-application-type=none)
+order/     OrderEvent, OrderPipeline, OrderDemoRunner              demo1 声明式菱形 DAG
+pay/       PayEvent, PayService, PayPipelineConfig, PayDemoRunner   demo2 编程式 builder
+ingest/    IngestEvent, IngestPipeline, IngestDemoRunner           demo3 并行+ShardKeyed
+reuse/     ReuseEvent, ReusePipeline, ReuseDemoRunner              demo4 Resettable
+backpressure/ BpEvent, BpPipeline, BackpressureDemoRunner          demo5 tryPublish 三形态
+nospring/  PureJavaExample                                         demo6 独立 main(仅 core API)
+DemoResults.java                   共享结果持有器(供冒烟测试断言各 demo 完成)
+resources/application.yml
 ```
 
-每个 `*DemoRunner` 是 `@Component implements CommandLineRunner`,用 `@Order(n)` 保证顺序(1..5),
-内部:打印分段标题 → `eventBus.publish(...)` 发布 → `CountDownLatch.await(超时)` 等阶段处理完 → 打印结果 →
-`DemoResults` 标记完成。所有面向控制台的说明用 `log.info`(SLF4J),不用 System.out。
+每个 `*DemoRunner` = `@Component implements CommandLineRunner`,`@Order(1..5)` 保证顺序;内部:打印分段标题 →
+`eventBus.publish(...)` → `CountDownLatch.await(超时)` 等阶段处理完 → 打印结果 → `DemoResults` 标记完成。
+所有控制台输出用 `log.info`(SLF4J),不用 System.out。
 
-## 各 demo 细节
+### 各 demo 细节
+- **demo1 order**:`OrderEvent{String orderId; long amount; String auditTrail}`;`OrderPipeline @Component`
+  `@DisruptorStage` validate→persist(after=validate)→audit(after=validate)→notify(after={persist,audit});
+  persist/audit 往 auditTrail 追加,notify 打印最终 auditTrail(证明下游可见上游改动 + 菱形汇聚)。runner latch=4。
+- **demo2 pay**:`PayEvent{String payId; String trace}`;`PayService @Component`(validate/persist/audit/notify 方法);
+  `PayPipelineConfig @Configuration` `@Bean EventPipeline<PayEvent> payPipeline(PayService svc)` 用
+  `EventPipeline.builder("pay",PayEvent.class).stage("validate",svc::validate).stage("persist",svc::persist).after("validate").stage("audit",svc::audit).after("validate").stage("notify",svc::notify).after("persist","audit").build()`。runner latch=4。
+- **demo3 ingest**:`IngestEvent implements ShardKeyed{String key; int seq; shardKey()=key}`;
+  `IngestPipeline @Component` `@DisruptorStage(pipeline="ingest",name="process",parallelism=4)` 打印线程名+key+seq;
+  runner 对 2~3 个 key 交错发布若干 seq,latch=事件总数,打印"同 key 由同一线程按 seq 递增处理"。
+- **demo4 reuse**:`ReuseEvent implements Resettable{String orderId; String couponCode; reset()置null}`;
+  `ReusePipeline @Component` `@DisruptorStage(pipeline="reuse",name="collect")` 打印 orderId+couponCode;
+  runner 先发带 couponCode="SAVE10" 的 A,再发一批只设 orderId 的订单(数量 > buffer-size 确保槽位复用),
+  latch=事件总数,打印"后续 couponCode 均为 null(无 SAVE10 残留),reset 生效"。
+- **demo5 backpressure**:`BpEvent{int n}`;`BpPipeline @Component` `@DisruptorStage(pipeline="backpressure",name="slow")`
+  内 `Thread.sleep(短)` 模拟慢消费;runner 突发发布远超 buffer(16)的事件填满 ring buffer,对每次
+  `eventBus.tryPublish(...)` 返回 false 的三形态各演示并打印:①丢弃+计数 ②`log.info` 模拟降级落库 ③抛
+  `IllegalStateException("系统繁忙")` 就地 catch 打印"快速失败回推上游";末尾打印 dropped 计数。等已入队事件处理完再结束。
+- **demo6 nospring**(独立 `PureJavaExample.main`,仅 core API):`new DisruptorConfig(16,BLOCKING,Duration.ofSeconds(5))`
+  → `EventPipeline.builder("plain",E.class).stage(...).build()` → `new PipelineBuilder(config).build(def)` →
+  `Pipelines p=new Pipelines(); p.register(pipeline)` → `EventBus bus=new DefaultEventBus(p)` →
+  `pipeline.disruptor().start()` → `bus.publish(...)` → `CountDownLatch.await` → `pipeline.disruptor().shutdown(timeout)` → 打印。
 
-### demo1 order —— 声明式注解 + 菱形 DAG
-- `OrderEvent`:可变 POJO,无参构造,字段 `String orderId; long amount; String auditTrail`(getter/setter,Lombok `@Getter @Setter`)。
-- `OrderPipeline`(`@Component`):`@DisruptorStage(pipeline="order", name="validate")` validate → `persist`(after=validate) → `audit`(after=validate) → `notify`(after={persist,audit})。各阶段 `log.info` 打印自己在跑;persist/audit 往 `auditTrail` 追加字符串,notify 打印最终 `auditTrail` 证明"下游可见上游改动 + 菱形汇聚在两分支后"。
-- `OrderDemoRunner`(`@Order(1)`):publish 一个订单,latch 计数=4(四阶段各 countDown),await 后打印完成。
-
-### demo2 pay —— 编程式 EventPipeline builder
-- `PayEvent`:可变 POJO,无参构造,字段 `String payId; String trace`。
-- `PayPipelineConfig`(`@Configuration`):`@Bean EventPipeline<PayEvent> payPipeline(PayService)` 用
-  `EventPipeline.builder("pay", PayEvent.class).stage("validate", svc::validate).stage("persist", svc::persist).after("validate").stage("audit", svc::audit).after("validate").stage("notify", svc::notify).after("persist","audit").build()`。
-  `PayService` 是本包一个 `@Component`,方法引用作 handler(演示无反射内联)。
-- `PayDemoRunner`(`@Order(2)`):同 demo1 方式发布 + await + 打印。
-
-### demo3 ingest —— 阶段并行 + ShardKeyed 保序
-- `IngestEvent implements ShardKeyed`:字段 `String key; int seq`;`shardKey()` 返回 `key`。
-- `IngestPipeline`(`@Component`):`@DisruptorStage(pipeline="ingest", name="process", parallelism=4)`
-  process 打印 `Thread.currentThread().getName()` + key + seq。
-- `IngestDemoRunner`(`@Order(3)`):对 2~3 个 key 各发布若干 seq(交错发布),latch=事件总数,await 后
-  打印"同一 key 的事件都由同一线程、按 seq 递增顺序处理"(把每个 key 观察到的线程名/seq 序列收集打印)。
-
-### demo4 reuse —— Resettable 去残留
-- `ReuseEvent implements Resettable`:字段 `String orderId; String couponCode`;`reset()` 置两者为 null。
-- `ReusePipeline`(`@Component`):`@DisruptorStage(pipeline="reuse", name="collect")` 打印 orderId + couponCode。
-- `ReuseDemoRunner`(`@Order(4)`):先 publish 带 `couponCode="SAVE10"` 的订单 A,再 publish 一批**只设 orderId**
-  的订单(B、C...,数量 > buffer-size 以确保槽位复用),await 后打印"后续订单 couponCode 均为 null(未见 SAVE10 残留),
-  reset 生效"。latch=事件总数。
-
-### demo5 backpressure —— tryPublish 三种降级形态
-- `BpEvent`:字段 `int n`。
-- `BpPipeline`(`@Component`):`@DisruptorStage(pipeline="backpressure", name="slow")` 内 `Thread.sleep(短)`
-  模拟慢消费。
-- `BackpressureDemoRunner`(`@Order(5)`):突发发布远超 buffer(16)的事件,使 ring buffer 填满;对每次
-  `eventBus.tryPublish(BpEvent.class, ...)` 返回 `false` 的情况,分别演示三形态并打印:
-  1. 可丢弃:`droppedCounter++` 计数;
-  2. 不能丢:`log.info("降级落库补偿: ...")`(用日志模拟 fallback 落库);
-  3. 关键链路:命中一次 false 时 `throw new IllegalStateException("系统繁忙")` 并就地 catch 打印"快速失败,回推上游限流"。
-  最后打印 dropped 计数。此 demo 不强求所有事件处理完(重点是触发并展示 false 分支);为不影响关闭排空,
-  等待已入队事件处理完再结束。
-
-### demo6 nospring —— 纯 Java 手工装配(独立 main,仅 core)
-- `PureJavaExample`:`public static void main`:
-  1. `DisruptorConfig config = new DisruptorConfig(16, WaitStrategyType.BLOCKING, Duration.ofSeconds(5));`
-  2. `EventPipeline<E> def = EventPipeline.builder("plain", E.class).stage(...).build();`(内部静态事件类 + lambda handler)
-  3. `DisruptorPipeline<E> pipeline = new PipelineBuilder(config).build(def);`
-  4. `Pipelines pipelines = new Pipelines(); pipelines.register(pipeline);`
-  5. `EventBus bus = new DefaultEventBus(pipelines);`
-  6. `pipeline.disruptor().start();` → `bus.publish(...)` → `CountDownLatch.await` → `pipeline.disruptor().shutdown(timeout)` 排空 → 打印。
-  - 只用 `disruptor-core` 的公开 API,证明脱离 Spring 可独立工作。运行方式:直接运行该 main。
-
-## application.yml
-
+### application.yml(example)
 ```yaml
 disruptor:
-  buffer-size: 16          # 2 的幂;故意设小以便 backpressure demo 触发满槽
-  wait-strategy: YIELDING  # BLOCKING / YIELDING(默认) / BUSY_SPIN / SLEEPING
+  buffer-size: 16          # 2 的幂;故意小以便 backpressure demo 触发满槽
+  wait-strategy: YIELDING
   shutdown-timeout: 10s
 logging:
   level:
@@ -113,22 +92,88 @@ spring:
   main:
     web-application-type: none     # 非 Web,跑完 demo 即退出
 ```
+注释:另可声明 `DisruptorConfig` `@Bean` 编程覆盖(声明后 yml 的 `disruptor.*` 被忽略);默认注释掉,保留 yml 生效。
 
-注释:另可声明 `DisruptorConfig` `@Bean` 以编程方式覆盖(声明后 yml 的 `disruptor.*` 被忽略);默认注释掉,保留 yml 生效。
+### 冒烟测试
+`ExampleSmokeTest @SpringBootTest`:启动上下文触发所有 DemoRunner,断言 `DemoResults` 里 demo1..5 均标记完成。
+慢阶段 sleep 保持毫秒级,整体秒级完成。demo6 是独立 main,不纳入此测试。
 
-## 防腐化冒烟测试
+---
 
-`ExampleSmokeTest`(`@SpringBootTest`):启动上下文触发所有 DemoRunner,断言 `DemoResults` 里 demo1..5 均标记完成
-(context 加载成功 + 各 demo 无异常跑通)。sleep/慢阶段耗时保持很短(毫秒级),整体秒级完成。纯 Java demo6 不在此测试内
-(它是独立 main;如需可另写一个直接调用其逻辑的小测试,非必需)。
+## 模块二:disruptor-spring-boot-tutorial(真实场景,web)
+
+**场景**:下单主流程与副作用解耦。HTTP `POST /orders` publish 一个 `OrderPlacedEvent` 后**立刻返回 202**,
+后台按 DAG 异步跑:校验 → 落库 → (发确认邮件 ‖ 扣库存 ‖ 埋点)。突发流量下 `tryPublish` 满时返回 429 背压。
+`GET /orders/stats` 看后台处理进度,直观体现"请求快速返回、副作用后台异步完成"。
+
+### 依赖
+- `com.sstlfsj:disruptor-spring-boot-starter`(不写版本)。
+- `org.springframework.boot:spring-boot-starter-web`(真实 HTTP 接口 + 内嵌 tomcat + logback)。
+- `org.projectlombok:lombok`(optional)。
+- 测试:`org.springframework.boot:spring-boot-starter-test`(test)。
+
+### 包结构 `com.sstlfsj.disruptor.tutorial`
+```
+TutorialApplication.java           @SpringBootApplication main(web)
+OrderPlacedEvent.java              事件:@Getter @Setter, implements Resettable
+OrderRecord.java                   不可变 record(落库快照,避免持有被复用的事件对象引用)
+InMemoryOrderRepository.java       @Component,ConcurrentHashMap<String,OrderRecord> 模拟落库
+OrderStats.java                    @Component,若干 AtomicInteger 计数(persisted/emailsSent/metricsRecorded/stockRemaining/rejected)
+OrderProcessingPipeline.java       @Component,注解式五阶段 DAG
+web/OrderController.java           @RestController POST /orders、GET /orders/stats
+web/PlaceOrderRequest.java         record(userId, amount, couponCode)
+resources/application.yml
+```
+
+### 事件与阶段
+- `OrderPlacedEvent implements Resettable`:`String orderId; String userId; long amount; String couponCode`(可选);
+  `reset()` 全部置 null/0(演示真实可选字段去残留)。
+- `OrderProcessingPipeline @Component @RequiredArgsConstructor`(注入 repo、stats),注解式 DAG:
+  - `validate`(源头):`amount<=0` 抛 `IllegalArgumentException`(顺带演示异常隔离:被记录不终止线程),否则 log。
+  - `persist`(after=validate):`repo.save(new OrderRecord(orderId,userId,amount,couponCode))`(**复制字段**入库,不存事件对象);`stats.persisted++`。
+  - `sendConfirmation`(after=persist):`Thread.sleep(短)` 模拟发信;`stats.emailsSent++`;log。
+  - `deductInventory`(after=persist):`stats.stockRemaining--`。
+  - `recordMetrics`(after=persist):`stats.metricsRecorded++`。
+  DAG = validate → persist → (sendConfirmation ‖ deductInventory ‖ recordMetrics),三个副作用并行 fan-out。
+
+### HTTP 接口(`OrderController @RestController @RequiredArgsConstructor`,注入 EventBus、OrderStats)
+- `POST /orders`(body `PlaceOrderRequest{String userId; long amount; String couponCode}`):
+  controller 生成 `orderId = UUID.randomUUID().toString()`,`boolean ok = eventBus.tryPublish(OrderPlacedEvent.class, e -> {填充 orderId/userId/amount/couponCode})`;
+  - `ok==false`:`stats.rejected++`,返回 `429` + `{"error":"系统繁忙，请稍后重试"}`(README 背压形态 3)。
+  - `ok==true`:返回 `202` + `{"orderId":..., "status":"accepted"}`(主流程 publish 完立刻返回)。
+- `GET /orders/stats`:返回 persisted/emailsSent/metricsRecorded/stockRemaining/rejected 的当前值。
+- `PlaceOrderRequest`:`record PlaceOrderRequest(String userId, long amount, String couponCode) {}`(Jackson 反序列化 record)。
+
+### application.yml(tutorial)
+```yaml
+disruptor:
+  buffer-size: 16          # 小 buffer,便于压测触发 429 背压
+  wait-strategy: YIELDING
+  shutdown-timeout: 10s
+logging:
+  level:
+    com.sstlfsj.disruptor: INFO
+server:
+  port: 8080
+```
+
+### 端到端验证测试
+`OrderFlowTest @SpringBootTest(webEnvironment=RANDOM_PORT)`,用 `TestRestTemplate`:
+- POST /orders `{userId:"u1", amount:100}` → 断言 `202` 且响应含非空 orderId。
+- 轮询 GET /orders/stats 直到 `persisted>=1`(超时 3s) → 断言 `emailsSent>=1`、`stockRemaining==99`、`metricsRecorded>=1`。
+阶段 sleep 保持毫秒级,测试秒级完成。
+
+---
 
 ## README 指引
 
-主 `README.md` 末尾加一小节「示例」,一句话指向 `disruptor-spring-boot-example`:`mvn -pl disruptor-spring-boot-example spring-boot:run`
-看 Spring 全套,运行 `PureJavaExample` 看纯 Java 路径。
+主 `README.md` 末尾加「示例与教程」一节,分别指向两模块:
+- 特性演示:`mvn -pl disruptor-spring-boot-example spring-boot:run`(六个 demo 顺序打印);纯 Java 路径运行 `PureJavaExample`。
+- 真实场景:`mvn -pl disruptor-spring-boot-tutorial spring-boot:run` 起 web,附一条 curl 例:
+  `curl -XPOST localhost:8080/orders -H 'Content-Type: application/json' -d '{"userId":"u1","amount":100}'`,
+  再 `curl localhost:8080/orders/stats` 看后台异步处理结果。
 
 ## 不做(YAGNI)
 
 - 不演示"覆盖默认 bean(EventBus/Pipelines 等)"—— 运行价值低,注释点到即可。
-- 不部署此模块。
-- 不做 Web/HTTP 触发层 —— CommandLineRunner 顺序演示即够。
+- 两模块均不部署;无鉴权/持久化/前端(教程聚焦"主流程解耦 + 背压"的直观价值)。
