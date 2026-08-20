@@ -295,7 +295,7 @@ logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
 ## 覆盖默认 bean
 
 对外 bean 均 `@ConditionalOnMissingBean`，可声明同类型 bean 覆盖：`EventBus`、`Pipelines`、
-`PipelineBuilder`、`DisruptorConfig`、`StagePipelineRegistrar`、`SmartLifecycle`（生命周期）。
+`PipelineBuilder`、`DisruptorConfig`、`StagePipelineRegistrar`、`DisruptorLifecycle`（生命周期）。
 
 ## 模块结构
 

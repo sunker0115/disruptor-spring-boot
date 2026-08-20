@@ -9,7 +9,6 @@ import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.context.SmartLifecycle;
 import org.springframework.context.annotation.Bean;
 
 /**
@@ -60,7 +59,7 @@ public class DisruptorAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public SmartLifecycle disruptorLifecycle(Pipelines pipelines, DisruptorConfig config) {
+    public DisruptorLifecycle disruptorLifecycle(Pipelines pipelines, DisruptorConfig config) {
         return new DisruptorLifecycle(pipelines, config.shutdownTimeout(), LIFECYCLE_PHASE);
     }
 }
