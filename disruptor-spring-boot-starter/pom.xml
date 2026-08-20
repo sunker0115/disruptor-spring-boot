@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.sstlfsj</groupId>
+        <artifactId>disruptor-spring-boot</artifactId>
+        <version>1.0.0</version>
+    </parent>
+    <artifactId>disruptor-spring-boot-starter</artifactId>
+
+    <description>Starter：无代码，聚合依赖。使用方只需引入本模块即可自动装配。</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.sstlfsj</groupId>
+            <artifactId>disruptor-spring-boot-autoconfigure</artifactId>
+        </dependency>
+    </dependencies>
+</project>

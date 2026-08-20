@@ -1,6 +1,5 @@
-package com.sstlfsj.disruptor.autoconfigure;
+package com.sstlfsj.disruptor.core;
 
-import com.sstlfsj.disruptor.core.PipelineTopology;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
