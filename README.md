@@ -166,6 +166,29 @@ public void process(IngestEvent e) { ... }   // 4 个线程并行，每事件恰
 事件实现 `Resettable`（`void reset()`）→ 管道在 DAG 所有叶子之后接一个单线程 cleanup handler
 调用 `reset()`，清空字段供槽位复用（避免发布 filler 未覆盖的字段残留旧值）。
 
+```java
+public class OrderEvent implements Resettable {
+    private String orderId;
+    private long amount;
+    private List<String> items = new ArrayList<>();
+    // getters / setters
+
+    @Override
+    public void reset() {   // 每个事件流经所有阶段后被调用一次
+        this.orderId = null;
+        this.amount = 0L;
+        this.items.clear();
+    }
+}
+```
+
+**何时需要**：
+
+- filler 每次都设置**全部**字段 → **不需要** `Resettable`（下一轮发布自然覆盖旧值）。
+- filler **有条件地 / 只设部分**字段（如可选字段），会读到上一轮残留 → 实现 `Resettable` 清空。
+- 事件持有集合、大对象引用，想在处理完及时释放、避免引用滞留延迟 GC → 在 `reset()` 里 `clear()` / 置 `null`。
+
+
 ## 背压
 
 `publish` 在 ring buffer 满时**阻塞**发布线程直到有空槽；`tryPublish` **非阻塞**，满时返回 `false`
