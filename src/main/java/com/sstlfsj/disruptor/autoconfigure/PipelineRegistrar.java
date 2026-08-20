@@ -7,6 +7,7 @@ import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.EventHandlerGroup;
 import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.event.DisruptorStage;
+import com.sstlfsj.disruptor.event.EventPipeline;
 import com.sstlfsj.disruptor.event.LoggingExceptionHandler;
 import com.sstlfsj.disruptor.event.Resettable;
 import com.sstlfsj.disruptor.event.ShardKeyed;
@@ -27,11 +28,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
- * 在所有单例初始化后，扫描全部 bean 的 {@link DisruptorStage} 方法，按 pipeline 分组，
- * 为每种事件类型建立一个强类型 {@link Disruptor}（预分配 {@code E::new}），按阶段依赖
- * 编排 DAG，并注册到 {@link Pipelines}（不启动，启动由 {@link DisruptorLifecycle} 负责）。
+ * 在所有单例初始化后，从两种来源收集管道定义并统一建立强类型 Disruptor 管道：
+ * <ul>
+ *   <li>声明式：扫描全部 bean 的 {@link DisruptorStage} 方法（反射调用）；</li>
+ *   <li>编程式：收集所有 {@link EventPipeline} bean（内联 Consumer 直接调用）。</li>
+ * </ul>
+ * 两者共用 {@link PipelineTopology} 校验 DAG、用 {@code then/and} 编排，注册到 {@link Pipelines}
+ * （不启动，启动由 {@link DisruptorLifecycle} 负责）。管道名与事件类型均全局唯一。
  */
 public class PipelineRegistrar implements SmartInitializingSingleton {
 
@@ -51,15 +57,20 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
 
     @Override
     public void afterSingletonsInstantiated() {
-        Map<String, List<StageMethod>> byPipeline = scanStages();
+        Map<String, PipelineDef> defs = new LinkedHashMap<>();
+        collectAnnotated(defs);
+        collectProgrammatic(defs);
+
         Map<Class<?>, String> typeToPipeline = new HashMap<>();
-        for (Map.Entry<String, List<StageMethod>> entry : byPipeline.entrySet()) {
+        for (Map.Entry<String, PipelineDef> entry : defs.entrySet()) {
             buildPipeline(entry.getKey(), entry.getValue(), typeToPipeline);
         }
-        log.debug("已建立 {} 条 Disruptor 管道", byPipeline.size());
+        log.debug("已建立 {} 条 Disruptor 管道", defs.size());
     }
 
-    private Map<String, List<StageMethod>> scanStages() {
+    // ---- 声明式来源：@DisruptorStage ----
+
+    private void collectAnnotated(Map<String, PipelineDef> defs) {
         Map<String, List<StageMethod>> byPipeline = new LinkedHashMap<>();
         for (String beanName : beanFactory.getBeanDefinitionNames()) {
             if (beanFactory.getBeanDefinition(beanName).isAbstract()) {
@@ -86,45 +97,78 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
                         .add(new StageMethod(ann, bean, method, method.getParameterTypes()[0]));
             }
         }
-        return byPipeline;
+
+        for (Map.Entry<String, List<StageMethod>> entry : byPipeline.entrySet()) {
+            String pipeline = entry.getKey();
+            List<StageMethod> methods = entry.getValue();
+            Class<?> eventType = methods.get(0).eventType();
+            List<ResolvedStage> stages = new ArrayList<>();
+            for (StageMethod sm : methods) {
+                if (sm.eventType() != eventType) {
+                    throw new IllegalStateException("管道 '" + pipeline + "' 各阶段事件类型不一致："
+                            + eventType.getName() + " vs " + sm.eventType().getName());
+                }
+                Method method = sm.method();
+                Object bean = sm.bean();
+                ReflectionUtils.makeAccessible(method);
+                EventInvoker invoker = event -> ReflectionUtils.invokeMethod(method, bean, event);
+                stages.add(new ResolvedStage(sm.ann().name(), List.of(sm.ann().after()),
+                        Math.max(1, sm.ann().parallelism()), invoker));
+            }
+            putDef(defs, pipeline, new PipelineDef(eventType, stages));
+        }
     }
 
-    private void buildPipeline(String pipelineName, List<StageMethod> stages,
-                               Map<Class<?>, String> typeToPipeline) {
-        // 事件类型一致性
-        Class<?> eventType = stages.get(0).eventType();
-        for (StageMethod sm : stages) {
-            if (sm.eventType() != eventType) {
-                throw new IllegalStateException("管道 '" + pipelineName + "' 各阶段事件类型不一致："
-                        + eventType.getName() + " vs " + sm.eventType().getName());
+    // ---- 编程式来源：EventPipeline bean ----
+
+    private void collectProgrammatic(Map<String, PipelineDef> defs) {
+        Map<String, EventPipeline> beans = beanFactory.getBeansOfType(EventPipeline.class);
+        for (EventPipeline<?> ep : beans.values()) {
+            List<ResolvedStage> stages = new ArrayList<>();
+            for (EventPipeline.Stage<?> stage : ep.stages()) {
+                @SuppressWarnings("unchecked")
+                Consumer<Object> handler = (Consumer<Object>) stage.handler();
+                EventInvoker invoker = handler::accept;
+                stages.add(new ResolvedStage(stage.name(), stage.after(),
+                        Math.max(1, stage.parallelism()), invoker));
             }
+            putDef(defs, ep.pipeline(), new PipelineDef(ep.eventType(), stages));
         }
-        // 事件类型跨管道唯一
+    }
+
+    private void putDef(Map<String, PipelineDef> defs, String pipeline, PipelineDef def) {
+        if (defs.put(pipeline, def) != null) {
+            throw new IllegalStateException("管道名重复：'" + pipeline + "'（声明式与编程式不能同名）");
+        }
+    }
+
+    // ---- 统一建管道 ----
+
+    private void buildPipeline(String pipelineName, PipelineDef def, Map<Class<?>, String> typeToPipeline) {
+        Class<?> eventType = def.eventType();
         String existing = typeToPipeline.put(eventType, pipelineName);
         if (existing != null) {
             throw new IllegalStateException("事件类型 " + eventType.getName()
                     + " 被多个管道使用：'" + existing + "' 与 '" + pipelineName
                     + "'；一种事件类型仅允许一条管道");
         }
-        // 阶段名唯一 + 拓扑
+
         Map<String, List<String>> stageAfter = new LinkedHashMap<>();
-        Map<String, StageMethod> byStageName = new LinkedHashMap<>();
-        for (StageMethod sm : stages) {
-            String name = sm.ann().name();
-            if (byStageName.put(name, sm) != null) {
-                throw new IllegalStateException("管道 '" + pipelineName + "' 阶段名重复：'" + name + "'");
+        Map<String, ResolvedStage> byName = new LinkedHashMap<>();
+        for (ResolvedStage stage : def.stages()) {
+            if (byName.put(stage.name(), stage) != null) {
+                throw new IllegalStateException("管道 '" + pipelineName + "' 阶段名重复：'" + stage.name() + "'");
             }
-            stageAfter.put(name, List.of(sm.ann().after()));
+            stageAfter.put(stage.name(), stage.after());
         }
         PipelineTopology topology = PipelineTopology.build(stageAfter);
 
-        // 建 Disruptor 并编排 DAG
         Disruptor<Object> disruptor = createDisruptor(pipelineName, eventType);
         disruptor.setDefaultExceptionHandler(new LoggingExceptionHandler());
 
         Map<String, EventHandlerGroup<Object>> groups = new HashMap<>();
         for (String stageName : topology.order()) {
-            EventHandler<Object>[] handlers = buildHandlers(byStageName.get(stageName));
+            EventHandler<Object>[] handlers = buildHandlers(byName.get(stageName));
             List<String> deps = topology.dependenciesOf(stageName);
             EventHandlerGroup<Object> group;
             if (deps.isEmpty()) {
@@ -139,7 +183,6 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
             groups.put(stageName, group);
         }
 
-        // 若事件可重置，所有叶子之后接单线程 cleanup handler 重置槽位供复用
         if (Resettable.class.isAssignableFrom(eventType)) {
             EventHandlerGroup<Object> allLeaves = null;
             for (String leaf : topology.leaves()) {
@@ -185,11 +228,9 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
     }
 
     @SuppressWarnings("unchecked")
-    private EventHandler<Object>[] buildHandlers(StageMethod sm) {
-        int parallelism = Math.max(1, sm.ann().parallelism());
-        Method method = sm.method();
-        ReflectionUtils.makeAccessible(method);
-        Object bean = sm.bean();
+    private EventHandler<Object>[] buildHandlers(ResolvedStage stage) {
+        int parallelism = stage.parallelism();
+        EventInvoker invoker = stage.invoker();
         EventHandler<Object>[] handlers = new EventHandler[parallelism];
         for (int shard = 0; shard < parallelism; shard++) {
             int shardId = shard;
@@ -198,7 +239,7 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
                 if (n > 1 && shardOf(event, sequence, n) != shardId) {
                     return;
                 }
-                ReflectionUtils.invokeMethod(method, bean, event);
+                invoker.invoke(event);
             };
         }
         return handlers;
@@ -219,6 +260,17 @@ public class PipelineRegistrar implements SmartInitializingSingleton {
     @SuppressWarnings("unchecked")
     private static <E> Class<E> cast(Class<?> type) {
         return (Class<E>) type;
+    }
+
+    @FunctionalInterface
+    private interface EventInvoker {
+        void invoke(Object event);
+    }
+
+    private record ResolvedStage(String name, List<String> after, int parallelism, EventInvoker invoker) {
+    }
+
+    private record PipelineDef(Class<?> eventType, List<ResolvedStage> stages) {
     }
 
     private record StageMethod(DisruptorStage ann, Object bean, Method method, Class<?> eventType) {
