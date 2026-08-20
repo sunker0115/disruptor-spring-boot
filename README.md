@@ -182,7 +182,20 @@ long remaining = eventBus.remainingCapacity(OrderEvent.class);   // 剩余槽位
 ## 覆盖默认 bean
 
 对外 bean 均 `@ConditionalOnMissingBean`，可声明同类型 bean 覆盖：`EventBus`、`Pipelines`、
-`PipelineRegistrar`、`SmartLifecycle`（生命周期）。
+`PipelineBuilder`、`DisruptorConfig`、`StagePipelineRegistrar`、`SmartLifecycle`（生命周期）。
+
+## 分层结构
+
+代码按依赖分三层，边界单向、可按需拆为独立 Maven 模块：
+
+- `com.sstlfsj.disruptor.core` —— **无 Spring 依赖**：公开 API（`EventPublisher`/`EventBus`/`EventPipeline`/
+  `ShardKeyed`/`Resettable`）+ 构建与运行逻辑（`PipelineBuilder`/`DisruptorPipeline`/`Pipelines`/
+  `DefaultEventBus`/`PipelineTopology`/`DisruptorConfig`）。可脱离 Spring 独立使用。
+- `com.sstlfsj.disruptor.spring` —— **依赖 Spring、不依赖 Spring Boot**：`@DisruptorStage`、
+  `StagePipelineRegistrar`（容器扫描）、`DisruptorLifecycle`（`SmartLifecycle`）。
+- `com.sstlfsj.disruptor.autoconfigure` —— **Spring Boot 自动装配**：`DisruptorProperties`、`DisruptorAutoConfiguration`。
+
+依赖方向 `autoconfigure → spring → core`，将来拆多模块时一行代码不用改。
 
 ## 已知限制（设计取舍）
 
