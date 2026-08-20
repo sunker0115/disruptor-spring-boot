@@ -1,6 +1,8 @@
 # 构建产物
 target/
 *.class
+# flatten-maven-plugin 生成的展开 pom（CI-friendly ${revision}）
+.flattened-pom.xml
 
 # IntelliJ IDEA
 .idea/

@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.sstlfsj</groupId>
     <artifactId>disruptor-spring-boot</artifactId>
-    <version>1.0.0</version>
+    <version>${revision}</version>
     <packaging>pom</packaging>
 
     <modules>
@@ -15,7 +15,10 @@
     </modules>
 
     <properties>
+        <!-- 唯一版本号真源：改这一处即改全仓（Maven CI-friendly，配合 flatten-maven-plugin 发布时展开为真实版本） -->
+        <revision>1.0.0</revision>
         <maven.compiler.release>17</maven.compiler.release>
+        <flatten-maven-plugin.version>1.7.0</flatten-maven-plugin.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>4.1.0</spring-boot.version>
         <disruptor.version>4.0.0</disruptor.version>
@@ -68,5 +71,33 @@
                 </plugin>
             </plugins>
         </pluginManagement>
+        <plugins>
+            <!-- 把 ${revision} 展开写入安装/发布的 pom，使用方拿到的是真实版本号而非占位符 -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>${flatten-maven-plugin.version}</version>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>resolveCiFriendliesOnly</flattenMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>flatten</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>flatten.clean</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 </project>

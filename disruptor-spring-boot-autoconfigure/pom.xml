@@ -6,7 +6,7 @@
     <parent>
         <groupId>com.sstlfsj</groupId>
         <artifactId>disruptor-spring-boot</artifactId>
-        <version>1.0.0</version>
+        <version>${revision}</version>
     </parent>
     <artifactId>disruptor-spring-boot-autoconfigure</artifactId>
 
