@@ -179,6 +179,26 @@ long remaining = eventBus.remainingCapacity(OrderEvent.class);   // 剩余槽位
 - **异常隔离**：阶段处理异常被记 ERROR 后跳过，不终止消费线程。
 - **进程内、非持久化**：事件仅在当前 JVM 内传递；进程崩溃时未消费事件丢失。
 
+## 日志与可观测
+
+logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
+
+- **INFO**（启动/关闭，低频）：每条管道的装配结构（事件类型、阶段 DAG、并行度、是否 `Resettable`）、
+  各管道 start/stop。可从日志确认"管道注册了什么、拓扑对不对"。
+- **ERROR**：阶段处理异常，带 `管道/阶段/event` 上下文（已隔离，消费线程继续）——定位"哪一步挂了"。
+- **WARN**：关闭排空超时（强制 halt，可能丢事件）。
+- **DEBUG**：背压——`tryPublish` 因 ring buffer 满被拒时记（含剩余容量）。默认不输出。
+
+示例：
+
+```
+已建立管道 [order] 事件类型=OrderEvent 阶段=[validate → persist(after=validate)[x4] → notify(after=persist)] 复用=Resettable
+已启动管道 [order]（事件类型 OrderEvent）
+管道 [order] 阶段 [persist] 处理事件异常，event=...，已隔离（消费线程继续）
+```
+
+按需 `logging.level.com.sstlfsj.disruptor=DEBUG` 即可看到背压等细节。
+
 ## 覆盖默认 bean
 
 对外 bean 均 `@ConditionalOnMissingBean`，可声明同类型 bean 覆盖：`EventBus`、`Pipelines`、

@@ -3,6 +3,8 @@ package com.sstlfsj.disruptor.core;
 import com.lmax.disruptor.InsufficientCapacityException;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.function.Consumer;
 
@@ -13,6 +15,8 @@ import java.util.function.Consumer;
  * @param <E> 该管道的强类型事件类型
  */
 public class DisruptorPipeline<E> implements EventPublisher<E> {
+
+    private static final Logger log = LoggerFactory.getLogger(DisruptorPipeline.class);
 
     private final String name;
     private final Class<E> eventType;
@@ -51,6 +55,10 @@ public class DisruptorPipeline<E> implements EventPublisher<E> {
         try {
             sequence = ringBuffer.tryNext();
         } catch (InsufficientCapacityException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("管道 [{}] ring buffer 已满，tryPublish 拒绝（背压），剩余容量={}",
+                        name, ringBuffer.remainingCapacity());
+            }
             return false;
         }
         writeAndPublish(sequence, filler);
