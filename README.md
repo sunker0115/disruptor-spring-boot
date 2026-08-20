@@ -297,19 +297,18 @@ logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
 对外 bean 均 `@ConditionalOnMissingBean`，可声明同类型 bean 覆盖：`EventBus`、`Pipelines`、
 `PipelineBuilder`、`DisruptorConfig`、`StagePipelineRegistrar`、`SmartLifecycle`（生命周期）。
 
-## 分层结构
+## 模块结构
 
-代码按依赖分两层，边界单向、可按需拆为独立 Maven 模块：
+三个 Maven 模块，父 `disruptor-spring-boot`（pom）聚合，依赖方向单向 `starter → autoconfigure → core`：
 
-- `com.sstlfsj.disruptor.core` —— **无 Spring 依赖**：公开 API（`EventPublisher`/`EventBus`/`EventPipeline`/
-  `ShardKeyed`/`Resettable`）+ 构建与运行逻辑（`PipelineBuilder`/`DisruptorPipeline`/`Pipelines`/
-  `DefaultEventBus`/`PipelineTopology`/`DisruptorConfig`）。可脱离 Spring 独立使用（手工装配
-  `PipelineBuilder` + `DefaultEventBus` 即可）。
-- `com.sstlfsj.disruptor.autoconfigure` —— **Spring 相关（含 Spring Boot 自动装配）**：`@DisruptorStage`、
-  `StagePipelineRegistrar`（容器扫描桥接）、`DisruptorLifecycle`、`DisruptorProperties`、`DisruptorAutoConfiguration`。
+| 模块 | 依赖 | 内容 |
+|---|---|---|
+| `disruptor-core` | disruptor + slf4j，**无 Spring** | 公开 API（`EventPublisher`/`EventBus`/`EventPipeline`/`ShardKeyed`/`Resettable`）+ 构建/运行逻辑（`PipelineBuilder`/`DisruptorPipeline`/`Pipelines`/`DefaultEventBus`/`PipelineTopology`/`DisruptorConfig`）。可脱离 Spring 独立使用。 |
+| `disruptor-spring-boot-autoconfigure` | disruptor-core + spring-boot-autoconfigure | `@DisruptorStage`、`StagePipelineRegistrar`（容器扫描）、`DisruptorLifecycle`、`DisruptorProperties`、`DisruptorAutoConfiguration`。 |
+| `disruptor-spring-boot-starter` | disruptor-spring-boot-autoconfigure | 无代码，聚合依赖——**使用方引入此模块即可**（快速开始的坐标即它）。 |
 
-依赖方向 `autoconfigure → core`。`core` 独立可复用；真需要"Spring 非 Boot"层时，从 autoconfigure
-里把 `@DisruptorStage`/`StagePipelineRegistrar`/`DisruptorLifecycle` 再拆出即可。
+- **Spring Boot 项目** → 引 `disruptor-spring-boot-starter`（自动装配全套）。
+- **非 Spring / 纯 Java 项目** → 只引 `disruptor-core`，手工装配 `PipelineBuilder` + `DefaultEventBus`（见「配置项」编程方式）。
 
 ## 已知限制（设计取舍）
 
