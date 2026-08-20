@@ -168,13 +168,30 @@ public void process(IngestEvent e) { ... }   // 4 个线程并行，每事件恰
 
 ## 背压
 
+`publish` 在 ring buffer 满时**阻塞**发布线程直到有空槽；`tryPublish` **非阻塞**，满时返回 `false`
+由调用方决定降级；`remainingCapacity` 暴露剩余槽位（堆积 = bufferSize − 本值）。
+
+`tryPublish` 满时（返回 `false`）的三种典型降级形态：
+
 ```java
-if (!eventBus.tryPublish(OrderEvent.class, e -> { e.setOrderId(id); })) {
-    // ring buffer 满：非阻塞返回 false，自行降级（丢弃 / 落库 / 告警）
+// 1. 可丢弃（指标 / 埋点）：丢弃 + 计数
+if (!eventBus.tryPublish(MetricEvent.class, e -> e.set(name, value))) {
+    droppedCounter.increment();                 // Micrometer 记录背压丢弃量
 }
-long remaining = eventBus.remainingCapacity(OrderEvent.class);   // 剩余槽位，堆积 = bufferSize - 本值
+
+// 2. 不能丢（审计 / 对账）：降级落库，事后补偿重放
+if (!eventBus.tryPublish(AuditEvent.class, e -> e.fill(action))) {
+    auditFallbackRepo.save(new PendingAudit(action));
+}
+
+// 3. 关键请求：快速失败，把压力回推给上游（限流）
+if (!eventBus.tryPublish(OrderEvent.class, e -> e.fill(order))) {
+    throw new ServiceBusyException("系统繁忙，请稍后重试");   // 上游转 HTTP 429 / 降级页
+}
 ```
-`publish`（非 `tryPublish`）在满时会阻塞发布线程直到有空槽。
+
+- 能丢 → 形态 1；不能丢 → 形态 2（落库补偿）；关键链路不能丢又要快 → 形态 3（快速失败限流）。
+- **宁可阻塞等待也不丢** → 直接用 `publish`（满时阻塞发布线程）。`tryPublish` 的意义就是"宁可丢 / 降级，也不阻塞发布线程"。
 
 ## 配置项
 
@@ -196,8 +213,7 @@ long remaining = eventBus.remainingCapacity(OrderEvent.class);   // 剩余槽位
 - **启动即校验（fail-fast）**：方法非单参数、同管道类型不一致、事件类型跨管道重复、事件缺无参构造、
   阶段依赖环或引用不存在的阶段 —— 均导致启动失败。
 - **仅 public 方法**：只有 public 的 `@DisruptorStage` 方法会被识别。
-- **异常隔离**：阶段处理异常被记 ERROR 后跳过，不终止消费线程。
-- **进程内、非持久化**：事件仅在当前 JVM 内传递；进程崩溃时未消费事件丢失。
+- **异常隔离**：阶段处理异常被记 ERROR 后跳过，不终止消费线程（进程内/非持久化等边界见「已知限制」）。
 
 ## 日志与可观测
 
