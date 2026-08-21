@@ -1,37 +1,33 @@
-# 示例与教程模块设计(disruptor-spring-boot-example / -tutorial)
+# 示例模块设计(disruptor-spring-boot-example)
 
 日期:2026-08-20
 状态:已确认,待实现
 
+> tutorial 模块（真实场景教程）另见 `2026-08-21-tutorial-matching-scenario-design.md`（撮合场景）。本文档只覆盖 example 特性演示模块。
+
 ## 目标
 
-新增**两个独立** Maven 模块,把 README 的用法落成"能跑的":
+新增 `disruptor-spring-boot-example` 模块 —— **特性演示**。每个核心特性一个自包含、可跑的 console demo,外加一个
+无 Spring 的纯 Java main。把 README 的用法落成"能跑的",看"每个能力单独怎么用"。可独立运行。
 
-1. `disruptor-spring-boot-example` —— **特性演示**。每个核心特性一个自包含、可跑的 console demo,外加一个
-   无 Spring 的纯 Java main。看"每个能力单独怎么用"。
-2. `disruptor-spring-boot-tutorial` —— **真实场景教程**。一个带真实 HTTP 接口的 Spring Boot web 小应用,
-   演示"下单主流程 publish 完立刻返回、副作用后台异步多阶段处理"的实际用法与价值。看"实际应用里怎么落地、有什么用"。
-
-两模块互不依赖、各自可独立运行。
-
-## 硬约束(两模块内各自成立)
+## 硬约束
 
 同一 Spring 上下文里**管道名与事件类型全局唯一**(跨声明式/编程式冲突则启动 fail-fast)。example 模块六个
-demo 各用独立事件类型 + 管道名;tutorial 模块只有一条 `order` 管道,不冲突。
+demo 各用独立事件类型 + 管道名,不冲突。
 
 ## 前置改动(根 pom)
 
 - `<dependencyManagement>` 补一条 `disruptor-spring-boot-starter`(`<version>${revision}</version>`),与已有
-  core/autoconfigure 一致,使两个新模块引 starter 时不必写版本。
-- `<modules>` 在三模块之后追加 `disruptor-spring-boot-example`、`disruptor-spring-boot-tutorial`。
+  core/autoconfigure 一致,使新模块引 starter 时不必写版本。
+- `<modules>` 在三模块之后追加 `disruptor-spring-boot-example`(tutorial 模块的接线见其专属设计文档)。
 
-两模块 pom 共性:`<parent>` 版本用 `${revision}`;packaging `jar`;纯示例不部署;
+模块 pom 共性:`<parent>` 版本用 `${revision}`;packaging `jar`;纯示例不部署;
 `spring-boot-maven-plugin`(`<version>${spring-boot.version}</version>`,BOM 不管插件版本)支持 `mvn spring-boot:run`;
 Lombok(`org.projectlombok:lombok`,`<optional>true</optional>`,版本由父 BOM 管)写 POJO getter/setter。
 
 ---
 
-## 模块一:disruptor-spring-boot-example(特性演示,console)
+## disruptor-spring-boot-example(特性演示,console)
 
 ### 依赖
 - `com.sstlfsj:disruptor-spring-boot-starter`(不写版本,父 depMgmt 提供)。
@@ -100,80 +96,12 @@ spring:
 
 ---
 
-## 模块二:disruptor-spring-boot-tutorial(真实场景,web)
-
-**场景**:下单主流程与副作用解耦。HTTP `POST /orders` publish 一个 `OrderPlacedEvent` 后**立刻返回 202**,
-后台按 DAG 异步跑:校验 → 落库 → (发确认邮件 ‖ 扣库存 ‖ 埋点)。突发流量下 `tryPublish` 满时返回 429 背压。
-`GET /orders/stats` 看后台处理进度,直观体现"请求快速返回、副作用后台异步完成"。
-
-### 依赖
-- `com.sstlfsj:disruptor-spring-boot-starter`(不写版本)。
-- `org.springframework.boot:spring-boot-starter-web`(真实 HTTP 接口 + 内嵌 tomcat + logback)。
-- `org.projectlombok:lombok`(optional)。
-- 测试:`org.springframework.boot:spring-boot-starter-test`(test)。
-
-### 包结构 `com.sstlfsj.disruptor.tutorial`
-```
-TutorialApplication.java           @SpringBootApplication main(web)
-OrderPlacedEvent.java              事件:@Getter @Setter, implements Resettable
-OrderRecord.java                   不可变 record(落库快照,避免持有被复用的事件对象引用)
-InMemoryOrderRepository.java       @Component,ConcurrentHashMap<String,OrderRecord> 模拟落库
-OrderStats.java                    @Component,若干 AtomicInteger 计数(persisted/emailsSent/metricsRecorded/stockRemaining/rejected)
-OrderProcessingPipeline.java       @Component,注解式五阶段 DAG
-web/OrderController.java           @RestController POST /orders、GET /orders/stats
-web/PlaceOrderRequest.java         record(userId, amount, couponCode)
-resources/application.yml
-```
-
-### 事件与阶段
-- `OrderPlacedEvent implements Resettable`:`String orderId; String userId; long amount; String couponCode`(可选);
-  `reset()` 全部置 null/0(演示真实可选字段去残留)。
-- `OrderProcessingPipeline @Component @RequiredArgsConstructor`(注入 repo、stats),注解式 DAG:
-  - `validate`(源头):`amount<=0` 抛 `IllegalArgumentException`(顺带演示异常隔离:被记录不终止线程),否则 log。
-  - `persist`(after=validate):`repo.save(new OrderRecord(orderId,userId,amount,couponCode))`(**复制字段**入库,不存事件对象);`stats.persisted++`。
-  - `sendConfirmation`(after=persist):`Thread.sleep(短)` 模拟发信;`stats.emailsSent++`;log。
-  - `deductInventory`(after=persist):`stats.stockRemaining--`。
-  - `recordMetrics`(after=persist):`stats.metricsRecorded++`。
-  DAG = validate → persist → (sendConfirmation ‖ deductInventory ‖ recordMetrics),三个副作用并行 fan-out。
-
-### HTTP 接口(`OrderController @RestController @RequiredArgsConstructor`,注入 EventBus、OrderStats)
-- `POST /orders`(body `PlaceOrderRequest{String userId; long amount; String couponCode}`):
-  controller 生成 `orderId = UUID.randomUUID().toString()`,`boolean ok = eventBus.tryPublish(OrderPlacedEvent.class, e -> {填充 orderId/userId/amount/couponCode})`;
-  - `ok==false`:`stats.rejected++`,返回 `429` + `{"error":"系统繁忙，请稍后重试"}`(README 背压形态 3)。
-  - `ok==true`:返回 `202` + `{"orderId":..., "status":"accepted"}`(主流程 publish 完立刻返回)。
-- `GET /orders/stats`:返回 persisted/emailsSent/metricsRecorded/stockRemaining/rejected 的当前值。
-- `PlaceOrderRequest`:`record PlaceOrderRequest(String userId, long amount, String couponCode) {}`(Jackson 反序列化 record)。
-
-### application.yml(tutorial)
-```yaml
-disruptor:
-  buffer-size: 16          # 小 buffer,便于压测触发 429 背压
-  wait-strategy: YIELDING
-  shutdown-timeout: 10s
-logging:
-  level:
-    com.sstlfsj.disruptor: INFO
-server:
-  port: 8080
-```
-
-### 端到端验证测试
-`OrderFlowTest @SpringBootTest(webEnvironment=RANDOM_PORT)`,用 `TestRestTemplate`:
-- POST /orders `{userId:"u1", amount:100}` → 断言 `202` 且响应含非空 orderId。
-- 轮询 GET /orders/stats 直到 `persisted>=1`(超时 3s) → 断言 `emailsSent>=1`、`stockRemaining==99`、`metricsRecorded>=1`。
-阶段 sleep 保持毫秒级,测试秒级完成。
-
----
-
 ## README 指引
 
-主 `README.md` 末尾加「示例与教程」一节,分别指向两模块:
+主 `README.md` 加「示例与教程」一节,示例部分:
 - 特性演示:`mvn -pl disruptor-spring-boot-example spring-boot:run`(六个 demo 顺序打印);纯 Java 路径运行 `PureJavaExample`。
-- 真实场景:`mvn -pl disruptor-spring-boot-tutorial spring-boot:run` 起 web,附一条 curl 例:
-  `curl -XPOST localhost:8080/orders -H 'Content-Type: application/json' -d '{"userId":"u1","amount":100}'`,
-  再 `curl localhost:8080/orders/stats` 看后台异步处理结果。
 
 ## 不做(YAGNI)
 
 - 不演示"覆盖默认 bean(EventBus/Pipelines 等)"—— 运行价值低,注释点到即可。
-- 两模块均不部署;无鉴权/持久化/前端(教程聚焦"主流程解耦 + 背压"的直观价值)。
+- 模块不部署;无鉴权/持久化/前端(聚焦"每个特性单独怎么用"的直观价值)。

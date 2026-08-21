@@ -1,10 +1,12 @@
-# 示例与教程模块 Implementation Plan
+# 示例模块 Implementation Plan
+
+> tutorial 模块的实现计划另见 `2026-08-21-tutorial-matching-implementation.md`（撮合场景）。本文档只覆盖 example 特性演示模块。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 新增两个独立 Maven 模块:`disruptor-spring-boot-example`(六个特性 console 演示 + 纯 Java main)与 `disruptor-spring-boot-tutorial`(下单场景 web 小应用),把 README 用法落成能跑的。
+**Goal:** 新增 `disruptor-spring-boot-example`(六个特性 console 演示 + 纯 Java main),把 README 用法落成能跑的。
 
-**Architecture:** 两模块互不依赖。example 是 web-none 的 Spring Boot app,每特性一个 `@Order` 的 `CommandLineRunner`,各用独立事件类型/管道名规避全局唯一约束,由 `ExampleSmokeTest` 验证跑通;纯 Java demo 是独立 `main`。tutorial 是 spring-boot-starter-web 应用,`POST /orders` 用 `tryPublish` 发布后立刻返回 202(满则 429),后台注解式 DAG(校验→落库→(发信‖扣库存‖埋点))异步处理,`GET /orders/stats` 观测,由 `OrderFlowTest` 端到端验证。
+**Architecture:** example 是 web-none 的 Spring Boot app,每特性一个 `@Order` 的 `CommandLineRunner`,各用独立事件类型/管道名规避全局唯一约束,由 `ExampleSmokeTest` 验证跑通;纯 Java demo 是独立 `main`。
 
 **Tech Stack:** Java 17、Spring Boot 4.1.0、LMAX Disruptor 4.0、Lombok、JUnit 5、本仓 disruptor-spring-boot-starter。
 
@@ -23,14 +25,12 @@ cd /Users/sunke/dev/ai-project/disruptor-spring-boot
 
 ---
 
-## Task 1: 脚手架 —— 根 pom 改动 + 两模块 pom + Application 骨架
+## Task 1: 脚手架 —— 根 pom 改动 + example 模块 pom + Application 骨架
 
 **Files:**
-- Modify: `pom.xml`(dependencyManagement 加 starter、modules 加两模块)
+- Modify: `pom.xml`(dependencyManagement 加 starter、modules 加 example 模块)
 - Create: `disruptor-spring-boot-example/pom.xml`
-- Create: `disruptor-spring-boot-tutorial/pom.xml`
 - Create: `disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/ExampleApplication.java`
-- Create: `disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/TutorialApplication.java`
 
 - [ ] **Step 1: 根 pom 的 dependencyManagement 补 starter**
 
@@ -44,13 +44,12 @@ cd /Users/sunke/dev/ai-project/disruptor-spring-boot
             </dependency>
 ```
 
-- [ ] **Step 2: 根 pom 的 modules 追加两模块**
+- [ ] **Step 2: 根 pom 的 modules 追加 example 模块**
 
 在 `<modules>` 内三模块之后追加:
 
 ```xml
         <module>disruptor-spring-boot-example</module>
-        <module>disruptor-spring-boot-tutorial</module>
 ```
 
 - [ ] **Step 3: 创建 example pom**
@@ -106,60 +105,7 @@ cd /Users/sunke/dev/ai-project/disruptor-spring-boot
 </project>
 ```
 
-- [ ] **Step 4: 创建 tutorial pom**
-
-`disruptor-spring-boot-tutorial/pom.xml`(同上,artifactId 改 `disruptor-spring-boot-tutorial`,web 依赖换成 starter-web):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.sstlfsj</groupId>
-        <artifactId>disruptor-spring-boot</artifactId>
-        <version>${revision}</version>
-    </parent>
-    <artifactId>disruptor-spring-boot-tutorial</artifactId>
-
-    <description>真实场景教程:下单主流程 publish 后立刻返回、副作用后台异步多阶段处理的 web 小应用。</description>
-
-    <dependencies>
-        <dependency>
-            <groupId>com.sstlfsj</groupId>
-            <artifactId>disruptor-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>${spring-boot.version}</version>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-```
-
-- [ ] **Step 5: 两个 Application 骨架**
+- [ ] **Step 4: Application 骨架**
 
 `disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/ExampleApplication.java`:
 
@@ -177,34 +123,17 @@ public class ExampleApplication {
 }
 ```
 
-`disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/TutorialApplication.java`:
+- [ ] **Step 5: 编译 example 模块**
 
-```java
-package com.sstlfsj.disruptor.tutorial;
+Run: `$MVN -q -pl disruptor-spring-boot-example -am compile`
+Expected: BUILD SUCCESS。
 
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-@SpringBootApplication
-public class TutorialApplication {
-    public static void main(String[] args) {
-        SpringApplication.run(TutorialApplication.class, args);
-    }
-}
-```
-
-- [ ] **Step 6: 编译两模块**
-
-Run: `$MVN -q -pl disruptor-spring-boot-example,disruptor-spring-boot-tutorial -am compile`
-Expected: BUILD SUCCESS（两模块编译通过）。
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add pom.xml disruptor-spring-boot-example/pom.xml disruptor-spring-boot-tutorial/pom.xml \
-  disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/ExampleApplication.java \
-  disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/TutorialApplication.java
-git commit -m "feat: 脚手架 example/tutorial 两模块（pom + Application + 根 pom 接线）"
+git add pom.xml disruptor-spring-boot-example/pom.xml \
+  disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/ExampleApplication.java
+git commit -m "feat: 脚手架 example 模块（pom + Application + 根 pom 接线）"
 ```
 
 ---
@@ -1097,403 +1026,15 @@ git commit -m "test(example): application.yml + 冒烟测试断言五个 demo �
 
 ---
 
-## Task 9: tutorial —— 端到端测试先行（失败）
-
-**Files:**
-- Create: `disruptor-spring-boot-tutorial/src/test/java/com/sstlfsj/disruptor/tutorial/OrderFlowTest.java`
-
-- [ ] **Step 1: 写端到端测试（此时控制器/事件都还没有，编译或运行必失败）**
-
-`disruptor-spring-boot-tutorial/src/test/java/com/sstlfsj/disruptor/tutorial/OrderFlowTest.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-
-import java.util.Map;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.awaitility.Awaitility.await;
-import static java.util.concurrent.TimeUnit.SECONDS;
-
-/** 端到端：POST /orders 立刻 202；后台异步跑完后 stats 反映落库/发信/扣库存。 */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-class OrderFlowTest {
-
-    @Autowired
-    TestRestTemplate rest;
-
-    @Test
-    @SuppressWarnings("unchecked")
-    void placeOrderReturnsFastThenProcessedAsync() {
-        ResponseEntity<Map> post = rest.postForEntity(
-                "/orders", Map.of("userId", "u1", "amount", 100), Map.class);
-
-        assertThat(post.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
-        assertThat(post.getBody()).isNotNull();
-        assertThat(post.getBody().get("orderId")).asString().isNotEmpty();
-
-        await().atMost(3, SECONDS).untilAsserted(() -> {
-            Map<String, Integer> stats = rest.getForObject("/orders/stats", Map.class);
-            assertThat(stats.get("persisted")).isGreaterThanOrEqualTo(1);
-            assertThat(stats.get("emailsSent")).isGreaterThanOrEqualTo(1);
-            assertThat(stats.get("metricsRecorded")).isGreaterThanOrEqualTo(1);
-            assertThat(stats.get("stockRemaining")).isEqualTo(99);
-        });
-    }
-}
-```
-
-> Awaitility 随 `spring-boot-starter-test` 传递依赖（Spring Boot 管理其版本），无需单独声明。
-
-- [ ] **Step 2: 运行，确认失败**
-
-Run: `$MVN -pl disruptor-spring-boot-tutorial -am test -Dtest=OrderFlowTest -Dsurefire.failIfNoSpecifiedTests=false`
-Expected: 编译失败或测试失败(尚无 /orders 接口)。这是预期的红。
-
-- [ ] **Step 3: Commit（红测先入库）**
-
-```bash
-git add disruptor-spring-boot-tutorial/src/test/java/com/sstlfsj/disruptor/tutorial/OrderFlowTest.java
-git commit -m "test(tutorial): 端到端下单流程测试（先行，预期红）"
-```
-
----
-
-## Task 10: tutorial —— 事件、落库快照、仓库、统计
-
-**Files:**
-- Create: `.../tutorial/OrderPlacedEvent.java`
-- Create: `.../tutorial/OrderRecord.java`
-- Create: `.../tutorial/InMemoryOrderRepository.java`
-- Create: `.../tutorial/OrderStats.java`
-
-- [ ] **Step 1: OrderPlacedEvent(Resettable)**
-
-`.../tutorial/OrderPlacedEvent.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-import com.sstlfsj.disruptor.core.Resettable;
-import lombok.Getter;
-import lombok.Setter;
-
-@Getter
-@Setter
-public class OrderPlacedEvent implements Resettable {
-    private String orderId;
-    private String userId;
-    private long amount;
-    private String couponCode;   // 可选
-
-    @Override
-    public void reset() {
-        this.orderId = null;
-        this.userId = null;
-        this.amount = 0L;
-        this.couponCode = null;
-    }
-}
-```
-
-- [ ] **Step 2: OrderRecord(不可变落库快照)**
-
-`.../tutorial/OrderRecord.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-/** 落库快照：复制事件字段，避免持有会被复用的事件对象引用。 */
-public record OrderRecord(String orderId, String userId, long amount, String couponCode) {
-}
-```
-
-- [ ] **Step 3: InMemoryOrderRepository**
-
-`.../tutorial/InMemoryOrderRepository.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-import org.springframework.stereotype.Component;
-
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-@Component
-public class InMemoryOrderRepository {
-
-    private final Map<String, OrderRecord> store = new ConcurrentHashMap<>();
-
-    public void save(OrderRecord record) {
-        store.put(record.orderId(), record);
-    }
-
-    public int count() {
-        return store.size();
-    }
-}
-```
-
-- [ ] **Step 4: OrderStats**
-
-`.../tutorial/OrderStats.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-import org.springframework.stereotype.Component;
-
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
-
-@Component
-public class OrderStats {
-
-    private final AtomicInteger persisted = new AtomicInteger();
-    private final AtomicInteger emailsSent = new AtomicInteger();
-    private final AtomicInteger metricsRecorded = new AtomicInteger();
-    private final AtomicInteger stockRemaining = new AtomicInteger(100);
-    private final AtomicInteger rejected = new AtomicInteger();
-
-    public void onPersisted() { persisted.incrementAndGet(); }
-    public void onEmailSent() { emailsSent.incrementAndGet(); }
-    public void onMetricRecorded() { metricsRecorded.incrementAndGet(); }
-    public void onStockDeducted() { stockRemaining.decrementAndGet(); }
-    public void onRejected() { rejected.incrementAndGet(); }
-
-    public Map<String, Integer> snapshot() {
-        return Map.of(
-                "persisted", persisted.get(),
-                "emailsSent", emailsSent.get(),
-                "metricsRecorded", metricsRecorded.get(),
-                "stockRemaining", stockRemaining.get(),
-                "rejected", rejected.get());
-    }
-}
-```
-
-- [ ] **Step 5: 编译**
-
-Run: `$MVN -q -pl disruptor-spring-boot-tutorial -am compile`
-Expected: BUILD SUCCESS。
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/OrderPlacedEvent.java \
-  disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/OrderRecord.java \
-  disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/InMemoryOrderRepository.java \
-  disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/OrderStats.java
-git commit -m "feat(tutorial): 事件、落库快照、仓库、统计"
-```
-
----
-
-## Task 11: tutorial —— 处理管道（注解式五阶段 DAG）
-
-**Files:**
-- Create: `.../tutorial/OrderProcessingPipeline.java`
-
-- [ ] **Step 1: OrderProcessingPipeline**
-
-`.../tutorial/OrderProcessingPipeline.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial;
-
-import com.sstlfsj.disruptor.autoconfigure.DisruptorStage;
-import lombok.RequiredArgsConstructor;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
-
-/**
- * 下单后台处理：validate → persist → (sendConfirmation ‖ deductInventory ‖ recordMetrics)。
- * 三个副作用并行 fan-out，互不阻塞主流程。
- */
-@Component
-@RequiredArgsConstructor
-public class OrderProcessingPipeline {
-
-    private static final Logger log = LoggerFactory.getLogger(OrderProcessingPipeline.class);
-
-    private final InMemoryOrderRepository repository;
-    private final OrderStats stats;
-
-    @DisruptorStage(pipeline = "order", name = "validate")
-    public void validate(OrderPlacedEvent e) {
-        if (e.getAmount() <= 0) {
-            // 抛出会被框架隔离（记 ERROR、不终止消费线程）；演示异常隔离。
-            throw new IllegalArgumentException("非法金额: " + e.getAmount());
-        }
-        log.info("[order/validate] 订单 {} 用户 {} 金额 {} 校验通过",
-                e.getOrderId(), e.getUserId(), e.getAmount());
-    }
-
-    @DisruptorStage(pipeline = "order", name = "persist", after = "validate")
-    public void persist(OrderPlacedEvent e) {
-        repository.save(new OrderRecord(e.getOrderId(), e.getUserId(), e.getAmount(), e.getCouponCode()));
-        stats.onPersisted();
-        log.info("[order/persist] 订单 {} 已落库", e.getOrderId());
-    }
-
-    @DisruptorStage(pipeline = "order", name = "sendConfirmation", after = "persist")
-    public void sendConfirmation(OrderPlacedEvent e) throws InterruptedException {
-        Thread.sleep(10);   // 模拟发信 IO
-        stats.onEmailSent();
-        log.info("[order/sendConfirmation] 订单 {} 确认邮件已发", e.getOrderId());
-    }
-
-    @DisruptorStage(pipeline = "order", name = "deductInventory", after = "persist")
-    public void deductInventory(OrderPlacedEvent e) {
-        stats.onStockDeducted();
-        log.info("[order/deductInventory] 订单 {} 已扣库存", e.getOrderId());
-    }
-
-    @DisruptorStage(pipeline = "order", name = "recordMetrics", after = "persist")
-    public void recordMetrics(OrderPlacedEvent e) {
-        stats.onMetricRecorded();
-        log.info("[order/recordMetrics] 订单 {} 埋点已记", e.getOrderId());
-    }
-}
-```
-
-- [ ] **Step 2: 编译**
-
-Run: `$MVN -q -pl disruptor-spring-boot-tutorial -am compile`
-Expected: BUILD SUCCESS。
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/OrderProcessingPipeline.java
-git commit -m "feat(tutorial): 注解式五阶段处理 DAG"
-```
-
----
-
-## Task 12: tutorial —— 控制器 + 请求体 + yml，端到端转绿
-
-**Files:**
-- Create: `.../tutorial/web/PlaceOrderRequest.java`
-- Create: `.../tutorial/web/OrderController.java`
-- Create: `disruptor-spring-boot-tutorial/src/main/resources/application.yml`
-
-- [ ] **Step 1: PlaceOrderRequest**
-
-`.../tutorial/web/PlaceOrderRequest.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial.web;
-
-public record PlaceOrderRequest(String userId, long amount, String couponCode) {
-}
-```
-
-- [ ] **Step 2: OrderController**
-
-`.../tutorial/web/OrderController.java`:
-
-```java
-package com.sstlfsj.disruptor.tutorial.web;
-
-import com.sstlfsj.disruptor.core.EventBus;
-import com.sstlfsj.disruptor.tutorial.OrderPlacedEvent;
-import com.sstlfsj.disruptor.tutorial.OrderStats;
-import lombok.RequiredArgsConstructor;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Map;
-import java.util.UUID;
-
-@RestController
-@RequestMapping("/orders")
-@RequiredArgsConstructor
-public class OrderController {
-
-    private final EventBus eventBus;
-    private final OrderStats stats;
-
-    /** 下单：publish 后立刻返回 202；ring buffer 满则 429（背压回推）。 */
-    @PostMapping
-    public ResponseEntity<Map<String, String>> place(@RequestBody PlaceOrderRequest req) {
-        String orderId = UUID.randomUUID().toString();
-        boolean accepted = eventBus.tryPublish(OrderPlacedEvent.class, e -> {
-            e.setOrderId(orderId);
-            e.setUserId(req.userId());
-            e.setAmount(req.amount());
-            e.setCouponCode(req.couponCode());
-        });
-        if (!accepted) {
-            stats.onRejected();
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                    .body(Map.of("error", "系统繁忙，请稍后重试"));
-        }
-        return ResponseEntity.accepted().body(Map.of("orderId", orderId, "status", "accepted"));
-    }
-
-    /** 观测后台异步处理进度。 */
-    @GetMapping("/stats")
-    public Map<String, Integer> stats() {
-        return stats.snapshot();
-    }
-}
-```
-
-- [ ] **Step 3: application.yml**
-
-`disruptor-spring-boot-tutorial/src/main/resources/application.yml`:
-
-```yaml
-disruptor:
-  buffer-size: 16          # 小 buffer，便于压测触发 429 背压
-  wait-strategy: YIELDING
-  shutdown-timeout: 10s
-logging:
-  level:
-    com.sstlfsj.disruptor: INFO
-server:
-  port: 8080
-```
-
-- [ ] **Step 4: 运行端到端测试，确认转绿**
-
-Run: `$MVN -pl disruptor-spring-boot-tutorial -am test`
-Expected: `OrderFlowTest` PASS，`Tests run: 1, Failures: 0, Errors: 0` + BUILD SUCCESS。
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/web/ \
-  disruptor-spring-boot-tutorial/src/main/resources/application.yml
-git commit -m "feat(tutorial): 下单/统计 HTTP 接口 + yml，端到端转绿"
-```
-
----
-
 ## Task 13: 全量构建 + README 指引
 
 **Files:**
 - Modify: `README.md`(末尾加「示例与教程」一节)
 
-- [ ] **Step 1: 全量构建两模块及其依赖**
+- [ ] **Step 1: 全量构建**
 
 Run: `$MVN -q clean install`
-Expected: BUILD SUCCESS，五个模块(core/autoconfigure/starter/example/tutorial)全过,测试全绿。
+Expected: BUILD SUCCESS，全模块编译通过、测试全绿。
 
 - [ ] **Step 2: README 追加「示例与教程」小节**
 
@@ -1502,7 +1043,7 @@ Expected: BUILD SUCCESS，五个模块(core/autoconfigure/starter/example/tutori
 ```markdown
 ## 示例与教程
 
-仓库内两个可跑模块:
+仓库内示例模块:
 
 - **特性演示** `disruptor-spring-boot-example`:每个核心特性一个 console demo(声明式 DAG、编程式、
   并行+ShardKeyed、Resettable、背压三形态)。运行:
@@ -1512,36 +1053,22 @@ Expected: BUILD SUCCESS，五个模块(core/autoconfigure/starter/example/tutori
   ```
 
   纯 Java(无 Spring)路径见 `PureJavaExample`,从 IDE 直接运行其 `main`。
-
-- **真实场景教程** `disruptor-spring-boot-tutorial`:下单场景 web 小应用——`POST /orders` publish 后
-  立刻返回、副作用(落库/发信/扣库存/埋点)后台异步跑,满时 429 背压。运行:
-
-  ```bash
-  mvn -pl disruptor-spring-boot-tutorial spring-boot:run
-  # 下单（立刻返回 202 + orderId）
-  curl -XPOST localhost:8080/orders -H 'Content-Type: application/json' \
-    -d '{"userId":"u1","amount":100}'
-  # 看后台异步处理进度
-  curl localhost:8080/orders/stats
-  ```
 ```
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add README.md
-git commit -m "docs: README 增加示例与教程模块的运行指引"
+git commit -m "docs: README 增加示例模块的运行指引"
 ```
 
 ---
 
 ## Self-Review 记录
 
-- **Spec 覆盖**:example 六个 demo(Task2-7)+ yml/冒烟(Task8);tutorial 事件/仓库/统计(Task10)、DAG(Task11)、
-  接口/yml(Task12)、端到端测试(Task9/12);根 pom depMgmt+modules(Task1);README(Task13)。均有对应任务。
+- **Spec 覆盖**:example 六个 demo(Task2-7)+ yml/冒烟(Task8);根 pom depMgmt+modules(Task1);README(Task13)。均有对应任务。
 - **偏离 spec 处**:demo1/demo2 菱形并行分支改写**不同布尔字段**(persisted/audited)而非追加同一字符串,
   规避并发写竞态——工程上更正确,已在 Task2/3 注明。
-- **类型一致**:`DemoResults.markDone/isDone`、`OrderStats.on*/snapshot`、`InMemoryOrderRepository.save/count`、
-  `@DisruptorStage` 属性(pipeline/name/after/parallelism)、`EventBus.publish/tryPublish`、
+- **类型一致**:`DemoResults.markDone/isDone`、`@DisruptorStage` 属性(pipeline/name/after/parallelism)、`EventBus.publish/tryPublish`、
   `EventPipeline.builder(...).stage/after/build`、`DisruptorConfig(int,WaitStrategyType,Duration)` 全篇一致。
 - **无占位符**:所有步骤含完整代码与命令。

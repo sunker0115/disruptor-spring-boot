@@ -310,6 +310,16 @@ logger 名为各组件类全名（`com.sstlfsj.disruptor.*`），分级如下：
 - **Spring Boot 项目** → 引 `disruptor-spring-boot-starter`（自动装配全套）。
 - **非 Spring / 纯 Java 项目** → 只引 `disruptor-core`，手工装配 `PipelineBuilder` + `DefaultEventBus`（见「配置项」编程方式）。
 
+## 示例与教程
+
+两个可跑模块（不发布，仅供学习）：
+
+- `disruptor-spring-boot-example`：每个特性一个自包含 console demo（声明式 DAG / 编程式 builder / 并行分片 / 事件复用 / 背压三形态 / 纯 Java）。`mvn -pl disruptor-spring-boot-example spring-boot:run`。
+- `disruptor-spring-boot-tutorial`：真实场景**撮合** web 小应用——`POST /orders` 用 `tryPublish` 进环立刻返回 202（满则 429），后台**单线程** Disruptor 撮合（DAG `match → emit ‖ metrics`），`GET /orders/stats`、`GET /book?symbol=` 观测。
+  - 跑：`mvn -pl disruptor-spring-boot-tutorial spring-boot:run`，另开终端 `bash disruptor-spring-boot-tutorial/demo.sh` 一键演示下单/成交/盘口/背压。
+  - 价值点：撮合盘口 `OrderBook` 故意非线程安全，靠 Disruptor **单消费者无锁串行**跑对——线程池要么加锁争用、要么并发算错。这把"为什么必须 Disruptor"从性能问题升级成正确性问题。
+  - 进/出两端（HTTP controller、内存 sink）是薄接缝，生产对应 MQ 消费者 / 发 MQ，撮合中间段与生产逐字一致。
+
 ## 已知限制（设计取舍）
 
 - 一种事件类型一条管道，没有"一个总线随手发任意类型"——这是忠于 Disruptor 强类型/零分配的应有之义。
