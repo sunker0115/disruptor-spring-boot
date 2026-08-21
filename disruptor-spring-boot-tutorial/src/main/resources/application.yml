@@ -1,0 +1,11 @@
+server:
+  port: 8080
+
+disruptor:
+  buffer-size: 1024        # RingBuffer 槽位数（2 的幂）
+  wait-strategy: YIELDING  # 消费者无事件时的等待策略
+  shutdown-timeout: 10s    # 关停时每条管道排空 RingBuffer 的最长等待
+
+logging:
+  level:
+    com.sstlfsj.disruptor.tutorial: INFO    # 主干 accept/match/emit 为 INFO；看撮合明细/metrics 可临时改 DEBUG

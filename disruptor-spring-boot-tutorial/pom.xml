@@ -10,7 +10,7 @@
     </parent>
     <artifactId>disruptor-spring-boot-tutorial</artifactId>
 
-    <description>真实场景教程:下单主流程 publish 后立刻返回、副作用后台异步多阶段处理的 web 小应用。</description>
+    <description>真实场景教程:撮合 web 小应用 —— 下单 tryPublish 进环立刻返回 202/429，后台单线程 Disruptor 撮合，读侧观测盘口与成交。</description>
 
     <dependencies>
         <dependency>
