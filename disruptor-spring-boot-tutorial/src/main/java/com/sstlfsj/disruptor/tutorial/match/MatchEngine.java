@@ -22,6 +22,12 @@ import java.util.Map;
  *
  * <p>跨线程读盘口：{@link #handle} 末尾把各 symbol 的深度整体替换到 volatile {@link #depthView}，web 线程无锁读
  * （单写者安全发布）。</p>
+ *
+ * <p><b>后续优化点</b>（tutorial 以可读性优先，未做；详见设计文档 {@code 2026-08-21-tutorial-matching-scenario-design.md}
+ * 「后续优化点」节，按收益排序）：<br>
+ * 1. 热路径去 {@code BigDecimal} + 去每单分配——价量改 long 定点（价已有 {@code priceLong} 编码）、复用结果容器/预分配输出事件，
+ *    取代每单 {@code new ArrayList<>} 与 {@code MatchResult} 记录分配。这是撮合延迟主来源，收益最大。<br>
+ * 2. 管道改编程式 {@code EventPipeline} 声明，热路径去反射（注解式 stage 每事件走一次反射 invoke）；仅在第 1 点榨干、追亚微秒时才显现。</p>
  */
 public class MatchEngine {
 

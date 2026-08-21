@@ -149,3 +149,12 @@ resources/application.yml                 disruptor.* + server.port + logging
 - 不接真 MQ / DB / websocket / 网关（进出两端留占位）。
 - 不做 MARKET / IOC / FOK / POST_ONLY / 撤单 / 改单 / futures / 多分片撮合 / 快照重放。
 - 不依赖 raftkit artifact；不改 starter / autoconfigure / core / example 任何代码；不改 pom。
+
+## 后续优化点（追求更低延迟时，超出 tutorial 范围）
+
+tutorial 以可读性优先，未做以下优化。按**收益从大到小**排（真要压撮合延迟先动前者）：
+
+1. **撮合热路径去 `BigDecimal` + 去每单分配（收益最大）**：`handle()` 每单用 `BigDecimal` 做价量运算（每次运算几十~上百 ns 且分配对象），并 new 出 `List<MatchResult>` + 各 `MatchResult` 记录。生产级引擎（LMAX 式，亚微秒）改用 **long 定点数**（价已有 `priceLong`×10^8 编码，量同理）做价量运算，并**复用结果容器 / 用预分配的输出事件**取代每单 new。这两项是撮合延迟的主要来源，比下一条重要一两个数量级。
+2. **管道声明用编程式 `EventPipeline` 代替注解式，热路径去反射**：注解式 stage 每事件走一次 `ReflectionUtils.invokeMethod`（反射，`StagePipelineRegistrar` 里包成 `Consumer`）；编程式 `EventPipeline.builder(...).stage(name, consumer)` 是直接 `Consumer.accept`、可被 JIT 内联、无反射。差值约 ~10ns/stage/事件（预热后），仅在第 1 条已榨干、追亚微秒时才显现——故排在其后。
+
+两者都不改变 Disruptor 拓扑/线程模型，纯属 stage 内部实现的微观优化。真要落地建议先加 JMH 微基准量化，再按上面顺序动手。
