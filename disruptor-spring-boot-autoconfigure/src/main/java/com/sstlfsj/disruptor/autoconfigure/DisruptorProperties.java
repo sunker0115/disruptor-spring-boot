@@ -6,6 +6,7 @@ import com.lmax.disruptor.SleepingWaitStrategy;
 import com.lmax.disruptor.WaitStrategy;
 import com.lmax.disruptor.YieldingWaitStrategy;
 import com.lmax.disruptor.dsl.ProducerType;
+import com.sstlfsj.disruptor.core.ErrorStrategy;
 import com.sstlfsj.disruptor.core.PipelineSettings;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -87,6 +88,8 @@ public class DisruptorProperties {
                 ? defaults.shutdownTimeout : override.shutdownTimeout;
         boolean daemonThreads = override == null || override.daemonThreads == null
                 ? defaults.daemonThreads : override.daemonThreads;
+        ErrorStrategy errorStrategy = override == null || override.errorStrategy == null
+                ? defaults.errorStrategy : override.errorStrategy;
 
         return PipelineSettings.builder()
                 .bufferSize(bufferSize)
@@ -94,6 +97,7 @@ public class DisruptorProperties {
                 .waitStrategy(waitStrategy.factory())
                 .threadFactory(name -> new NamedThreadFactory(name, daemonThreads))
                 .shutdownTimeout(shutdownTimeout)
+                .exceptionHandler(errorStrategy.handler())
                 .build();
     }
 
@@ -113,6 +117,9 @@ public class DisruptorProperties {
 
         /** 消费线程是否为 daemon 线程。 */
         private boolean daemonThreads;
+
+        /** 消费异常的默认处置策略;默认记录并跳过、继续消费(避免一条异常卡死整条管道)。 */
+        private ErrorStrategy errorStrategy = ErrorStrategy.LOG_AND_CONTINUE;
 
         public int getBufferSize() {
             return bufferSize;
@@ -153,6 +160,14 @@ public class DisruptorProperties {
         public void setDaemonThreads(boolean daemonThreads) {
             this.daemonThreads = daemonThreads;
         }
+
+        public ErrorStrategy getErrorStrategy() {
+            return errorStrategy;
+        }
+
+        public void setErrorStrategy(ErrorStrategy errorStrategy) {
+            this.errorStrategy = errorStrategy;
+        }
     }
 
     public static class Pipeline {
@@ -171,6 +186,9 @@ public class DisruptorProperties {
 
         /** 覆盖此管道的 daemon 线程设置。 */
         private Boolean daemonThreads;
+
+        /** 覆盖此管道的消费异常处置策略。 */
+        private ErrorStrategy errorStrategy;
 
         public Integer getBufferSize() {
             return bufferSize;
@@ -210,6 +228,14 @@ public class DisruptorProperties {
 
         public void setDaemonThreads(Boolean daemonThreads) {
             this.daemonThreads = daemonThreads;
+        }
+
+        public ErrorStrategy getErrorStrategy() {
+            return errorStrategy;
+        }
+
+        public void setErrorStrategy(ErrorStrategy errorStrategy) {
+            this.errorStrategy = errorStrategy;
         }
     }
 

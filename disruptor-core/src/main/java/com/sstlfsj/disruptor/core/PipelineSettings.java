@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor.core;
 
 import com.lmax.disruptor.BlockingWaitStrategy;
+import com.lmax.disruptor.ExceptionHandler;
 import com.lmax.disruptor.WaitStrategy;
 import com.lmax.disruptor.dsl.ProducerType;
 
@@ -19,7 +20,8 @@ public record PipelineSettings(
         ProducerType producerType,
         Supplier<? extends WaitStrategy> waitStrategyFactory,
         Function<String, ThreadFactory> threadFactoryFactory,
-        Duration shutdownTimeout) {
+        Duration shutdownTimeout,
+        ExceptionHandler<Object> exceptionHandler) {
 
     public PipelineSettings {
         validateBufferSize(bufferSize);
@@ -27,6 +29,7 @@ public record PipelineSettings(
         Objects.requireNonNull(waitStrategyFactory, "waitStrategyFactory 不能为空");
         Objects.requireNonNull(threadFactoryFactory, "threadFactoryFactory 不能为空");
         validateShutdownTimeout(shutdownTimeout);
+        Objects.requireNonNull(exceptionHandler, "exceptionHandler 不能为空");
     }
 
     public static PipelineSettings defaults() {
@@ -61,6 +64,7 @@ public record PipelineSettings(
         private Supplier<? extends WaitStrategy> waitStrategyFactory = BlockingWaitStrategy::new;
         private Function<String, ThreadFactory> threadFactoryFactory = NamedThreadFactory::new;
         private Duration shutdownTimeout = Duration.ofSeconds(10);
+        private ExceptionHandler<Object> exceptionHandler = ErrorStrategy.LOG_AND_CONTINUE.handler();
 
         private Builder() {
         }
@@ -92,9 +96,14 @@ public record PipelineSettings(
             return this;
         }
 
+        public Builder exceptionHandler(ExceptionHandler<Object> exceptionHandler) {
+            this.exceptionHandler = Objects.requireNonNull(exceptionHandler, "exceptionHandler 不能为空");
+            return this;
+        }
+
         public PipelineSettings build() {
             return new PipelineSettings(bufferSize, producerType, waitStrategyFactory,
-                    threadFactoryFactory, shutdownTimeout);
+                    threadFactoryFactory, shutdownTimeout, exceptionHandler);
         }
     }
 

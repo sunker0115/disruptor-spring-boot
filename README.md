@@ -76,12 +76,14 @@ disruptor:
     wait-strategy: BLOCKING
     shutdown-timeout: 10s
     daemon-threads: false
+    error-strategy: LOG_AND_CONTINUE
   pipelines:
     orders:
       buffer-size: 65536
       producer-type: SINGLE
       wait-strategy: BUSY_SPIN
       shutdown-timeout: 30s
+      error-strategy: HALT
   metrics:
     enabled: true
 ```
@@ -100,7 +102,18 @@ disruptor:
 
 ### 异常处理
 
-默认不覆盖 LMAX 的异常策略。需要全管道策略时：
+默认策略是 `LOG_AND_CONTINUE`：某条事件处理抛异常时，记录 ERROR 日志并跳过该条、继续消费后续事件——避免 Disruptor 原生 `FatalExceptionHandler` 那样一条异常就终止消费者、令序列停推而卡死整条管道。声明式可按环境切换（`LOG_AND_CONTINUE` / `HALT`；`HALT` 记录后抛出、终止该消费者，仅用于出错即停 + 人工介入的严格场景）：
+
+```yaml
+disruptor:
+  defaults:
+    error-strategy: LOG_AND_CONTINUE
+  pipelines:
+    orders:
+      error-strategy: HALT
+```
+
+需要完全自定义（按事件类型、单条重试计数、失败投递通道等）时，用编程式逃生口：
 
 ```java
 PipelineSpec.builder("orders", OrderEvent.class, OrderEvent::new)
@@ -109,7 +122,7 @@ PipelineSpec.builder("orders", OrderEvent.class, OrderEvent::new)
         .build();
 ```
 
-需要处理器级策略时，在 `topology` 中直接调用 `disruptor.handleExceptionsFor(handler).with(...)`。Starter 不捕获处理器异常，也不会让异常事件伪装成已成功处理后继续流向下游。
+需要处理器级差异化策略时，在 `topology` 中直接调用 `disruptor.handleExceptionsFor(handler).with(...)`。优先级同其它旋钮：`PipelineSpec.exceptionHandler` > `disruptor.pipelines.<name>.error-strategy` > `disruptor.defaults.error-strategy` > 框架默认 `LOG_AND_CONTINUE`。Starter 不在消费者外包裹委托层，也不会让异常事件伪装成已成功处理后流向下游。
 
 ### 事件槽位复用
 

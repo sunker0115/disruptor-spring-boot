@@ -68,7 +68,7 @@ public final class PipelineSpec<E> {
         return exceptionHandler;
     }
 
-    ResolvedPipelineSettings resolve(PipelineSettings settings) {
+    ResolvedPipelineSettings<E> resolve(PipelineSettings settings) {
         Objects.requireNonNull(settings, "settings 不能为空");
         int resolvedBufferSize = bufferSize == null ? settings.bufferSize() : bufferSize;
         ProducerType resolvedProducerType = producerType == null ? settings.producerType() : producerType;
@@ -78,17 +78,20 @@ public final class PipelineSpec<E> {
                 ? settings.threadFactoryFactory().apply(name) : threadFactory;
         Duration resolvedShutdownTimeout = shutdownTimeout == null
                 ? settings.shutdownTimeout() : shutdownTimeout;
+        ExceptionHandler<? super E> resolvedExceptionHandler = exceptionHandler == null
+                ? settings.exceptionHandler() : exceptionHandler;
 
         PipelineSettings.validateBufferSize(resolvedBufferSize);
         PipelineSettings.validateShutdownTimeout(resolvedShutdownTimeout);
         WaitStrategy resolvedWaitStrategy = Objects.requireNonNull(resolvedWaitStrategyFactory.get(),
                 "waitStrategyFactory 不能返回 null");
-        return new ResolvedPipelineSettings(
+        return new ResolvedPipelineSettings<>(
                 resolvedBufferSize,
                 Objects.requireNonNull(resolvedProducerType, "producerType 不能为空"),
                 resolvedWaitStrategy,
                 Objects.requireNonNull(resolvedThreadFactory, "threadFactory 不能为空"),
-                resolvedShutdownTimeout);
+                resolvedShutdownTimeout,
+                Objects.requireNonNull(resolvedExceptionHandler, "exceptionHandler 不能为空"));
     }
 
     public static final class Builder<E> {

@@ -103,6 +103,7 @@ disruptor:
     wait-strategy: BLOCKING
     shutdown-timeout: 10s
     daemon-threads: false
+    error-strategy: LOG_AND_CONTINUE
   pipelines:
     matching:
       producer-type: SINGLE
@@ -118,9 +119,9 @@ core 安全默认值
   < PipelineSpec 显式值
 ```
 
-因 `PipelineSpec 显式值` 位于链尾（最高优先级），一旦 spec 在代码里设置了某个基建旋钮（如 `bufferSize`、`waitStrategy`、`shutdownTimeout`），`disruptor.pipelines.<name>` 与 `disruptor.defaults` 便无法再覆盖它。这是"编程优先"框架下的自然取舍——PipelineSpec 是权威源，属性只填充其未指定的字段。因此若希望某旋钮可由外部配置按环境调优（dev/prod 不同 buffer 等），spec 中应保持该字段未设置（留空），交由 `disruptor.pipelines.<name>` / `disruptor.defaults` 填充。topology、事件类型与工厂等只能存在于代码，不在此取舍范围内。
+因 `PipelineSpec 显式值` 位于链尾（最高优先级），一旦 spec 在代码里设置了某个基建旋钮（如 `bufferSize`、`waitStrategy`、`shutdownTimeout`、`errorStrategy`），`disruptor.pipelines.<name>` 与 `disruptor.defaults` 便无法再覆盖它。这是"编程优先"框架下的自然取舍——PipelineSpec 是权威源，属性只填充其未指定的字段。因此若希望某旋钮可由外部配置按环境调优（dev/prod 不同 buffer 等），spec 中应保持该字段未设置（留空），交由 `disruptor.pipelines.<name>` / `disruptor.defaults` 填充。topology、事件类型与工厂等只能存在于代码，不在此取舍范围内。
 
-默认使用 `MULTI + BLOCKING + 1024 + 非 daemon + 10s`。默认不调用 `setDefaultExceptionHandler`，保留 LMAX 原生异常策略。
+默认使用 `MULTI + BLOCKING + 1024 + 非 daemon + 10s + LOG_AND_CONTINUE`。异常处理统一走 `setDefaultExceptionHandler`：框架默认注入 `LOG_AND_CONTINUE`（基于 SLF4J 记录并跳过出错事件、继续消费），替代 LMAX 原生 `FatalExceptionHandler`（后者 rethrow 会终止消费者、令序列停推而卡死整条管道）。可经 `error-strategy` 按环境切换为 `HALT`，或用 `PipelineSpec.exceptionHandler(...)` 提供完整自定义。
 
 配置只为无参数常见等待策略提供枚举。需要构造参数或自定义实现时，由 `PipelineSpec` 提供原生策略工厂。
 
@@ -128,7 +129,7 @@ core 安全默认值
 
 - topology 注册完成后，处理器由 LMAX `BatchEventProcessor` 直接调用；
 - Starter 不把处理器压缩为 `Consumer<E>`；
-- Starter 不捕获事件处理异常；全局和处理器级异常策略均走 LMAX 原生机制；
+- 事件处理异常交由 Disruptor 默认 `ExceptionHandler` 处置（框架默认 `LOG_AND_CONTINUE`：记录并跳过、继续消费）；Starter 不在消费者外再包裹 try-catch 委托层，也不让异常事件伪装成已成功处理后流向下游；处理器级策略走原生 `handleExceptionsFor`；
 - 发布直接访问同一个 `RingBuffer<E>`，没有委托层和状态分支；
 - 静态 translator 可避免捕获型 lambda 分配，但业务处理器与参数对象分配不属于 Starter 承诺；
 - translator 抛出异常时仍发布已领取槽位，这是 LMAX 官方契约，文档要求 translator 不抛异常；
@@ -162,7 +163,7 @@ Starter 引入 `spring-boot-starter`，使用方只依赖 Starter 即具备完�
 核心测试必须使用真实 Disruptor，覆盖：
 
 - 原生 `sequence/endOfBatch/onBatchStart/onStart/onShutdown/setSequenceCallback`；
-- 默认与处理器级异常处理；
+- 默认异常策略（`LOG_AND_CONTINUE` 不卡死、`HALT` 终止）与处理器级异常处理；
 - rewind、自定义 processor 和 processor factory 的 topology 可达性；
 - 0/1/2/3 参数与批量 translator；
 - 无无参构造的事件工厂；

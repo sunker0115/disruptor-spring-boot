@@ -148,16 +148,15 @@ public final class DisruptorRuntime {
 
     private static <E> DefaultPipelineHandle<E> buildHandle(PipelineSpec<E> spec,
                                                              PipelineSettings settings) {
-        ResolvedPipelineSettings resolved = spec.resolve(settings);
+        ResolvedPipelineSettings<E> resolved = spec.resolve(settings);
         Disruptor<E> disruptor = new Disruptor<>(
                 spec.eventFactory(),
                 resolved.bufferSize(),
                 resolved.threadFactory(),
                 resolved.producerType(),
                 resolved.waitStrategy());
-        if (spec.exceptionHandler() != null) {
-            disruptor.setDefaultExceptionHandler(spec.exceptionHandler());
-        }
+        // 统一在 topology 装配之前设置默认异常处理器(经 ExceptionHandlerWrapper,对存量+新建 processor 均生效)。
+        disruptor.setDefaultExceptionHandler(resolved.exceptionHandler());
         try {
             spec.topology().configure(disruptor);
         } catch (RuntimeException | Error failure) {

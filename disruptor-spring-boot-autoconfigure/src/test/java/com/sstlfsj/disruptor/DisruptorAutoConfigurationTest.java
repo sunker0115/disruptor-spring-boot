@@ -76,6 +76,40 @@ class DisruptorAutoConfigurationTest {
     }
 
     @Test
+    void defaultErrorStrategyContinuesConsumingAfterHandlerException() {
+        CountDownLatch succeeded = new CountDownLatch(2);
+        contextRunner.withBean("faulty", PipelineSpec.class, () -> PipelineSpec
+                        .builder("faulty", TestEvent.class, TestEvent::new)
+                        .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
+                            if ("boom".equals(event.value)) {
+                                throw new IllegalStateException("boom");
+                            }
+                            succeeded.countDown();
+                        }))
+                        .build())
+                .run(context -> {
+                    PipelineHandle<TestEvent> handle = context.getBean(DisruptorRuntime.class)
+                            .require("faulty", TestEvent.class);
+                    EventTranslatorOneArg<TestEvent, String> translator =
+                            (event, sequence, value) -> event.value = value;
+                    handle.ringBuffer().publishEvent(translator, "ok-1");
+                    handle.ringBuffer().publishEvent(translator, "boom");
+                    handle.ringBuffer().publishEvent(translator, "ok-2");
+                    // 未配 error-strategy → 默认 LOG_AND_CONTINUE:出错事件被跳过,前后正常事件都消费,管道不卡死。
+                    assertThat(succeeded.await(2, TimeUnit.SECONDS)).isTrue();
+                });
+    }
+
+    @Test
+    void bindsErrorStrategyFromPropertiesWithRelaxedEnum() {
+        contextRunner.withUserConfiguration(SinglePipeline.class)
+                .withPropertyValues(
+                        "disruptor.defaults.error-strategy=log-and-continue",
+                        "disruptor.pipelines.orders.error-strategy=halt")
+                .run(context -> assertThat(context).hasSingleBean(DisruptorRuntime.class));
+    }
+
+    @Test
     void failsOnUnknownNamedConfiguration() {
         contextRunner.withUserConfiguration(SinglePipeline.class)
                 .withPropertyValues("disruptor.pipelines.misspelled.buffer-size=64")
