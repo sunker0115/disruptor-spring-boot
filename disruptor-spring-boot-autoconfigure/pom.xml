@@ -44,6 +44,13 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <!-- 提供真实 Micrometer 装配（MetricsAutoConfiguration / SimpleMetricsExportAutoConfiguration），
+                 用于验证 DisruptorMetricsAutoConfiguration 的 afterName 装配顺序与自动绑定。 -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-micrometer-metrics</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>

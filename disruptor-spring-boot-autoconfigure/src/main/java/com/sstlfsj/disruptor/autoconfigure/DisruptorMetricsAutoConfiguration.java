@@ -13,8 +13,8 @@ import org.springframework.context.annotation.Bean;
 @AutoConfiguration(
         after = DisruptorAutoConfiguration.class,
         afterName = {
-                "org.springframework.boot.metrics.autoconfigure.MetricsAutoConfiguration",
-                "org.springframework.boot.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration"
+                "org.springframework.boot.micrometer.metrics.autoconfigure.MetricsAutoConfiguration",
+                "org.springframework.boot.micrometer.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration"
         })
 @ConditionalOnClass(MeterRegistry.class)
 @ConditionalOnBean({DisruptorRuntime.class, MeterRegistry.class})
