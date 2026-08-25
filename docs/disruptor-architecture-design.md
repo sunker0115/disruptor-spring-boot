@@ -118,6 +118,8 @@ core 安全默认值
   < PipelineSpec 显式值
 ```
 
+因 `PipelineSpec 显式值` 位于链尾（最高优先级），一旦 spec 在代码里设置了某个基建旋钮（如 `bufferSize`、`waitStrategy`、`shutdownTimeout`），`disruptor.pipelines.<name>` 与 `disruptor.defaults` 便无法再覆盖它。这是"编程优先"框架下的自然取舍——PipelineSpec 是权威源，属性只填充其未指定的字段。因此若希望某旋钮可由外部配置按环境调优（dev/prod 不同 buffer 等），spec 中应保持该字段未设置（留空），交由 `disruptor.pipelines.<name>` / `disruptor.defaults` 填充。topology、事件类型与工厂等只能存在于代码，不在此取舍范围内。
+
 默认使用 `MULTI + BLOCKING + 1024 + 非 daemon + 10s`。默认不调用 `setDefaultExceptionHandler`，保留 LMAX 原生异常策略。
 
 配置只为无参数常见等待策略提供枚举。需要构造参数或自定义实现时，由 `PipelineSpec` 提供原生策略工厂。
