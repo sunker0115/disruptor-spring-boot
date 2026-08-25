@@ -1,53 +1,266 @@
 package com.sstlfsj.disruptor.autoconfigure;
 
-import com.sstlfsj.disruptor.core.DisruptorConfig;
+import com.lmax.disruptor.BlockingWaitStrategy;
+import com.lmax.disruptor.BusySpinWaitStrategy;
+import com.lmax.disruptor.SleepingWaitStrategy;
+import com.lmax.disruptor.WaitStrategy;
+import com.lmax.disruptor.YieldingWaitStrategy;
+import com.lmax.disruptor.dsl.ProducerType;
+import com.sstlfsj.disruptor.core.PipelineSettings;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
-/**
- * Configuration properties bound from the {@code disruptor.*} namespace，转换为 core 层无 Spring 的
- * {@link DisruptorConfig} 传给管道构建与生命周期。全局参数应用于所有管道；处理阶段拓扑由
- * {@code @DisruptorStage} 或编程式 {@code EventPipeline} 声明，不在此配置。
- */
+/** Disruptor 自动配置属性。 */
 @ConfigurationProperties(prefix = "disruptor")
 public class DisruptorProperties {
 
-    /** Ring buffer size per pipeline; must be a power of two. */
-    private int bufferSize = 1024;
+    /** 是否启用自动配置。 */
+    private boolean enabled = true;
 
-    /** Wait strategy used by consumers when no event is available. */
-    private DisruptorConfig.WaitStrategyType waitStrategy = DisruptorConfig.WaitStrategyType.YIELDING;
+    /** Spring 生命周期阶段；值越小越早启动、越晚停止。 */
+    private int lifecyclePhase = Integer.MIN_VALUE;
 
-    /** Maximum time to wait for each pipeline's ring buffer to drain during shutdown before halting. */
-    private Duration shutdownTimeout = Duration.ofSeconds(10);
+    /** 所有管道的默认设置。 */
+    private Defaults defaults = new Defaults();
 
-    public int getBufferSize() {
-        return bufferSize;
+    /** 按管道名覆盖默认设置。 */
+    private Map<String, Pipeline> pipelines = new LinkedHashMap<>();
+
+    /** Micrometer 只读指标设置。 */
+    private Metrics metrics = new Metrics();
+
+    public boolean isEnabled() {
+        return enabled;
     }
 
-    public void setBufferSize(int bufferSize) {
-        this.bufferSize = bufferSize;
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
     }
 
-    public DisruptorConfig.WaitStrategyType getWaitStrategy() {
-        return waitStrategy;
+    public int getLifecyclePhase() {
+        return lifecyclePhase;
     }
 
-    public void setWaitStrategy(DisruptorConfig.WaitStrategyType waitStrategy) {
-        this.waitStrategy = waitStrategy;
+    public void setLifecyclePhase(int lifecyclePhase) {
+        this.lifecyclePhase = lifecyclePhase;
     }
 
-    public Duration getShutdownTimeout() {
-        return shutdownTimeout;
+    public Defaults getDefaults() {
+        return defaults;
     }
 
-    public void setShutdownTimeout(Duration shutdownTimeout) {
-        this.shutdownTimeout = shutdownTimeout;
+    public void setDefaults(Defaults defaults) {
+        this.defaults = defaults;
     }
 
-    /** 转为 core 层的无 Spring 配置值对象。 */
-    public DisruptorConfig toConfig() {
-        return new DisruptorConfig(bufferSize, waitStrategy, shutdownTimeout);
+    public Map<String, Pipeline> getPipelines() {
+        return pipelines;
+    }
+
+    public void setPipelines(Map<String, Pipeline> pipelines) {
+        this.pipelines = pipelines;
+    }
+
+    public Metrics getMetrics() {
+        return metrics;
+    }
+
+    public void setMetrics(Metrics metrics) {
+        this.metrics = metrics;
+    }
+
+    PipelineSettings settingsFor(String pipelineName) {
+        Pipeline override = pipelines.get(pipelineName);
+        int bufferSize = override == null || override.bufferSize == null
+                ? defaults.bufferSize : override.bufferSize;
+        ProducerType producerType = override == null || override.producerType == null
+                ? defaults.producerType : override.producerType;
+        WaitStrategyType waitStrategy = override == null || override.waitStrategy == null
+                ? defaults.waitStrategy : override.waitStrategy;
+        Duration shutdownTimeout = override == null || override.shutdownTimeout == null
+                ? defaults.shutdownTimeout : override.shutdownTimeout;
+        boolean daemonThreads = override == null || override.daemonThreads == null
+                ? defaults.daemonThreads : override.daemonThreads;
+
+        return PipelineSettings.builder()
+                .bufferSize(bufferSize)
+                .producerType(producerType)
+                .waitStrategy(waitStrategy.factory())
+                .threadFactory(name -> new NamedThreadFactory(name, daemonThreads))
+                .shutdownTimeout(shutdownTimeout)
+                .build();
+    }
+
+    public static class Defaults {
+
+        /** RingBuffer 容量，必须是正的 2 的幂。 */
+        private int bufferSize = 1024;
+
+        /** 生产者类型。 */
+        private ProducerType producerType = ProducerType.MULTI;
+
+        /** 常用等待策略预设；需要构造参数的策略应在 PipelineSpec 中直接配置。 */
+        private WaitStrategyType waitStrategy = WaitStrategyType.BLOCKING;
+
+        /** 单条管道关闭时等待积压事件排空的最长时间。 */
+        private Duration shutdownTimeout = Duration.ofSeconds(10);
+
+        /** 消费线程是否为 daemon 线程。 */
+        private boolean daemonThreads;
+
+        public int getBufferSize() {
+            return bufferSize;
+        }
+
+        public void setBufferSize(int bufferSize) {
+            this.bufferSize = bufferSize;
+        }
+
+        public ProducerType getProducerType() {
+            return producerType;
+        }
+
+        public void setProducerType(ProducerType producerType) {
+            this.producerType = producerType;
+        }
+
+        public WaitStrategyType getWaitStrategy() {
+            return waitStrategy;
+        }
+
+        public void setWaitStrategy(WaitStrategyType waitStrategy) {
+            this.waitStrategy = waitStrategy;
+        }
+
+        public Duration getShutdownTimeout() {
+            return shutdownTimeout;
+        }
+
+        public void setShutdownTimeout(Duration shutdownTimeout) {
+            this.shutdownTimeout = shutdownTimeout;
+        }
+
+        public boolean isDaemonThreads() {
+            return daemonThreads;
+        }
+
+        public void setDaemonThreads(boolean daemonThreads) {
+            this.daemonThreads = daemonThreads;
+        }
+    }
+
+    public static class Pipeline {
+
+        /** 覆盖此管道的 RingBuffer 容量。 */
+        private Integer bufferSize;
+
+        /** 覆盖此管道的生产者类型。 */
+        private ProducerType producerType;
+
+        /** 覆盖此管道的等待策略预设。 */
+        private WaitStrategyType waitStrategy;
+
+        /** 覆盖此管道的关闭等待时间。 */
+        private Duration shutdownTimeout;
+
+        /** 覆盖此管道的 daemon 线程设置。 */
+        private Boolean daemonThreads;
+
+        public Integer getBufferSize() {
+            return bufferSize;
+        }
+
+        public void setBufferSize(Integer bufferSize) {
+            this.bufferSize = bufferSize;
+        }
+
+        public ProducerType getProducerType() {
+            return producerType;
+        }
+
+        public void setProducerType(ProducerType producerType) {
+            this.producerType = producerType;
+        }
+
+        public WaitStrategyType getWaitStrategy() {
+            return waitStrategy;
+        }
+
+        public void setWaitStrategy(WaitStrategyType waitStrategy) {
+            this.waitStrategy = waitStrategy;
+        }
+
+        public Duration getShutdownTimeout() {
+            return shutdownTimeout;
+        }
+
+        public void setShutdownTimeout(Duration shutdownTimeout) {
+            this.shutdownTimeout = shutdownTimeout;
+        }
+
+        public Boolean getDaemonThreads() {
+            return daemonThreads;
+        }
+
+        public void setDaemonThreads(Boolean daemonThreads) {
+            this.daemonThreads = daemonThreads;
+        }
+    }
+
+    public static class Metrics {
+
+        /** classpath 存在 Micrometer 时是否注册只读指标。 */
+        private boolean enabled = true;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+    }
+
+    public enum WaitStrategyType {
+        BLOCKING(BlockingWaitStrategy::new),
+        BUSY_SPIN(BusySpinWaitStrategy::new),
+        YIELDING(YieldingWaitStrategy::new),
+        SLEEPING(SleepingWaitStrategy::new);
+
+        private final Supplier<? extends WaitStrategy> factory;
+
+        WaitStrategyType(Supplier<? extends WaitStrategy> factory) {
+            this.factory = factory;
+        }
+
+        Supplier<? extends WaitStrategy> factory() {
+            return factory;
+        }
+    }
+
+    private static final class NamedThreadFactory implements ThreadFactory {
+
+        private final String pipelineName;
+        private final boolean daemon;
+        private final AtomicInteger sequence = new AtomicInteger(1);
+
+        private NamedThreadFactory(String pipelineName, boolean daemon) {
+            this.pipelineName = pipelineName;
+            this.daemon = daemon;
+        }
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable,
+                    "disruptor-" + pipelineName + "-" + sequence.getAndIncrement());
+            thread.setDaemon(daemon);
+            return thread;
+        }
     }
 }

@@ -42,7 +42,7 @@ for i in $(seq 1 60); do codes="$codes $(post BUY 80 1)"; done
 echo "  60 次快速下单的 HTTP 状态分布:"
 echo "$codes" | tr ' ' '\n' | grep -v '^$' | sort | uniq -c
 echo "  （出现 429 = RingBuffer 满、tryPublish 回推背压；默认 buffer=1024 时需更高频，"
-echo "    要稳定复现可用更小 buffer 启动：--disruptor.buffer-size=16）"
+echo "    要稳定复现可用更小 buffer 启动：--disruptor.pipelines.matching.buffer-size=16）"
 
 echo
 echo "完成。回到应用日志窗口看 [matching/accept]→[matching/match]（同一线程名）→[matching/emit] 主干。"

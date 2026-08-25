@@ -34,8 +34,8 @@ import static org.awaitility.Awaitility.await;
  * 用 {@code @Primary} 覆盖 MatchEngine 为阻塞子类，确定性触发（对照 example/backpressure 的"灌满即拒"）。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-        "disruptor.buffer-size=8",
-        "disruptor.shutdown-timeout=2s"
+        "disruptor.pipelines.matching.buffer-size=8",
+        "disruptor.pipelines.matching.shutdown-timeout=2s"
 })
 @Import(BackpressureTest.GatedConfig.class)
 class BackpressureTest {

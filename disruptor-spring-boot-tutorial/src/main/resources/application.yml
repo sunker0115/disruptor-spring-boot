@@ -2,9 +2,13 @@ server:
   port: 8080
 
 disruptor:
-  buffer-size: 1024        # RingBuffer 槽位数（2 的幂）
-  wait-strategy: YIELDING  # 消费者无事件时的等待策略
-  shutdown-timeout: 10s    # 关停时每条管道排空 RingBuffer 的最长等待
+  defaults:
+    buffer-size: 1024
+    wait-strategy: YIELDING
+    shutdown-timeout: 10s
+  pipelines:
+    matching:
+      producer-type: SINGLE
 
 logging:
   level:

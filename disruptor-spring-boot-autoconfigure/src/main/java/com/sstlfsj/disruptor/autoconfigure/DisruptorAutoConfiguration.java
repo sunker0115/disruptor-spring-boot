@@ -1,65 +1,54 @@
 package com.sstlfsj.disruptor.autoconfigure;
 
-import com.sstlfsj.disruptor.core.DefaultEventBus;
-import com.sstlfsj.disruptor.core.DisruptorConfig;
-import com.sstlfsj.disruptor.core.EventBus;
-import com.sstlfsj.disruptor.core.PipelineBuilder;
-import com.sstlfsj.disruptor.core.Pipelines;
-import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import com.lmax.disruptor.dsl.Disruptor;
+import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PipelineSpec;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
-/**
- * Auto-configuration（spring-boot 层）：把 core 的构建/发布组件与 spring 的扫描/生命周期组件
- * 装配为 bean。装配链：{@link DisruptorProperties} → {@link DisruptorConfig} → {@link PipelineBuilder}；
- * {@link StagePipelineRegistrar} 启动时扫描声明式/编程式定义交给 builder 建管道、注册进 {@link Pipelines}；
- * {@link EventBus} 发布门面；{@link DisruptorLifecycle} 托管所有管道启停。
- *
- * <p>依赖方向 autoconfigure → spring → core，三层可按需拆为独立 Maven 模块。</p>
- */
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/** 使用 {@link PipelineSpec} Bean 构建并托管命名 Disruptor 管道。 */
 @AutoConfiguration
+@ConditionalOnClass(Disruptor.class)
+@ConditionalOnProperty(prefix = "disruptor", name = "enabled", matchIfMissing = true)
 @EnableConfigurationProperties(DisruptorProperties.class)
 public class DisruptorAutoConfiguration {
 
-    private static final int LIFECYCLE_PHASE = Integer.MIN_VALUE;
-
     @Bean
     @ConditionalOnMissingBean
-    public DisruptorConfig disruptorConfig(DisruptorProperties properties) {
-        return properties.toConfig();
+    public DisruptorRuntime disruptorRuntime(List<PipelineSpec<?>> specs,
+                                             DisruptorProperties properties) {
+        validateNamedConfiguration(specs, properties);
+        return DisruptorRuntime.builder()
+                .addAll(specs)
+                .settingsResolver(properties::settingsFor)
+                .build();
     }
 
     @Bean
     @ConditionalOnMissingBean
-    public Pipelines disruptorPipelines() {
-        return new Pipelines();
+    public DisruptorLifecycle disruptorLifecycle(DisruptorRuntime runtime,
+                                                 DisruptorProperties properties) {
+        return new DisruptorLifecycle(runtime, properties.getLifecyclePhase());
     }
 
-    @Bean
-    @ConditionalOnMissingBean
-    public PipelineBuilder disruptorPipelineBuilder(DisruptorConfig config) {
-        return new PipelineBuilder(config);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public StagePipelineRegistrar disruptorStagePipelineRegistrar(ConfigurableListableBeanFactory beanFactory,
-                                                                  PipelineBuilder pipelineBuilder,
-                                                                  Pipelines pipelines) {
-        return new StagePipelineRegistrar(beanFactory, pipelineBuilder, pipelines);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public EventBus eventBus(Pipelines pipelines) {
-        return new DefaultEventBus(pipelines);
-    }
-
-    @Bean
-    @ConditionalOnMissingBean
-    public DisruptorLifecycle disruptorLifecycle(Pipelines pipelines, DisruptorConfig config) {
-        return new DisruptorLifecycle(pipelines, config.shutdownTimeout(), LIFECYCLE_PHASE);
+    private static void validateNamedConfiguration(List<PipelineSpec<?>> specs,
+                                                   DisruptorProperties properties) {
+        Set<String> names = new HashSet<>();
+        for (PipelineSpec<?> spec : specs) {
+            names.add(spec.name());
+        }
+        Set<String> unknown = new HashSet<>(properties.getPipelines().keySet());
+        unknown.removeAll(names);
+        if (!unknown.isEmpty()) {
+            throw new IllegalStateException("disruptor.pipelines 包含未定义的管道：" + unknown);
+        }
     }
 }

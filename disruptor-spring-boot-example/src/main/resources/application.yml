@@ -1,15 +1,14 @@
 disruptor:
-  buffer-size: 16          # 2 的幂；故意小以便 backpressure demo 触发满槽
-  wait-strategy: YIELDING  # BLOCKING / YIELDING(默认) / BUSY_SPIN / SLEEPING
-  shutdown-timeout: 10s
+  defaults:
+    buffer-size: 16
+    wait-strategy: YIELDING
+    shutdown-timeout: 10s
+  pipelines:
+    order:
+      producer-type: SINGLE
 logging:
   level:
     com.sstlfsj.disruptor: DEBUG   # 看得到装配 INFO 与背压 DEBUG
 spring:
   main:
     web-application-type: none     # 非 Web，跑完 demo 即退出
-
-# 另一种配置方式：声明 DisruptorConfig @Bean 编程覆盖（声明后上面 disruptor.* 被忽略）。
-# @Bean DisruptorConfig disruptorConfig() {
-#   return new DisruptorConfig(2048, DisruptorConfig.WaitStrategyType.BLOCKING, Duration.ofSeconds(30));
-# }

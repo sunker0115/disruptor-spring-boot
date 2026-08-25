@@ -1,1 +1,2 @@
 com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration
+com.sstlfsj.disruptor.autoconfigure.DisruptorMetricsAutoConfiguration

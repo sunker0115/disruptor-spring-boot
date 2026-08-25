@@ -10,6 +10,7 @@
 
     <modules>
         <module>disruptor-core</module>
+        <module>disruptor-benchmarks</module>
         <module>disruptor-spring-boot-autoconfigure</module>
         <module>disruptor-spring-boot-starter</module>
         <module>disruptor-spring-boot-example</module>
@@ -24,6 +25,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>4.1.0</spring-boot.version>
         <disruptor.version>4.0.0</disruptor.version>
+        <jmh.version>1.37</jmh.version>
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
         <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
     </properties>
@@ -43,6 +45,16 @@
                 <groupId>com.lmax</groupId>
                 <artifactId>disruptor</artifactId>
                 <version>${disruptor.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-core</artifactId>
+                <version>${jmh.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.openjdk.jmh</groupId>
+                <artifactId>jmh-generator-annprocess</artifactId>
+                <version>${jmh.version}</version>
             </dependency>
             <!-- 内部模块，子模块相互引用不用写版本 -->
             <dependency>
@@ -70,6 +82,9 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>${maven-compiler-plugin.version}</version>
+                    <configuration>
+                        <proc>full</proc>
+                    </configuration>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>

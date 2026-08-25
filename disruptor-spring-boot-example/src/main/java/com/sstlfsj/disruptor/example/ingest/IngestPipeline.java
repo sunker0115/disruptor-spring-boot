@@ -1,8 +1,10 @@
 package com.sstlfsj.disruptor.example.ingest;
 
-import com.sstlfsj.disruptor.autoconfigure.DisruptorStage;
+import com.lmax.disruptor.EventHandler;
+import com.sstlfsj.disruptor.core.PipelineSpec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -11,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 
-/** demo3：并行分片 4；ShardKeyed 保证同 key 落同一分片、按 seq 顺序处理。 */
+/** demo3：使用 LMAX FAQ 推荐的取模 handler 模式，保证同 key 落同一分片。 */
 @Component
 public class IngestPipeline {
 
@@ -21,7 +23,27 @@ public class IngestPipeline {
     /** key -> 该 key 被观察到的（线程名 + seq）序列，供 runner 打印验证。 */
     static final Map<String, List<String>> observed = new ConcurrentHashMap<>();
 
-    @DisruptorStage(pipeline = "ingest", name = "process", parallelism = 4)
+    @Bean
+    public PipelineSpec<IngestEvent> ingestPipelineSpec() {
+        return PipelineSpec.builder("ingest", IngestEvent.class, IngestEvent::new)
+                .topology(disruptor -> disruptor.handleEventsWith(stripedHandlers(4)))
+                .build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private EventHandler<IngestEvent>[] stripedHandlers(int stripes) {
+        EventHandler<IngestEvent>[] handlers = new EventHandler[stripes];
+        for (int stripe = 0; stripe < stripes; stripe++) {
+            int stripeId = stripe;
+            handlers[stripe] = (event, sequence, endOfBatch) -> {
+                if (Math.floorMod(event.getKey().hashCode(), stripes) == stripeId) {
+                    process(event);
+                }
+            };
+        }
+        return handlers;
+    }
+
     public void process(IngestEvent e) {
         String thread = Thread.currentThread().getName();
         observed.computeIfAbsent(e.getKey(), k -> new CopyOnWriteArrayList<>())

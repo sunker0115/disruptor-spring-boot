@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor.example.backpressure;
 
-import com.sstlfsj.disruptor.core.EventBus;
+import com.lmax.disruptor.EventTranslatorOneArg;
+import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -15,17 +16,21 @@ import org.springframework.stereotype.Component;
 public class BackpressureDemoRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(BackpressureDemoRunner.class);
-    private final EventBus eventBus;
+    private static final EventTranslatorOneArg<BpEvent, Integer> TRANSLATOR =
+            (event, sequence, value) -> event.setN(value);
+
+    private final DisruptorRuntime runtime;
     private final DemoResults results;
 
     @Override
     public void run(String... args) throws Exception {
         log.info("==== demo5 背压 tryPublish 三形态（backpressure）====");
+        var ringBuffer = runtime.require("backpressure", BpEvent.class).ringBuffer();
         int dropped = 0;
         int total = 60;                         // 远超 buffer(16) + 慢消费 → 必然触发满
         for (int i = 0; i < total; i++) {
             int n = i;
-            boolean ok = eventBus.tryPublish(BpEvent.class, e -> e.setN(n));
+            boolean ok = ringBuffer.tryPublishEvent(TRANSLATOR, n);
             if (!ok) {
                 switch (i % 3) {                // 轮流演示三形态
                     case 0 -> {                 // ① 可丢弃：丢弃 + 计数

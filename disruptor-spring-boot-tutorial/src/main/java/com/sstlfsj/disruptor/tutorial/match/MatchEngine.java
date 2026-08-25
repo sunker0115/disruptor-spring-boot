@@ -27,7 +27,7 @@ import java.util.Map;
  * 「后续优化点」节，按收益排序）：<br>
  * 1. 热路径去 {@code BigDecimal} + 去每单分配——价量改 long 定点（价已有 {@code priceLong} 编码）、复用结果容器/预分配输出事件，
  *    取代每单 {@code new ArrayList<>} 与 {@code MatchResult} 记录分配。这是撮合延迟主来源，收益最大。<br>
- * 2. 管道改编程式 {@code EventPipeline} 声明，热路径去反射（注解式 stage 每事件走一次反射 invoke）；仅在第 1 点榨干、追亚微秒时才显现。</p>
+ * 2. 事件模型进一步原地化，减少撮合结果和挂单对象分配；Starter 路径本身已经没有反射调用。</p>
  */
 public class MatchEngine {
 

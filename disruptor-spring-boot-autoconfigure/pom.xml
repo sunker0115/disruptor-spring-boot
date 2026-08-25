@@ -10,7 +10,7 @@
     </parent>
     <artifactId>disruptor-spring-boot-autoconfigure</artifactId>
 
-    <description>Spring Boot 自动装配：扫描 @DisruptorStage / EventPipeline，装配 EventBus 与生命周期。</description>
+    <description>Spring Boot 自动装配：从 PipelineSpec Bean 构建命名 Disruptor 运行时并托管生命周期。</description>
 
     <dependencies>
         <dependency>
@@ -20,6 +20,21 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-core</artifactId>
             <optional>true</optional>
         </dependency>
 

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.sstlfsj</groupId>
+        <artifactId>disruptor-spring-boot</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <artifactId>disruptor-benchmarks</artifactId>
+
+    <description>JMH：对比原生 Disruptor 与 DisruptorRuntime 构建后的发布路径。</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.sstlfsj</groupId>
+            <artifactId>disruptor-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+</project>

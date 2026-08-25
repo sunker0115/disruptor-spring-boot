@@ -1,6 +1,6 @@
 package com.sstlfsj.disruptor.example.pay;
 
-import com.sstlfsj.disruptor.core.EventPipeline;
+import com.sstlfsj.disruptor.core.PipelineSpec;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -8,12 +8,14 @@ import org.springframework.context.annotation.Configuration;
 public class PayPipelineConfig {
 
     @Bean
-    public EventPipeline<PayEvent> payPipeline(PayService svc) {
-        return EventPipeline.builder("pay", PayEvent.class)
-                .stage("validate", svc::validate)
-                .stage("persist", svc::persist).after("validate")
-                .stage("audit", svc::audit).after("validate")
-                .stage("notify", svc::notify).after("persist", "audit")
+    public PipelineSpec<PayEvent> payPipeline(PayService svc) {
+        return PipelineSpec.builder("pay", PayEvent.class, PayEvent::new)
+                .topology(disruptor -> disruptor
+                        .handleEventsWith((event, sequence, endOfBatch) -> svc.validate(event))
+                        .then(
+                                (event, sequence, endOfBatch) -> svc.persist(event),
+                                (event, sequence, endOfBatch) -> svc.audit(event))
+                        .then((event, sequence, endOfBatch) -> svc.notify(event)))
                 .build();
     }
 }

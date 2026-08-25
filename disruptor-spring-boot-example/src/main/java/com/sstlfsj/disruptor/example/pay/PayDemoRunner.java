@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor.example.pay;
 
-import com.sstlfsj.disruptor.core.EventBus;
+import com.lmax.disruptor.EventTranslatorOneArg;
+import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -18,14 +19,21 @@ import java.util.concurrent.TimeUnit;
 public class PayDemoRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(PayDemoRunner.class);
-    private final EventBus eventBus;
+    private static final EventTranslatorOneArg<PayEvent, String> TRANSLATOR =
+            (event, sequence, payId) -> {
+                event.setPayId(payId);
+                event.setPersisted(false);
+                event.setAudited(false);
+            };
+
+    private final DisruptorRuntime runtime;
     private final DemoResults results;
 
     @Override
     public void run(String... args) throws Exception {
-        log.info("==== demo2 编程式 EventPipeline builder（pay）====");
+        log.info("==== demo2 PipelineSpec + 原生 topology（pay）====");
         PayService.latch = new CountDownLatch(4);
-        eventBus.publish(PayEvent.class, e -> e.setPayId("P-1"));
+        runtime.require("pay", PayEvent.class).ringBuffer().publishEvent(TRANSLATOR, "P-1");
         if (!PayService.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo2 超时");
         }

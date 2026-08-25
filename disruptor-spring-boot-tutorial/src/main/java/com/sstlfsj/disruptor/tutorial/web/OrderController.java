@@ -1,6 +1,8 @@
 package com.sstlfsj.disruptor.tutorial.web;
 
-import com.sstlfsj.disruptor.core.EventBus;
+import com.lmax.disruptor.EventTranslatorTwoArg;
+import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
 import com.sstlfsj.disruptor.tutorial.sink.MatchMetrics;
 import com.sstlfsj.disruptor.tutorial.dto.AcceptedResponse;
@@ -17,7 +19,6 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.math.BigDecimal;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -31,8 +32,17 @@ import java.util.concurrent.atomic.AtomicLong;
 public class OrderController {
 
     private static final Logger log = LoggerFactory.getLogger(OrderController.class);
+    private static final EventTranslatorTwoArg<OrderEvent, Long, PlaceOrderRequest> TRANSLATOR =
+            (event, sequence, orderId, request) -> {
+                event.setOrderId(orderId);
+                event.setSymbol(request.symbol());
+                event.setSide(request.side());
+                event.setPrice(request.price());
+                event.setQuantity(request.quantity());
+                event.setTransactTime(System.currentTimeMillis());
+            };
 
-    private final EventBus eventBus;
+    private final DisruptorRuntime runtime;
     private final MatchMetrics metrics;
     private final AtomicLong idGen = new AtomicLong();
 
@@ -46,14 +56,8 @@ public class OrderController {
         }
 
         long id = idGen.incrementAndGet();
-        boolean accepted = eventBus.tryPublish(OrderEvent.class, e -> {
-            e.setOrderId(id);
-            e.setSymbol(req.symbol());
-            e.setSide(req.side());
-            e.setPrice(req.price());
-            e.setQuantity(req.quantity());
-            e.setTransactTime(System.currentTimeMillis());
-        });
+        PipelineHandle<OrderEvent> matching = runtime.require("matching", OrderEvent.class);
+        boolean accepted = matching.ringBuffer().tryPublishEvent(TRANSLATOR, id, req);
 
         if (accepted) {
             log.info("[matching/accept] 受理订单 {} symbol={} side={} price={} qty={}",
@@ -61,7 +65,7 @@ public class OrderController {
             return ResponseEntity.accepted().body(new AcceptedResponse(id));
         }
         log.warn("[matching/reject] 背压拒绝 symbol={} side={} remaining={}",
-                req.symbol(), req.side(), eventBus.remainingCapacity(OrderEvent.class));
+                req.symbol(), req.side(), matching.ringBuffer().remainingCapacity());
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body("撮合繁忙，请重试");
     }
 
