@@ -7,15 +7,13 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class PayPipelineConfig {
 
+    /** demo2：通过 PipelineSpec.exceptionHandler(...) 注册自定义管道级异常策略。 */
     @Bean
-    public PipelineSpec<PayEvent> payPipeline(PayService svc) {
+    public PipelineSpec<PayEvent> payPipeline(PayService svc, PayExceptionHandler exceptionHandler) {
         return PipelineSpec.builder("pay", PayEvent.class, PayEvent::new)
-                .topology(disruptor -> disruptor
-                        .handleEventsWith((event, sequence, endOfBatch) -> svc.validate(event))
-                        .then(
-                                (event, sequence, endOfBatch) -> svc.persist(event),
-                                (event, sequence, endOfBatch) -> svc.audit(event))
-                        .then((event, sequence, endOfBatch) -> svc.notify(event)))
+                .exceptionHandler(exceptionHandler)
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> svc.charge(event)))
                 .build();
     }
 }

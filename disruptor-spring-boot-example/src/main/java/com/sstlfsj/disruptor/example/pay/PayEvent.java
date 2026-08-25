@@ -7,6 +7,5 @@ import lombok.Setter;
 @Setter
 public class PayEvent {
     private String payId;
-    private boolean persisted;
-    private boolean audited;
+    private long amount;
 }
