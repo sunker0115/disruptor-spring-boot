@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.tutorial;
 import com.sstlfsj.disruptor.tutorial.match.Side;
 import com.sstlfsj.disruptor.tutorial.dto.AcceptedResponse;
 import com.sstlfsj.disruptor.tutorial.dto.BookResponse;
+import com.sstlfsj.disruptor.tutorial.dto.PersistStatsResponse;
 import com.sstlfsj.disruptor.tutorial.dto.PlaceOrderRequest;
 import com.sstlfsj.disruptor.tutorial.dto.StatsResponse;
 import org.junit.jupiter.api.BeforeEach;
@@ -60,6 +61,16 @@ class MatchingFlowTest {
             assertThat(stats).isNotNull();
             assertThat(stats.tradeCount()).isEqualTo(1);
             assertThat(stats.tradedVolume()).isEqualByComparingTo("10");
+
+            // persist stage 与 metrics stage 并行消费同一撮合产出：落库成交数应与统计成交数恒等，
+            // 且落库发生在 endOfBatch。批大小依赖调度时序，故只断言「两条 stage 结果恒等」+「flush 已发生」，
+            // 不断言具体批大小（自适应批处理的批变大效果留给日志/手动压测观察）。
+            PersistStatsResponse persist =
+                    client.get().uri("/orders/persist-stats").retrieve().body(PersistStatsResponse.class);
+            assertThat(persist).isNotNull();
+            assertThat(persist.persistedCount()).isEqualTo(stats.tradeCount());
+            assertThat(persist.flushCount()).isGreaterThanOrEqualTo(1);
+            assertThat(persist.lastBatchSize()).isGreaterThanOrEqualTo(1);
         });
     }
 
