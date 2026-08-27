@@ -62,12 +62,12 @@ public class OrderController {
             event.setQuantity(req.quantity());
             event.setTransactTime(System.currentTimeMillis());
         });
-        // —— 对照：零分配写法（纳秒级热路径 / GC 敏感时选它）。静态 EventTranslator 单例 + 参数透传 →
-        //    零捕获零分配；代价是要维护一个静态字段并直达 ringBuffer()。切到这种写法需
+        // —— 对照：低分配写法（纳秒级热路径 / GC 敏感时选它）。静态 EventTranslator 单例 + 参数透传 →
+        //    不创建捕获 lambda，并继续参与关闭准入。切到这种写法需
         //    import com.lmax.disruptor.EventTranslatorTwoArg，并加类字段：
         //    private static final EventTranslatorTwoArg<OrderEvent, Long, PlaceOrderRequest> TRANSLATOR =
         //            (event, sequence, orderId, request) -> { event.setOrderId(orderId); /* ...其余 setter... */ };
-        //    然后：boolean accepted = matching.ringBuffer().tryPublishEvent(TRANSLATOR, id, req);
+        //    然后：boolean accepted = matching.tryPublishEvent(TRANSLATOR, id, req);
 
         if (accepted) {
             log.info("[matching/accept] 受理订单 {} symbol={} side={} price={} qty={}",

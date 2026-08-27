@@ -37,20 +37,22 @@ class ExceptionHandlingTest {
             throw new IllegalStateException("boom on " + event.number);
         };
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
-                        "strict", TestEvent.class, TestEvent::new)
+                "strict", TestEvent.class, TestEvent::new)
                 .bufferSize(16)
-                .shutdownTimeout(Duration.ofMillis(200))
                 .topology(disruptor -> disruptor.handleEventsWith(upstream)
                         .then((event, sequence, endOfBatch) -> downstream.countDown()))
                 .build();
-        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofMillis(200))
+                .add(spec)
+                .build();
 
         runtime.start();
         try {
-            runtime.require("strict", TestEvent.class).ringBuffer().publishEvent(TRANSLATOR, 1L);
+            runtime.require("strict", TestEvent.class).publishEvent(TRANSLATOR, 1L);
             assertFalse(downstream.await(300, TimeUnit.MILLISECONDS), "失败槽位不得流向依赖它的下游");
         } finally {
-            runtime.shutdown();
+            runtime.halt();
         }
     }
 
@@ -77,9 +79,9 @@ class ExceptionHandlingTest {
 
         runtime.start();
         try {
-            var ringBuffer = runtime.require("available", TestEvent.class).ringBuffer();
-            ringBuffer.publishEvent(TRANSLATOR, 1L);
-            ringBuffer.publishEvent(TRANSLATOR, 2L);
+            var pipeline = runtime.require("available", TestEvent.class);
+            pipeline.publishEvent(TRANSLATOR, 1L);
+            pipeline.publishEvent(TRANSLATOR, 2L);
 
             assertTrue(downstream.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(1L, 2L), seen);

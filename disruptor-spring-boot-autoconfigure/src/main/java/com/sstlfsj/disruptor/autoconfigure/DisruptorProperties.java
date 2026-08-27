@@ -27,6 +27,9 @@ public class DisruptorProperties {
     /** Spring 生命周期阶段；值越小越早启动、越晚停止。 */
     private int lifecyclePhase = Integer.MIN_VALUE;
 
+    /** Runtime 完成全部管道排空与线程退出的总时间预算。 */
+    private Duration shutdownTimeout = Duration.ofSeconds(10);
+
     /** 所有管道的默认设置。 */
     private Defaults defaults = new Defaults();
 
@@ -50,6 +53,14 @@ public class DisruptorProperties {
 
     public void setLifecyclePhase(int lifecyclePhase) {
         this.lifecyclePhase = lifecyclePhase;
+    }
+
+    public Duration getShutdownTimeout() {
+        return shutdownTimeout;
+    }
+
+    public void setShutdownTimeout(Duration shutdownTimeout) {
+        this.shutdownTimeout = shutdownTimeout;
     }
 
     public Defaults getDefaults() {
@@ -84,8 +95,6 @@ public class DisruptorProperties {
                 ? defaults.producerType : override.producerType;
         WaitStrategyType waitStrategy = override == null || override.waitStrategy == null
                 ? defaults.waitStrategy : override.waitStrategy;
-        Duration shutdownTimeout = override == null || override.shutdownTimeout == null
-                ? defaults.shutdownTimeout : override.shutdownTimeout;
         boolean daemonThreads = override == null || override.daemonThreads == null
                 ? defaults.daemonThreads : override.daemonThreads;
         ErrorStrategy errorStrategy = override == null || override.errorStrategy == null
@@ -97,7 +106,6 @@ public class DisruptorProperties {
                     .producerType(producerType)
                     .waitStrategy(waitStrategy.factory())
                     .threadFactory(name -> new NamedThreadFactory(name, daemonThreads))
-                    .shutdownTimeout(shutdownTimeout)
                     .exceptionHandler(errorStrategy.handler())
                     .build();
         } catch (IllegalArgumentException failure) {
@@ -116,9 +124,6 @@ public class DisruptorProperties {
 
         /** 常用等待策略预设；需要构造参数的策略应在 PipelineSpec 中直接配置。 */
         private WaitStrategyType waitStrategy = WaitStrategyType.BLOCKING;
-
-        /** 单条管道关闭时等待积压事件排空的最长时间。 */
-        private Duration shutdownTimeout = Duration.ofSeconds(10);
 
         /** 消费线程是否为 daemon 线程。 */
         private boolean daemonThreads;
@@ -150,14 +155,6 @@ public class DisruptorProperties {
             this.waitStrategy = waitStrategy;
         }
 
-        public Duration getShutdownTimeout() {
-            return shutdownTimeout;
-        }
-
-        public void setShutdownTimeout(Duration shutdownTimeout) {
-            this.shutdownTimeout = shutdownTimeout;
-        }
-
         public boolean isDaemonThreads() {
             return daemonThreads;
         }
@@ -185,9 +182,6 @@ public class DisruptorProperties {
 
         /** 覆盖此管道的等待策略预设。 */
         private WaitStrategyType waitStrategy;
-
-        /** 覆盖此管道的关闭等待时间。 */
-        private Duration shutdownTimeout;
 
         /** 覆盖此管道的 daemon 线程设置。 */
         private Boolean daemonThreads;
@@ -217,14 +211,6 @@ public class DisruptorProperties {
 
         public void setWaitStrategy(WaitStrategyType waitStrategy) {
             this.waitStrategy = waitStrategy;
-        }
-
-        public Duration getShutdownTimeout() {
-            return shutdownTimeout;
-        }
-
-        public void setShutdownTimeout(Duration shutdownTimeout) {
-            this.shutdownTimeout = shutdownTimeout;
         }
 
         public Boolean getDaemonThreads() {

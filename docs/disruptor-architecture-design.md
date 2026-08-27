@@ -18,9 +18,9 @@
 ### 目标
 
 - 引入 Starter 并声明 `PipelineSpec` Bean 后即可由 Spring 托管管道；
-- 保留 LMAX Disruptor 的原生拓扑、处理器、发布和扩展能力；
-- 统一命名注册、配置合并、启动回滚和逆序关闭；
-- 不在事件发布与消费热路径增加反射或代理层；
+- 保留 LMAX Disruptor 的原生拓扑、处理器和扩展能力；
+- 统一命名注册、配置合并、发布准入、启动回滚和有界关闭；
+- 受管发布不使用反射或动态代理，高级场景保留原生零代理逃生口；
 - 纯 Java 与 Spring Boot 使用同一个核心运行时。
 
 ### 非目标
@@ -35,7 +35,7 @@ Maven Central 发布、签名、CI、许可证和社区治理属于开源工程�
 
 ## 核心决策
 
-采用 `PipelineSpec<E> + DisruptorTopology<E> + PipelineHandle<E> + DisruptorRuntime`，由 Starter 构建实例，业务在回调中使用原生拓扑 API。
+采用 `PipelineSpec<E> + DisruptorTopology<E> + PipelineHandle<E> + ManagedPipeline<E> + DisruptorRuntime`。业务在构建期使用原生拓扑 API，运行期默认通过受管发布入口进入 RingBuffer。
 
 | 方案 | 原生能力 | Starter 提供的价值 | 长期成本 | 结论 |
 | --- | --- | --- | --- | --- |
@@ -43,7 +43,18 @@ Maven Central 发布、签名、CI、许可证和社区治理属于开源工程�
 | 业务直接创建 `Disruptor<E>` Bean | 完整 | 生命周期、命名和配置样板仍由业务承担 | 低 | 不采用 |
 | Starter 构建实例，业务配置原生 topology | 完整 | 托管基础设施并保留原生语义 | 低 | 采用 |
 
-这个选择与 Disruptor 自身“预分配 RingBuffer、显式消费者依赖图”的模型保持一致。Starter 只补 Spring 基础设施，不重新解释并发模型。
+这个选择与 Disruptor 自身“预分配 RingBuffer、显式消费者依赖图”的模型保持一致。Starter 不重写 `EventProcessor`，只补齐上游刻意交给调用方负责的发布停止、排空边界和线程终止协议。
+
+### 关闭方案对比
+
+| 方案 | 能否解决启动后立即关闭 | 能否阻止关闭期发布 | 是否等待线程退出 | 结论 |
+| --- | --- | --- | --- | --- |
+| 等待消费者报告 `isRunning()` 后再返回 `start()` | 仅覆盖启动竞态 | 否 | 否 | 不采用；消费者后续异常退出仍会破坏关闭 |
+| 直接调用 LMAX `Disruptor.shutdown()` | 否；上游会忽略尚未运行的消费者 | 否；上游明确要求调用前停止发布 | 否 | 不采用 |
+| 只比较 cursor 与最小 gating sequence | 是 | 否 | 否 | 不采用；仍缺少完整关闭边界 |
+| 受管发布准入 + 固定目标游标 + gating 排空 + halt + join | 是 | 受管入口可以 | 是 | 采用 |
+
+[LMAX 4.0.0 `Disruptor.shutdown()`](https://github.com/LMAX-Exchange/disruptor/blob/4.0.0/src/main/java/com/lmax/disruptor/dsl/Disruptor.java) 明确要求调用前停止发布，其 backlog 检查还会通过 [`ConsumerRepository`](https://github.com/LMAX-Exchange/disruptor/blob/4.0.0/src/main/java/com/lmax/disruptor/dsl/ConsumerRepository.java) 排除未报告运行的消费者。[Apache Log4j2](https://github.com/apache/logging-log4j2/blob/2.x/log4j-core/src/main/java/org/apache/logging/log4j/core/async/AsyncLoggerDisruptor.java) 的成熟集成同样先关闭发布入口，再排空并调用上游关闭。本项目保留 `unsafeRingBuffer()` 作为高级逃生口，但不为绕过受管入口的并发发布作无损关闭承诺。
 
 ## 模块与依赖边界
 
@@ -58,8 +69,9 @@ Maven Central 发布、签名、CI、许可证和社区治理属于开源工程�
 disruptor-core
   ├─ PipelineSpec 与 PipelineSettings 合并
   ├─ Disruptor<E> 构建
+  ├─ ManagedPipeline 发布准入与线程跟踪
   ├─ 名称注册与类型校验
-  └─ 一次性生命周期
+  └─ Runtime 级关闭编排与总截止时间
           │
           ▼
 disruptor-spring-boot-autoconfigure
@@ -95,7 +107,6 @@ disruptor-spring-boot-starter
 - `Supplier<? extends WaitStrategy>`；
 - `ThreadFactory`；
 - `ExceptionHandler<? super E>`；
-- `shutdownTimeout`。
 
 等待策略使用工厂而不是共享实例，保证每条管道获得独立对象。`PipelineSpec` 的显式配置是代码级权威源，优先于外部属性。
 
@@ -104,13 +115,13 @@ disruptor-spring-boot-starter
 `PipelineHandle<E>` 公开：
 
 - 管道名与事件类型；
-- 原生 `Disruptor<E>` 与同一个 `RingBuffer<E>`；
-- `hasStarted()`：底层实例是否曾经启动；
-- `publish(...)`、`tryPublish(...)` 和 `remaining()` 便捷方法。
+- 0 至 3 参数 translator 的受管 `publishEvent/tryPublishEvent`；
+- `publish(...)`、`tryPublish(...)` 和 `remaining()` 便捷方法；
+- 显式命名的原生逃生口 `unsafeRingBuffer()`。
 
-`hasStarted()` 在停止后仍返回 `true`，不能用于健康检查。生命周期默认由 Runtime 或 Spring 托管；业务不应通过 `disruptor()` 绕过托管流程调用 `start()`、`halt()` 或 `shutdown()`。
+受管发布通过一个无锁准入协议记录在途发布。Runtime 进入 `QUIESCING` 后拒绝新发布，等待已获准发布完成后才捕获排空目标，因此“已经 claim 但 translator 尚未返回”的槽位不会被漏掉。静态 translator 路径不创建包装 lambda，但每次受管发布会增加两次原子计数操作。
 
-句柄不复制 `EventSink` 的全部重载。高性能或高级发布路径直接使用 `ringBuffer()`，避免 Starter API 随 Disruptor 演进而落后。
+句柄不复制 `EventSink` 的批量与 varargs 重载。需要这些能力或要求完全零代理时使用 `unsafeRingBuffer()`；调用方必须在关闭 Runtime 前自行停止相应生产者。运行期不再公开原生 `Disruptor<E>`，防止业务绕过 Runtime 操作生命周期。
 
 ### DisruptorRuntime
 
@@ -122,9 +133,9 @@ Runtime 使用名称索引管道。同一事件类型允许对应多条管道：
 状态机为：
 
 ```text
-NEW ── start() ──> RUNNING ── shutdown()/halt() ──> STOPPED
- │                    │
- └─ shutdown()/halt() ┘
+NEW → STARTING → RUNNING → QUIESCING → STOPPING → STOPPED
+ │                 │                         ▲
+ └──── halt() ─────┴─────────────────────────┘
 
 STOPPED ── start() ──> IllegalStateException
 ```
@@ -137,9 +148,17 @@ STOPPED ── start() ──> IllegalStateException
 - 停止后不允许重新启动，因为 LMAX Disruptor 本身不支持重启；
 - topology 不得自行调用 `start()`；
 - 启动失败时，逆序 `halt` 所有已经尝试启动的管道，包括部分启动的当前管道；
-- 正常关闭按启动逆序逐条排空；
-- 单条管道排空超时或停止失败时强制 `halt`，并继续关闭其它管道；
-- Runtime 最终进入 `STOPPED`；单条管道关闭或强制停止抛出运行时异常时，记录日志并继续后续清理。
+- `shutdown()` 先关闭所有受管发布入口并等待在途发布，再为每条管道捕获固定目标游标；
+- 正常关闭按启动逆序逐条排空；排空只比较最小 gating sequence 与目标游标，不依赖消费者 `isRunning()`；
+- 排空完成后调用上游 `halt()`，并等待 Runtime 跟踪的消费线程真正退出；
+- 全部管道共享一个 Runtime 级截止时间，关闭耗时不随管道数量线性累加；
+- 单条管道排空超时或停止失败时强制 `halt`、中断仍存活线程，并继续关闭其它管道；
+- Runtime 最终进入 `STOPPED`；只要存在未排空、停止失败或线程未退出，就抛出聚合 `DisruptorShutdownException`；
+- `isRunning()` 在 `QUIESCING` 开始时立即变为 `false`，且状态读取不被长时间关闭过程阻塞；它仍不是消费者健康检查。
+
+“排空”只保证消费链末端 gating sequence 越过目标游标。自定义 processor 若提前推进 sequence，或 handler 内部再启动 fire-and-forget 副作用，这些外部工作不属于 Runtime 能证明完成的范围。
+
+命名管道是彼此独立的生命周期单元，关闭协议不推断跨管道依赖。需要保证级联处理完整性的阶段应放在同一条 Disruptor topology 中；handler 向另一条受管管道继续发布的场景必须由应用先停止上游并自行编排关闭顺序，否则全局进入 `QUIESCING` 后下游发布会被拒绝。
 
 ## 配置模型
 
@@ -147,11 +166,11 @@ STOPPED ── start() ──> IllegalStateException
 disruptor:
   enabled: true
   lifecycle-phase: -2147483648
+  shutdown-timeout: 10s
   defaults:
     buffer-size: 1024
     producer-type: MULTI
     wait-strategy: BLOCKING
-    shutdown-timeout: 10s
     daemon-threads: false
     error-strategy: HALT
   pipelines:
@@ -173,7 +192,9 @@ core 安全默认值
 
 如果希望某个参数由不同环境调整，`PipelineSpec` 中必须保持未设置，让外部属性提供该值。topology、事件类型和事件工厂只能在代码中定义。
 
-默认管道设置为 `MULTI + BLOCKING + 1024 + 非 daemon + 10s + HALT`。配置层只提供无参数等待策略预设；需要构造参数或自定义实现时由 `PipelineSpec` 提供原生工厂。
+默认管道设置为 `MULTI + BLOCKING + 1024 + 非 daemon + HALT`，Runtime 默认关闭总预算为 `10s`。配置层只提供无参数等待策略预设；需要构造参数或自定义实现时由 `PipelineSpec` 提供原生工厂。
+
+`shutdown-timeout` 是 Runtime 级总预算，不进入命名管道覆盖和 `PipelineSpec`。把它设为每管道配置会导致 N 条管道最坏关闭 N 倍时长，也无法与 Spring 的整体关闭窗口对齐，因此不采用。
 
 命名配置没有对应 `PipelineSpec` 时启动失败，避免拼写错误被静默忽略。容量、关闭时间等非法值在构建阶段失败，错误信息包含管道名。
 
@@ -191,9 +212,9 @@ Runtime 不包装业务 handler，也不实现自动重试。自动重试需要�
 ## 热路径与事件语义
 
 - topology 完成后，业务 handler 由 LMAX processor 直接调用；
-- 发布直接访问原生 `RingBuffer<E>`，不经过 Starter 代理；
+- 受管 `publishEvent/tryPublishEvent` 直接调用同一个 `RingBuffer<E>`，只增加发布准入所需的原子计数，不使用反射、动态代理或包装 translator；
 - `PipelineHandle.publish(...)` 与 `tryPublish(...)` 会为每次调用创建 translator lambda，只定位为便捷 API；
-- 静态 translator 发布路径可避免捕获型 lambda 分配；
+- 静态 translator 的受管发布路径不创建包装 lambda；完全零代理路径使用 `unsafeRingBuffer()`；
 - translator 抛异常时，Disruptor 仍发布已经领取的槽位，因此 translator 不得包含可能失败的业务逻辑；
 - 事件对象循环复用，发布方必须覆盖本次所需字段；
 - 可选字段清理由业务在 topology 叶子后显式注册；
@@ -214,7 +235,7 @@ Bean 回退条件彼此独立：
 
 零条 `PipelineSpec` 是合法状态，会创建空 Runtime。命名属性指向不存在的管道时仍然失败。
 
-`DisruptorLifecycle` 实现 `SmartLifecycle`，默认 phase 为 `Integer.MIN_VALUE`，使管道尽早启动、尽晚停止。它只委托 Runtime，不复制生命周期逻辑。
+`DisruptorLifecycle` 实现 `SmartLifecycle`，默认 phase 为 `Integer.MIN_VALUE`，使管道尽早启动、尽晚停止。它显式实现 `stop(Runnable)`：Runtime 只有在排空、halt 和线程等待完成后才返回，因此正常 callback 不会早于消费线程退出；即使关闭抛出聚合异常，也会在 `finally` 中执行 callback，避免 Spring 生命周期处理器继续等待。
 
 自动配置模块生成：
 
@@ -241,7 +262,9 @@ Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runt
 - rewind、自定义 processor、processor factory 与 translator 重载；
 - 默认 `HALT`、显式 `LOG_AND_CONTINUE` 和处理器级异常策略；
 - 同事件类型多命名管道与类型校验；
-- 部分启动回滚、逆序关闭、超时强制停止、停止失败隔离和禁止重启；
+- 消费线程尚未进入 `run()` 时立即关闭仍完整排空，并重复执行并发回归场景；
+- 在途发布先于关闭目标完成、`QUIESCING` 后新发布被拒绝；
+- 部分启动回滚、逆序关闭、线程 join、总预算超时、停止失败聚合和禁止重启；
 - 配置覆盖、非法配置、未知命名配置和零管道；
 - 自动配置开关、自定义 Bean 回退、AOT 元数据与可选 Micrometer；
 - 指标在启动、积压、排空和停止阶段的变化；
@@ -253,13 +276,13 @@ Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runt
 mvn test
 ```
 
-性能验证使用 `disruptor-benchmarks` 中的 JMH 基准，对比原生实例与 Runtime 构建实例取得的同一类 `RingBuffer` 发布路径。性能结论必须记录硬件、JVM、参数、预热和测量配置；普通单测不设置易受机器噪声影响的吞吐阈值。
+性能验证使用 `disruptor-benchmarks` 中的 JMH 基准，对比原生实例、受管发布和 `unsafeRingBuffer()` 三条路径。性能结论必须记录硬件、JVM、参数、预热和测量配置；普通单测不设置易受机器噪声影响的吞吐阈值。
 
 ## 演进约束
 
 - 新能力优先暴露原生 Disruptor 入口，不复制上游 API；
 - 新配置必须具有明确默认值、优先级和失败语义；
-- 修改生命周期或异常策略时，必须先补真实并发行为测试；
+- 修改生命周期、发布准入或异常策略时，必须先补真实并发行为测试；
 - 公开 API 的破坏性变更需要在发布说明中明确记录；
 - README 只保留使用者开始使用所需内容，内部取舍和不变量写入本文；
 - 文档中的版本、默认值、命令和模块名必须能由当前仓库验证。

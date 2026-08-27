@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.example.reuse;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -37,10 +38,10 @@ public class ReuseDemoRunner implements CommandLineRunner {
         int followers = 20;                 // > buffer-size(16)，确保槽位被复用
         ReusePipeline.seen.clear();
         ReusePipeline.latch = new CountDownLatch(1 + followers);
-        var ringBuffer = runtime.require("reuse", ReuseEvent.class).ringBuffer();
-        ringBuffer.publishEvent(WITH_COUPON, "A", "SAVE10");
+        PipelineHandle<ReuseEvent> pipeline = runtime.require("reuse", ReuseEvent.class);
+        pipeline.publishEvent(WITH_COUPON, "A", "SAVE10");
         for (int i = 0; i < followers; i++) {              // 后续订单只设 orderId
-            ringBuffer.publishEvent(WITHOUT_COUPON, "B" + i);
+            pipeline.publishEvent(WITHOUT_COUPON, "B" + i);
         }
         if (!ReusePipeline.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo4 超时");

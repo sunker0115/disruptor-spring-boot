@@ -1,5 +1,6 @@
 package com.sstlfsj.disruptor;
 
+import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration;
@@ -32,6 +33,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -39,6 +41,31 @@ class DisruptorAutoConfigurationTest {
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of(DisruptorAutoConfiguration.class));
+
+    @Test
+    void lifecycleCallbackRunsAfterConsumerThreadStops() {
+        AtomicBoolean consumerStopped = new AtomicBoolean();
+        AtomicBoolean callbackSawStoppedConsumer = new AtomicBoolean();
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder("lifecycle", TestEvent.class, TestEvent::new)
+                .topology(disruptor -> disruptor.handleEventsWith(new EventHandler<>() {
+                    @Override
+                    public void onEvent(TestEvent event, long sequence, boolean endOfBatch) {
+                    }
+
+                    @Override
+                    public void onShutdown() {
+                        consumerStopped.set(true);
+                    }
+                }))
+                .build();
+        DisruptorLifecycle lifecycle = new DisruptorLifecycle(
+                DisruptorRuntime.builder().add(spec).build(), Integer.MIN_VALUE);
+
+        lifecycle.start();
+        lifecycle.stop(() -> callbackSawStoppedConsumer.set(consumerStopped.get()));
+
+        assertThat(callbackSawStoppedConsumer).isTrue();
+    }
 
     @Test
     void buildsNamedRuntimeFromPipelineSpecBeansAndAppliesPropertyLayers() {
@@ -52,8 +79,10 @@ class DisruptorAutoConfigurationTest {
                     assertThat(context).hasSingleBean(DisruptorRuntime.class);
                     assertThat(context).hasSingleBean(DisruptorLifecycle.class);
                     DisruptorRuntime runtime = context.getBean(DisruptorRuntime.class);
-                    assertThat(runtime.require("orders", TestEvent.class).ringBuffer().getBufferSize()).isEqualTo(128);
-                    assertThat(runtime.require("audit", TestEvent.class).ringBuffer().getBufferSize()).isEqualTo(32);
+                    assertThat(runtime.require("orders", TestEvent.class).unsafeRingBuffer().getBufferSize())
+                            .isEqualTo(128);
+                    assertThat(runtime.require("audit", TestEvent.class).unsafeRingBuffer().getBufferSize())
+                            .isEqualTo(32);
                     assertThat(context.getBean(DisruptorLifecycle.class).getPhase()).isEqualTo(-100);
                 });
     }
@@ -71,7 +100,7 @@ class DisruptorAutoConfigurationTest {
                             .require("native", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    assertThat(handle.ringBuffer().tryPublishEvent(translator, "value")).isTrue();
+                    assertThat(handle.tryPublishEvent(translator, "value")).isTrue();
                     assertThat(consumed.await(2, TimeUnit.SECONDS)).isTrue();
                 });
     }
@@ -88,14 +117,15 @@ class DisruptorAutoConfigurationTest {
                             succeeded.countDown();
                         }))
                         .build())
+                .withPropertyValues("disruptor.shutdown-timeout=200ms")
                 .run(context -> {
                     PipelineHandle<TestEvent> handle = context.getBean(DisruptorRuntime.class)
                             .require("faulty", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    handle.ringBuffer().publishEvent(translator, "ok-1");
-                    handle.ringBuffer().publishEvent(translator, "boom");
-                    handle.ringBuffer().publishEvent(translator, "ok-2");
+                    handle.publishEvent(translator, "ok-1");
+                    handle.publishEvent(translator, "boom");
+                    handle.publishEvent(translator, "ok-2");
                     assertThat(succeeded.await(300, TimeUnit.MILLISECONDS)).isFalse();
                     assertThat(succeeded.getCount()).isEqualTo(1);
                 });
@@ -119,9 +149,9 @@ class DisruptorAutoConfigurationTest {
                             .require("faulty", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    handle.ringBuffer().publishEvent(translator, "ok-1");
-                    handle.ringBuffer().publishEvent(translator, "boom");
-                    handle.ringBuffer().publishEvent(translator, "ok-2");
+                    handle.publishEvent(translator, "ok-1");
+                    handle.publishEvent(translator, "boom");
+                    handle.publishEvent(translator, "ok-2");
                     assertThat(succeeded.await(2, TimeUnit.SECONDS)).isTrue();
                 });
     }

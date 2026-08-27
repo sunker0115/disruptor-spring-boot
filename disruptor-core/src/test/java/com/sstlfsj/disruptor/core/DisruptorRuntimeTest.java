@@ -2,8 +2,12 @@ package com.sstlfsj.disruptor.core;
 
 import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.EventProcessor;
+import com.lmax.disruptor.EventTranslator;
+import com.lmax.disruptor.EventTranslatorOneArg;
+import com.lmax.disruptor.EventTranslatorThreeArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.lmax.disruptor.Sequence;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -14,11 +18,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -75,22 +80,21 @@ class DisruptorRuntimeTest {
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "orders", TestEvent.class, () -> new TestEvent("preallocated"))
                 .bufferSize(16)
-                .shutdownTimeout(Duration.ofSeconds(2))
                 .topology(disruptor -> disruptor.handleEventsWith(handler))
                 .build();
 
-        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofSeconds(2))
+                .add(spec)
+                .build();
         PipelineHandle<TestEvent> handle = runtime.require("orders", TestEvent.class);
 
-        assertSame(handle, runtime.unique(TestEvent.class));
-        assertSame(handle.ringBuffer(), handle.disruptor().getRingBuffer());
-        assertEquals(16, handle.ringBuffer().getBufferSize());
-        assertFalse(handle.hasStarted());
+        assertEquals(handle, runtime.unique(TestEvent.class));
+        assertEquals(16, handle.unsafeRingBuffer().getBufferSize());
 
         runtime.start();
-        assertTrue(handle.hasStarted());
         assertTrue(started.await(2, TimeUnit.SECONDS));
-        handle.ringBuffer().publishEvent(TRANSLATOR, "order-1", 42L);
+        handle.publishEvent(TRANSLATOR, "order-1", 42L);
 
         assertTrue(consumed.await(2, TimeUnit.SECONDS));
         assertEquals(0L, seenSequence.get());
@@ -99,9 +103,8 @@ class DisruptorRuntimeTest {
         assertTrue(sequenceCallbackSet.get());
 
         runtime.shutdown();
-        assertTrue(stopped.await(2, TimeUnit.SECONDS));
+        assertEquals(0L, stopped.getCount(), "shutdown 返回前消费线程必须完成 onShutdown");
         assertFalse(runtime.isRunning());
-        assertTrue(handle.hasStarted());
     }
 
     @Test
@@ -233,12 +236,12 @@ class DisruptorRuntimeTest {
     void rejectsNullFillersBeforeClaimingARingBufferSlot() {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("publish-null")).build();
         PipelineHandle<TestEvent> handle = runtime.require("publish-null", TestEvent.class);
-        long cursor = handle.ringBuffer().getCursor();
+        long cursor = handle.unsafeRingBuffer().getCursor();
 
         assertThrows(NullPointerException.class, () -> handle.publish(null));
-        assertEquals(cursor, handle.ringBuffer().getCursor());
+        assertEquals(cursor, handle.unsafeRingBuffer().getCursor());
         assertThrows(NullPointerException.class, () -> handle.tryPublish(null));
-        assertEquals(cursor, handle.ringBuffer().getCursor());
+        assertEquals(cursor, handle.unsafeRingBuffer().getCursor());
     }
 
     @Test
@@ -246,10 +249,15 @@ class DisruptorRuntimeTest {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("publish-failure")).build();
         PipelineHandle<TestEvent> handle = runtime.require("publish-failure", TestEvent.class);
 
-        assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
-            throw new IllegalStateException("boom");
-        }));
-        assertEquals(0L, handle.ringBuffer().getCursor());
+        runtime.start();
+        try {
+            assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
+                throw new IllegalStateException("boom");
+            }));
+            assertEquals(0L, handle.unsafeRingBuffer().getCursor());
+        } finally {
+            runtime.halt();
+        }
     }
 
     @Test
@@ -262,17 +270,20 @@ class DisruptorRuntimeTest {
         };
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "slow", TestEvent.class, () -> new TestEvent("slot"))
-                .shutdownTimeout(Duration.ofMillis(200))
                 .topology(disruptor -> disruptor.handleEventsWith(blocking))
                 .build();
-        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofMillis(200))
+                .add(spec)
+                .build();
 
         runtime.start();
         try {
-            runtime.require("slow", TestEvent.class).ringBuffer().publishEvent(TRANSLATOR, "x", 1L);
+            runtime.require("slow", TestEvent.class).publishEvent(TRANSLATOR, "x", 1L);
             assertTrue(entered.await(2, TimeUnit.SECONDS));
             // handler 卡死，shutdown 必须在超时后强制 halt 返回，而不是永久阻塞。
-            assertTimeoutPreemptively(Duration.ofSeconds(3), runtime::shutdown);
+            assertTimeoutPreemptively(Duration.ofSeconds(3), () ->
+                    assertThrows(DisruptorShutdownException.class, runtime::shutdown));
             assertFalse(runtime.isRunning());
         } finally {
             release.countDown();
@@ -292,9 +303,7 @@ class DisruptorRuntimeTest {
         assertTrue(runtime.isRunning());
         runtime.shutdown();
 
-        // onShutdown 相对 shutdown() 返回是异步的（LMAX Disruptor 在 halt() 后不 join 消费线程），
-        // 因此只断言全部管道最终关闭；逆序由 DisruptorRuntime.shutdown() 的 Collections.reverse 保证。
-        assertTrue(allShutdown.await(2, TimeUnit.SECONDS), "所有管道都应触发 onShutdown");
+        assertEquals(0L, allShutdown.getCount(), "shutdown 返回前全部消费线程应退出");
         assertFalse(runtime.isRunning());
     }
 
@@ -310,37 +319,219 @@ class DisruptorRuntimeTest {
                 .build();
 
         runtime.start();
-        runtime.shutdown();
+        assertThrows(DisruptorShutdownException.class, runtime::shutdown);
 
         assertTrue(healthyStopped.await(2, TimeUnit.SECONDS),
                 "单条管道停止失败不得阻断其余管道关闭");
-        assertEquals(2, failingProcessor.haltCalls.get(),
-                "shutdown 失败后应再尝试一次强制 halt");
+        assertEquals(1, failingProcessor.haltCalls.get(),
+                "同一次关闭不得重复调用失败的 halt");
         assertFalse(runtime.isRunning());
     }
 
-    @Test
-    void drainsInflightEventsBeforeStopping() {
+    @RepeatedTest(20)
+    void drainsInflightEventsEvenWhenConsumerThreadHasNotEnteredRun() throws Exception {
         int total = 128;
+        CountDownLatch consumerThreadCreated = new CountDownLatch(1);
+        CountDownLatch allowConsumerToRun = new CountDownLatch(1);
         AtomicLong processed = new AtomicLong();
+        AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "drain", TestEvent.class, () -> new TestEvent("slot"))
                 .bufferSize(256)
+                .threadFactory(runnable -> new Thread(() -> {
+                    consumerThreadCreated.countDown();
+                    try {
+                        allowConsumerToRun.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    runnable.run();
+                }, "delayed-consumer"))
                 .topology(disruptor -> disruptor.handleEventsWith(
                         (event, sequence, endOfBatch) -> processed.incrementAndGet()))
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
 
         runtime.start();
-        var ringBuffer = runtime.require("drain", TestEvent.class).ringBuffer();
+        assertTrue(consumerThreadCreated.await(2, TimeUnit.SECONDS));
+        PipelineHandle<TestEvent> handle = runtime.require("drain", TestEvent.class);
         for (int i = 0; i < total; i++) {
-            ringBuffer.publishEvent(TRANSLATOR, "v", (long) i);
+            handle.publishEvent(TRANSLATOR, "v", (long) i);
         }
-        // shutdown 会 busy-spin 等 backlog 排空后才 halt，返回时所有事件的 onEvent 必已完成。
-        runtime.shutdown();
 
+        Thread shutdown = Thread.ofPlatform().name("delayed-consumer-shutdown").start(() -> {
+            try {
+                runtime.shutdown();
+            } catch (Throwable failure) {
+                shutdownFailure.set(failure);
+            }
+        });
+        awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
+        allowConsumerToRun.countDown();
+        shutdown.join(2_000);
+
+        assertFalse(shutdown.isAlive());
+        assertEquals(null, shutdownFailure.get());
         assertEquals(total, processed.get());
         assertFalse(runtime.isRunning());
+    }
+
+    @Test
+    void waitsForInFlightPublicationBeforeCapturingDrainTarget() throws Exception {
+        CountDownLatch translating = new CountDownLatch(1);
+        CountDownLatch releaseTranslator = new CountDownLatch(1);
+        CountDownLatch consumed = new CountDownLatch(1);
+        AtomicReference<Throwable> publisherFailure = new AtomicReference<>();
+        AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "publication-boundary", TestEvent.class, () -> new TestEvent("slot"))
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> consumed.countDown()))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        PipelineHandle<TestEvent> handle = runtime.require("publication-boundary", TestEvent.class);
+        runtime.start();
+
+        Thread publisher = Thread.ofPlatform().name("test-publisher").start(() -> {
+            try {
+                handle.publishEvent((event, sequence) -> {
+                    translating.countDown();
+                    try {
+                        releaseTranslator.await();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("发布线程被中断", interrupted);
+                    }
+                    event.value = "accepted";
+                });
+            } catch (Throwable failure) {
+                publisherFailure.set(failure);
+            }
+        });
+        assertTrue(translating.await(2, TimeUnit.SECONDS));
+
+        Thread shutdown = Thread.ofPlatform().name("test-shutdown").start(() -> {
+            try {
+                runtime.shutdown();
+            } catch (Throwable failure) {
+                shutdownFailure.set(failure);
+            }
+        });
+        awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
+        assertFalse(handle.tryPublishEvent((event, sequence) -> event.value = "late"),
+                "进入 QUIESCING 后必须拒绝新发布");
+
+        releaseTranslator.countDown();
+        publisher.join(2_000);
+        shutdown.join(2_000);
+
+        assertFalse(publisher.isAlive());
+        assertFalse(shutdown.isAlive());
+        assertEquals(null, publisherFailure.get());
+        assertEquals(null, shutdownFailure.get());
+        assertEquals(0L, consumed.getCount(), "关闭边界前进入的发布必须被消费");
+    }
+
+    @Test
+    void quiescesEveryPipelineBeforeDrainingAnyPipeline() throws Exception {
+        CountDownLatch secondHandlerEntered = new CountDownLatch(1);
+        CountDownLatch releaseSecondHandler = new CountDownLatch(1);
+        AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+        PipelineSpec<TestEvent> second = PipelineSpec.builder(
+                        "second", TestEvent.class, () -> new TestEvent("slot"))
+                .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
+                    secondHandlerEntered.countDown();
+                    releaseSecondHandler.await();
+                }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofSeconds(2))
+                .add(spec("first"))
+                .add(second)
+                .build();
+        PipelineHandle<TestEvent> firstHandle = runtime.require("first", TestEvent.class);
+        PipelineHandle<TestEvent> secondHandle = runtime.require("second", TestEvent.class);
+
+        runtime.start();
+        secondHandle.publishEvent(TRANSLATOR, "blocking", 1L);
+        assertTrue(secondHandlerEntered.await(2, TimeUnit.SECONDS));
+
+        Thread shutdown = Thread.ofPlatform().name("multi-pipeline-shutdown").start(() -> {
+            try {
+                runtime.shutdown();
+            } catch (Throwable failure) {
+                shutdownFailure.set(failure);
+            }
+        });
+        awaitCondition(() -> !secondHandle.tryPublishEvent(TRANSLATOR, "probe", 2L),
+                Duration.ofSeconds(2));
+
+        assertFalse(firstHandle.tryPublishEvent(TRANSLATOR, "late", 3L),
+                "排空任一管道前必须先关闭全部受管发布入口");
+
+        releaseSecondHandler.countDown();
+        shutdown.join(2_000);
+
+        assertFalse(shutdown.isAlive());
+        assertEquals(null, shutdownFailure.get());
+    }
+
+    @Test
+    void rejectsManagedPublishingOutsideRunningState() {
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("managed-state")).build();
+        PipelineHandle<TestEvent> handle = runtime.require("managed-state", TestEvent.class);
+
+        assertFalse(handle.tryPublishEvent(TRANSLATOR, "before", 1L));
+        assertThrows(IllegalStateException.class,
+                () -> handle.publishEvent(TRANSLATOR, "before", 1L));
+
+        runtime.start();
+        assertTrue(handle.tryPublishEvent(TRANSLATOR, "running", 2L));
+        runtime.shutdown();
+
+        assertFalse(handle.tryPublishEvent(TRANSLATOR, "after", 3L));
+        assertThrows(IllegalStateException.class,
+                () -> handle.publishEvent(TRANSLATOR, "after", 3L));
+    }
+
+    @Test
+    void supportsManagedTranslatorOverloads() throws Exception {
+        CountDownLatch consumed = new CountDownLatch(4);
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "translator-overloads", TestEvent.class, () -> new TestEvent("slot"))
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> consumed.countDown()))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        PipelineHandle<TestEvent> handle = runtime.require("translator-overloads", TestEvent.class);
+        EventTranslator<TestEvent> zero = (event, sequence) -> event.number = 0L;
+        EventTranslatorOneArg<TestEvent, Long> one =
+                (event, sequence, number) -> event.number = number;
+        EventTranslatorThreeArg<TestEvent, String, Long, Boolean> three =
+                (event, sequence, value, number, ignored) -> {
+                    event.value = value;
+                    event.number = number;
+                };
+
+        runtime.start();
+        handle.publishEvent(zero);
+        assertTrue(handle.tryPublishEvent(one, 1L));
+        handle.publishEvent(TRANSLATOR, "two", 2L);
+        assertTrue(handle.tryPublishEvent(three, "three", 3L, true));
+
+        assertTrue(consumed.await(2, TimeUnit.SECONDS));
+        runtime.shutdown();
+    }
+
+    private static void awaitCondition(BooleanSupplier condition, Duration timeout) {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("等待条件超时");
+            }
+            LockSupport.parkNanos(100_000L);
+        }
     }
 
     private static PipelineSpec<TestEvent> shutdownSignalling(String name, CountDownLatch allShutdown) {

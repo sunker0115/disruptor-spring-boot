@@ -5,7 +5,7 @@
 
 基于 [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) 原生 API 的 Spring Boot Starter。
 
-项目只托管管道构建、命名注册、配置合并和 Spring 生命周期。事件拓扑、处理器、异常处理、回放、自定义处理器与事件发布仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
+项目托管管道构建、命名注册、配置合并、发布准入和完整关闭流程。事件拓扑、处理器、异常处理、回放与自定义处理器仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
 
 当前仓库是 `1.0.0` 开发版本，尚未发布到 Maven Central。使用前需要先在本地构建并安装。
 
@@ -75,7 +75,7 @@ PipelineSpec<OrderEvent> orderPipeline(
 
 ### 4. 发布事件
 
-`DisruptorRuntime` 由自动配置注册为 Spring Bean，可通过构造器注入。按名称和事件类型获取句柄，再使用原生 `RingBuffer`：
+`DisruptorRuntime` 由自动配置注册为 Spring Bean，可通过构造器注入。按名称和事件类型获取句柄，再通过受管入口发布：
 
 ```java
 private static final EventTranslatorTwoArg<OrderEvent, String, Long> TRANSLATOR =
@@ -85,11 +85,10 @@ private static final EventTranslatorTwoArg<OrderEvent, String, Long> TRANSLATOR 
         };
 
 PipelineHandle<OrderEvent> orders = runtime.require("orders", OrderEvent.class);
-boolean accepted = orders.ringBuffer()
-        .tryPublishEvent(TRANSLATOR, orderId, amount);
+boolean accepted = orders.tryPublishEvent(TRANSLATOR, orderId, amount);
 ```
 
-`PipelineHandle.publish(...)` 和 `tryPublish(...)` 可用于普通便捷调用。追求稳定低分配时，应直接使用 `ringBuffer()` 与静态 translator，避免捕获型 lambda。
+`publishEvent/tryPublishEvent` 支持 0 至 3 个参数的原生 translator，并参与关闭准入屏障；`publish/tryPublish` 是接受 `Consumer<E>` 的便捷入口。需要批量发布、varargs 或完全绕过受管入口时可以使用 `unsafeRingBuffer()`，但必须在 Runtime 关闭前自行停止这些生产者。
 
 ## 配置
 
@@ -97,11 +96,11 @@ boolean accepted = orders.ringBuffer()
 disruptor:
   enabled: true
   lifecycle-phase: -2147483648
+  shutdown-timeout: 10s
   defaults:
     buffer-size: 1024
     producer-type: MULTI
     wait-strategy: BLOCKING
-    shutdown-timeout: 10s
     daemon-threads: false
     error-strategy: HALT
   pipelines:
@@ -109,7 +108,6 @@ disruptor:
       buffer-size: 65536
       producer-type: SINGLE
       wait-strategy: BUSY_SPIN
-      shutdown-timeout: 30s
       daemon-threads: false
       error-strategy: HALT
   metrics:
@@ -120,15 +118,15 @@ disruptor:
 | --- | --- | --- |
 | `disruptor.enabled` | `true` | 是否启用自动配置 |
 | `disruptor.lifecycle-phase` | `Integer.MIN_VALUE` | Spring 生命周期阶段；越小越早启动、越晚停止 |
+| `disruptor.shutdown-timeout` | `10s` | Runtime 排空全部管道并等待消费线程退出的总预算，必须大于 0 |
 | `disruptor.defaults.buffer-size` | `1024` | RingBuffer 容量，必须是正的 2 的幂 |
 | `disruptor.defaults.producer-type` | `MULTI` | `SINGLE` 或 `MULTI` |
 | `disruptor.defaults.wait-strategy` | `BLOCKING` | 等待策略预设 |
-| `disruptor.defaults.shutdown-timeout` | `10s` | 单条管道等待积压排空的最长时间，必须大于 0 |
 | `disruptor.defaults.daemon-threads` | `false` | 消费线程是否为 daemon 线程 |
 | `disruptor.defaults.error-strategy` | `HALT` | 默认消费异常策略 |
 | `disruptor.metrics.enabled` | `true` | classpath 存在 Micrometer 时是否注册指标 |
 
-每个 `disruptor.pipelines.<name>` 可以覆盖全部默认管道设置。最终优先级为：
+每个 `disruptor.pipelines.<name>` 可以覆盖 buffer、producer、wait strategy、daemon thread 和 error strategy。最终优先级为：
 
 ```text
 框架安全默认值 < disruptor.defaults < disruptor.pipelines.<name> < PipelineSpec 显式选项
@@ -166,15 +164,19 @@ disruptor.handleEventsWith(process)
 
 Disruptor 在 translator 抛异常时仍会发布已经领取的槽位。translator 应只做简单字段赋值，并且不得抛异常。
 
+受管 `publishEvent/tryPublishEvent` 在 Runtime 进入关闭阶段后分别抛出 `IllegalStateException` 或返回 `false`。已经获准但尚未完成的发布会先完成，再被纳入本次排空目标。`unsafeRingBuffer()` 不参与该协议，与关闭并发发布的结果不受保证。
+
+命名管道按彼此独立的生命周期单元处理。要求无损级联的阶段应放在同一条 Disruptor topology 中；handler 向另一条受管管道继续发布时，应用必须先停止上游并自行编排关闭顺序。
+
 ### 生命周期
 
-`DisruptorRuntime` 是一次性状态机：`NEW → RUNNING → STOPPED`。处于 `RUNNING` 时重复调用 `start()` 不产生额外动作，重复停止也是幂等的；进入 `STOPPED` 后再次启动会失败。
+`DisruptorRuntime` 是一次性状态机：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → STOPPED`。处于 `RUNNING` 时重复调用 `start()` 不产生额外动作，重复停止也是幂等的；进入 `STOPPED` 后再次启动会失败。
 
-启动失败时，Runtime 会逆序 `halt` 所有已经尝试启动的管道，包括发生部分启动的当前管道。正常关闭按启动逆序逐条排空；单条管道超时或停止失败时会强制 `halt`，并继续关闭其它管道。
+优雅关闭会先拒绝新受管发布并等待在途发布完成，再捕获固定目标游标；随后按启动逆序等待最小 gating sequence 越过目标、调用 `halt()`，最后等待消费线程真正退出。该判断不依赖消费者是否已经报告 `isRunning()`，因此启动后立即关闭也不会漏掉已发布事件。
 
-`PipelineHandle.hasStarted()` 表示底层 Disruptor 是否曾经启动，停止后仍返回 `true`。`DisruptorRuntime.isRunning()` 只表示 Runtime 处于已启动且未停止的托管生命周期状态，两者都不表示消费者线程健康。
+所有管道共享一个 `disruptor.shutdown-timeout` 总预算。任一管道未排空、消费者停止失败或线程未在预算内退出时，Runtime 仍会继续清理其它管道，最后抛出聚合的 `DisruptorShutdownException`，不把可能丢事件的关闭误报为成功。
 
-业务代码不应通过 `PipelineHandle.disruptor()` 自行调用 `start()`、`halt()` 或 `shutdown()`。
+`DisruptorRuntime.isRunning()` 只表示 Runtime 是否仍接受受管发布，不表示每个消费者线程健康。默认 `HALT` 导致消费者退出后，该值仍可能为 `true`；应用必须监控消费异常。
 
 ### 指标
 
@@ -206,7 +208,7 @@ DisruptorRuntime runtime = DisruptorRuntime.builder()
 
 runtime.start();
 try {
-    runtime.require("plain", MyEvent.class).ringBuffer()
+    runtime.require("plain", MyEvent.class)
             .publishEvent(TRANSLATOR, value);
 } finally {
     runtime.shutdown();
@@ -217,7 +219,7 @@ try {
 
 - `disruptor-spring-boot-example`：原生菱形 DAG、分片、异常处理、事件清理、背压和纯 Java 示例；
 - `disruptor-spring-boot-tutorial`：单写者撮合 Web 教程；
-- `disruptor-benchmarks`：原生实例与 Runtime 构建实例的 JMH 发布路径对比。
+- `disruptor-benchmarks`：原生实例、受管发布与 `unsafeRingBuffer()` 的 JMH 发布路径对比。
 
 运行全仓测试：
 

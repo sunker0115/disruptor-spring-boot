@@ -1,8 +1,8 @@
 disruptor:
+  shutdown-timeout: 10s
   defaults:
     buffer-size: 16
     wait-strategy: YIELDING
-    shutdown-timeout: 10s
   pipelines:
     order:
       producer-type: SINGLE

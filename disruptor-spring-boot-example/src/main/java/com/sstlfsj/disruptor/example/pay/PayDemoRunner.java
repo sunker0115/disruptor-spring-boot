@@ -36,9 +36,9 @@ public class PayDemoRunner implements CommandLineRunner {
         // handler 接住，且异常之后的事件仍被处理——管道未被单次失败中断。
         PayService.latch = new CountDownLatch(3);
         PipelineHandle<PayEvent> handle = runtime.require("pay", PayEvent.class);
-        handle.ringBuffer().publishEvent(TRANSLATOR, "P-1", 100L);
-        handle.ringBuffer().publishEvent(TRANSLATOR, "P-BAD", -1L);
-        handle.ringBuffer().publishEvent(TRANSLATOR, "P-2", 200L);
+        handle.publishEvent(TRANSLATOR, "P-1", 100L);
+        handle.publishEvent(TRANSLATOR, "P-BAD", -1L);
+        handle.publishEvent(TRANSLATOR, "P-2", 200L);
         if (!PayService.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo2 超时");
         }

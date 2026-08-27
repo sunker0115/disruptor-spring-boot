@@ -62,7 +62,7 @@ class NativeCapabilitiesTest {
 
         runtime.start();
         try {
-            var ringBuffer = runtime.require("exceptions", TestEvent.class).ringBuffer();
+            var ringBuffer = runtime.require("exceptions", TestEvent.class).unsafeRingBuffer();
             ringBuffer.publishEvent(TRANSLATOR, 1L);
             ringBuffer.publishEvent(TRANSLATOR, 2L);
 
@@ -94,7 +94,7 @@ class NativeCapabilitiesTest {
 
         runtime.start();
         try {
-            runtime.require("rewind", TestEvent.class).ringBuffer().publishEvent(TRANSLATOR, 1L);
+            runtime.require("rewind", TestEvent.class).unsafeRingBuffer().publishEvent(TRANSLATOR, 1L);
             assertTrue(handled.await(2, TimeUnit.SECONDS));
         } finally {
             runtime.shutdown();
@@ -116,7 +116,7 @@ class NativeCapabilitiesTest {
 
         runtime.start();
         try {
-            runtime.require("processor", TestEvent.class).ringBuffer().publishEvent(TRANSLATOR, 1L);
+            runtime.require("processor", TestEvent.class).unsafeRingBuffer().publishEvent(TRANSLATOR, 1L);
             assertTrue(handled.await(2, TimeUnit.SECONDS));
         } finally {
             runtime.shutdown();

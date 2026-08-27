@@ -3,6 +3,8 @@ package com.sstlfsj.disruptor.autoconfigure;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import org.springframework.context.SmartLifecycle;
 
+import java.util.Objects;
+
 /** 将纯 Java {@link DisruptorRuntime} 接入 Spring 一次性生命周期。 */
 public final class DisruptorLifecycle implements SmartLifecycle {
 
@@ -22,6 +24,16 @@ public final class DisruptorLifecycle implements SmartLifecycle {
     @Override
     public void stop() {
         runtime.shutdown();
+    }
+
+    @Override
+    public void stop(Runnable callback) {
+        Objects.requireNonNull(callback, "callback 不能为空");
+        try {
+            runtime.shutdown();
+        } finally {
+            callback.run();
+        }
     }
 
     @Override

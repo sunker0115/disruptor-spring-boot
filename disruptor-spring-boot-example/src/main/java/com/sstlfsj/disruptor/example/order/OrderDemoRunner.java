@@ -34,8 +34,7 @@ public class OrderDemoRunner implements CommandLineRunner {
     public void run(String... args) throws Exception {
         log.info("==== demo1 原生菱形 DAG（order）====");
         OrderPipeline.latch = new CountDownLatch(4);
-        runtime.require("order", OrderEvent.class).ringBuffer()
-                .publishEvent(TRANSLATOR, "A-1", 199L);
+        runtime.require("order", OrderEvent.class).publishEvent(TRANSLATOR, "A-1", 199L);
         if (!OrderPipeline.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo1 超时");
         }

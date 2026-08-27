@@ -30,8 +30,7 @@ public final class NativeSmokeMain {
 
         runtime.start();
         try {
-            runtime.require("native-smoke", SmokeEvent.class).ringBuffer()
-                    .publishEvent(TRANSLATOR, 42L);
+            runtime.require("native-smoke", SmokeEvent.class).publishEvent(TRANSLATOR, 42L);
             if (!consumed.await(5, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("native smoke 消费超时");
             }

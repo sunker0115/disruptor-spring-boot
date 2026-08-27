@@ -6,6 +6,7 @@ import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.core.PipelineSpec;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -39,8 +40,13 @@ public class PublishPathBenchmark {
     }
 
     @Benchmark
-    public void runtimeBuilt(RuntimeState state) {
+    public void runtimeUnsafeRingBuffer(RuntimeState state) {
         state.ringBuffer.publishEvent(TRANSLATOR);
+    }
+
+    @Benchmark
+    public void runtimeManagedPublisher(RuntimeState state) {
+        state.handle.publishEvent(TRANSLATOR);
     }
 
     @State(Scope.Benchmark)
@@ -68,6 +74,7 @@ public class PublishPathBenchmark {
     public static class RuntimeState {
 
         private DisruptorRuntime runtime;
+        private PipelineHandle<BenchmarkEvent> handle;
         private RingBuffer<BenchmarkEvent> ringBuffer;
 
         @Setup
@@ -82,7 +89,8 @@ public class PublishPathBenchmark {
                     }))
                     .build();
             runtime = DisruptorRuntime.builder().add(spec).build();
-            ringBuffer = runtime.require("runtime", BenchmarkEvent.class).ringBuffer();
+            handle = runtime.require("runtime", BenchmarkEvent.class);
+            ringBuffer = handle.unsafeRingBuffer();
             runtime.start();
         }
 

@@ -24,7 +24,6 @@ class PipelineSpecTest {
                 .producerType(ProducerType.MULTI)
                 .waitStrategy(BlockingWaitStrategy::new)
                 .threadFactory(name -> configuredFactory)
-                .shutdownTimeout(Duration.ofSeconds(8))
                 .build();
 
         ThreadFactory explicitFactory = runnable -> new Thread(runnable, "explicit");
@@ -33,7 +32,6 @@ class PipelineSpecTest {
                 .producerType(ProducerType.SINGLE)
                 .waitStrategy(SleepingWaitStrategy::new)
                 .threadFactory(explicitFactory)
-                .shutdownTimeout(Duration.ofSeconds(3))
                 .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
                 }))
                 .build();
@@ -45,7 +43,6 @@ class PipelineSpecTest {
         assertInstanceOf(SleepingWaitStrategy.class, resolved.waitStrategy());
         assertEquals("explicit", resolved.threadFactory().newThread(() -> {
         }).getName());
-        assertEquals(Duration.ofSeconds(3), resolved.shutdownTimeout());
     }
 
     @Test
@@ -55,7 +52,6 @@ class PipelineSpecTest {
         assertEquals(1024, settings.bufferSize());
         assertEquals(ProducerType.MULTI, settings.producerType());
         assertInstanceOf(BlockingWaitStrategy.class, settings.waitStrategyFactory().get());
-        assertEquals(Duration.ofSeconds(10), settings.shutdownTimeout());
         assertFalse(settings.threadFactoryFactory().apply("orders").newThread(() -> {
         }).isDaemon());
     }
@@ -67,8 +63,8 @@ class PipelineSpecTest {
         assertThrows(IllegalStateException.class, () -> PipelineSpec.builder(
                 "test", TestEvent.class, TestEvent::new).build());
         assertThrows(IllegalArgumentException.class, () -> PipelineSettings.builder().bufferSize(3).build());
-        assertThrows(IllegalArgumentException.class, () -> PipelineSettings.builder()
-                .shutdownTimeout(Duration.ZERO).build());
+        assertThrows(IllegalArgumentException.class, () -> DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ZERO));
         assertTrue(PipelineSettings.isPowerOfTwo(1024));
         assertFalse(PipelineSettings.isPowerOfTwo(1023));
     }

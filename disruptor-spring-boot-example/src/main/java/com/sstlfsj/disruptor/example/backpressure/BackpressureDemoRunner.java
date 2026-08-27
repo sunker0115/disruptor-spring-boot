@@ -2,6 +2,7 @@ package com.sstlfsj.disruptor.example.backpressure;
 
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -25,12 +26,12 @@ public class BackpressureDemoRunner implements CommandLineRunner {
     @Override
     public void run(String... args) throws Exception {
         log.info("==== demo5 背压 tryPublish 三形态（backpressure）====");
-        var ringBuffer = runtime.require("backpressure", BpEvent.class).ringBuffer();
+        PipelineHandle<BpEvent> pipeline = runtime.require("backpressure", BpEvent.class);
         int dropped = 0;
         int total = 60;                         // 远超 buffer(16) + 慢消费 → 必然触发满
         for (int i = 0; i < total; i++) {
             int n = i;
-            boolean ok = ringBuffer.tryPublishEvent(TRANSLATOR, n);
+            boolean ok = pipeline.tryPublishEvent(TRANSLATOR, n);
             if (!ok) {
                 switch (i % 3) {                // 轮流演示三形态
                     case 0 -> {                 // ① 可丢弃：丢弃 + 计数

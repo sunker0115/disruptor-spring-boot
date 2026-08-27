@@ -35,7 +35,7 @@ import static org.awaitility.Awaitility.await;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "disruptor.pipelines.matching.buffer-size=8",
-        "disruptor.pipelines.matching.shutdown-timeout=2s"
+        "disruptor.shutdown-timeout=2s"
 })
 @Import(BackpressureTest.GatedConfig.class)
 class BackpressureTest {

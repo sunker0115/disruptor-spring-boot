@@ -21,7 +21,7 @@ class DisruptorPropertiesTest {
         assertThat(settings.bufferSize()).isEqualTo(1024);
         assertThat(settings.producerType()).isEqualTo(ProducerType.MULTI);
         assertThat(settings.waitStrategyFactory().get()).isInstanceOf(BlockingWaitStrategy.class);
-        assertThat(settings.shutdownTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(new DisruptorProperties().getShutdownTimeout()).isEqualTo(Duration.ofSeconds(10));
         assertThat(settings.threadFactoryFactory().apply("orders").newThread(() -> {
         }).isDaemon()).isFalse();
         assertThatThrownBy(() -> settings.exceptionHandler()
@@ -31,13 +31,12 @@ class DisruptorPropertiesTest {
     }
 
     @Test
-    void namedPipelineOverridesEveryDefaultSetting() {
+    void namedPipelineOverridesEveryPipelineSetting() {
         DisruptorProperties properties = new DisruptorProperties();
         DisruptorProperties.Pipeline override = new DisruptorProperties.Pipeline();
         override.setBufferSize(128);
         override.setProducerType(ProducerType.SINGLE);
         override.setWaitStrategy(DisruptorProperties.WaitStrategyType.YIELDING);
-        override.setShutdownTimeout(Duration.ofSeconds(3));
         override.setDaemonThreads(true);
         override.setErrorStrategy(ErrorStrategy.LOG_AND_CONTINUE);
         properties.getPipelines().put("orders", override);
@@ -47,7 +46,6 @@ class DisruptorPropertiesTest {
         assertThat(settings.bufferSize()).isEqualTo(128);
         assertThat(settings.producerType()).isEqualTo(ProducerType.SINGLE);
         assertThat(settings.waitStrategyFactory().get()).isInstanceOf(YieldingWaitStrategy.class);
-        assertThat(settings.shutdownTimeout()).isEqualTo(Duration.ofSeconds(3));
         Thread thread = settings.threadFactoryFactory().apply("orders").newThread(() -> {
         });
         assertThat(thread.getName()).isEqualTo("disruptor-orders-1");

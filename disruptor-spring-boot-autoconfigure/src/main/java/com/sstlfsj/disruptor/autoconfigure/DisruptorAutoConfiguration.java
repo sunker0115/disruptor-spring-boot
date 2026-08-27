@@ -29,6 +29,7 @@ public class DisruptorAutoConfiguration {
         return DisruptorRuntime.builder()
                 .addAll(specs)
                 .settingsResolver(properties::settingsFor)
+                .shutdownTimeout(properties.getShutdownTimeout())
                 .build();
     }
 

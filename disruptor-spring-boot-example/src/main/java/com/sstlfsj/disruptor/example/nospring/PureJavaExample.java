@@ -36,14 +36,17 @@ public class PureJavaExample {
                 .build();
         PipelineSettings settings = PipelineSettings.builder()
                 .bufferSize(16)
-                .shutdownTimeout(Duration.ofSeconds(5))
                 .build();
-        DisruptorRuntime runtime = DisruptorRuntime.builder().settings(settings).add(spec).build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .settings(settings)
+                .shutdownTimeout(Duration.ofSeconds(5))
+                .add(spec)
+                .build();
 
         runtime.start();
         try {
             for (int i = 0; i < 3; i++) {
-                runtime.require("plain", PlainEvent.class).ringBuffer().publishEvent(TRANSLATOR, i);
+                runtime.require("plain", PlainEvent.class).publishEvent(TRANSLATOR, i);
             }
             if (!latch.await(3, TimeUnit.SECONDS)) {
                 log.warn("[pure-java] 超时");

@@ -5,7 +5,6 @@ import com.lmax.disruptor.ExceptionHandler;
 import com.lmax.disruptor.WaitStrategy;
 import com.lmax.disruptor.dsl.ProducerType;
 
-import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ThreadFactory;
 import java.util.function.Supplier;
@@ -26,7 +25,6 @@ public final class PipelineSpec<E> {
     private final Supplier<? extends WaitStrategy> waitStrategyFactory;
     private final ThreadFactory threadFactory;
     private final ExceptionHandler<? super E> exceptionHandler;
-    private final Duration shutdownTimeout;
 
     private PipelineSpec(Builder<E> builder) {
         this.name = builder.name;
@@ -41,7 +39,6 @@ public final class PipelineSpec<E> {
         this.waitStrategyFactory = builder.waitStrategyFactory;
         this.threadFactory = builder.threadFactory;
         this.exceptionHandler = builder.exceptionHandler;
-        this.shutdownTimeout = builder.shutdownTimeout;
     }
 
     public static <E> Builder<E> builder(String name, Class<E> eventType, EventFactory<E> eventFactory) {
@@ -76,13 +73,10 @@ public final class PipelineSpec<E> {
                 ? settings.waitStrategyFactory() : waitStrategyFactory;
         ThreadFactory resolvedThreadFactory = threadFactory == null
                 ? settings.threadFactoryFactory().apply(name) : threadFactory;
-        Duration resolvedShutdownTimeout = shutdownTimeout == null
-                ? settings.shutdownTimeout() : shutdownTimeout;
         ExceptionHandler<? super E> resolvedExceptionHandler = exceptionHandler == null
                 ? settings.exceptionHandler() : exceptionHandler;
 
         PipelineSettings.validateBufferSize(resolvedBufferSize);
-        PipelineSettings.validateShutdownTimeout(resolvedShutdownTimeout);
         WaitStrategy resolvedWaitStrategy = Objects.requireNonNull(resolvedWaitStrategyFactory.get(),
                 "waitStrategyFactory 不能返回 null");
         return new ResolvedPipelineSettings<>(
@@ -90,7 +84,6 @@ public final class PipelineSpec<E> {
                 Objects.requireNonNull(resolvedProducerType, "producerType 不能为空"),
                 resolvedWaitStrategy,
                 Objects.requireNonNull(resolvedThreadFactory, "threadFactory 不能为空"),
-                resolvedShutdownTimeout,
                 Objects.requireNonNull(resolvedExceptionHandler, "exceptionHandler 不能为空"));
     }
 
@@ -105,7 +98,6 @@ public final class PipelineSpec<E> {
         private Supplier<? extends WaitStrategy> waitStrategyFactory;
         private ThreadFactory threadFactory;
         private ExceptionHandler<? super E> exceptionHandler;
-        private Duration shutdownTimeout;
 
         private Builder(String name, Class<E> eventType, EventFactory<E> eventFactory) {
             this.name = PipelineSettings.requireName(name);
@@ -142,12 +134,6 @@ public final class PipelineSpec<E> {
 
         public Builder<E> exceptionHandler(ExceptionHandler<? super E> exceptionHandler) {
             this.exceptionHandler = Objects.requireNonNull(exceptionHandler, "exceptionHandler 不能为空");
-            return this;
-        }
-
-        public Builder<E> shutdownTimeout(Duration shutdownTimeout) {
-            PipelineSettings.validateShutdownTimeout(shutdownTimeout);
-            this.shutdownTimeout = shutdownTimeout;
             return this;
         }
 

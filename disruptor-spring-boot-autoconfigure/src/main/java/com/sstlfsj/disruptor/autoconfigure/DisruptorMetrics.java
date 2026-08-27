@@ -28,12 +28,12 @@ public final class DisruptorMetrics implements MeterBinder {
 
     private static void registerPipelineGauges(MeterRegistry registry, PipelineHandle<?> handle) {
         Gauge.builder("disruptor.pipeline.buffer.size", handle,
-                        value -> value.ringBuffer().getBufferSize())
+                        value -> value.unsafeRingBuffer().getBufferSize())
                 .description("Disruptor ring buffer size")
                 .tags("pipeline", handle.name(), "event.type", handle.eventType().getName())
                 .register(registry);
         Gauge.builder("disruptor.pipeline.remaining.capacity", handle,
-                        value -> value.ringBuffer().remainingCapacity())
+                        value -> value.unsafeRingBuffer().remainingCapacity())
                 .description("Disruptor ring buffer remaining capacity")
                 .tags("pipeline", handle.name(), "event.type", handle.eventType().getName())
                 .register(registry);
@@ -44,8 +44,8 @@ public final class DisruptorMetrics implements MeterBinder {
     }
 
     private static double backlog(PipelineHandle<?> handle) {
-        long cursor = handle.ringBuffer().getCursor();
-        long minimumGatingSequence = handle.ringBuffer().getMinimumGatingSequence();
+        long cursor = handle.unsafeRingBuffer().getCursor();
+        long minimumGatingSequence = handle.unsafeRingBuffer().getMinimumGatingSequence();
         return Math.max(0L, cursor - minimumGatingSequence);
     }
 }

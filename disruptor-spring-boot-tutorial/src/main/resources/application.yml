@@ -2,10 +2,10 @@ server:
   port: 8080
 
 disruptor:
+  shutdown-timeout: 10s
   defaults:
     buffer-size: 1024
     wait-strategy: YIELDING
-    shutdown-timeout: 10s
   pipelines:
     matching:
       producer-type: SINGLE
