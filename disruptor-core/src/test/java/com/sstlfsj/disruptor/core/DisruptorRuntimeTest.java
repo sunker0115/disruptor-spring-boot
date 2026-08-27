@@ -7,8 +7,11 @@ import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.EventTranslatorThreeArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.lmax.disruptor.Sequence;
+import com.lmax.disruptor.dsl.ProducerType;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -245,19 +248,26 @@ class DisruptorRuntimeTest {
     }
 
     @Test
-    void publishesClaimedSlotWhenFillerThrows() {
-        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("publish-failure")).build();
+    void releasesSinglePublisherAdmissionWhenFillerThrows() {
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "publish-failure", TestEvent.class, () -> new TestEvent("slot"))
+                .producerType(ProducerType.SINGLE)
+                .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
+                }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofMillis(200))
+                .add(spec)
+                .build();
         PipelineHandle<TestEvent> handle = runtime.require("publish-failure", TestEvent.class);
 
         runtime.start();
-        try {
-            assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
-                throw new IllegalStateException("boom");
-            }));
-            assertEquals(0L, handle.unsafeRingBuffer().getCursor());
-        } finally {
-            runtime.halt();
-        }
+        assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
+            throw new IllegalStateException("boom");
+        }));
+        assertEquals(0L, handle.unsafeRingBuffer().getCursor());
+
+        runtime.shutdown();
     }
 
     @Test
@@ -377,8 +387,10 @@ class DisruptorRuntimeTest {
         assertFalse(runtime.isRunning());
     }
 
-    @Test
-    void waitsForInFlightPublicationBeforeCapturingDrainTarget() throws Exception {
+    @ParameterizedTest
+    @EnumSource(ProducerType.class)
+    void waitsForInFlightPublicationBeforeCapturingDrainTarget(ProducerType producerType)
+            throws Exception {
         CountDownLatch translating = new CountDownLatch(1);
         CountDownLatch releaseTranslator = new CountDownLatch(1);
         CountDownLatch consumed = new CountDownLatch(1);
@@ -386,6 +398,7 @@ class DisruptorRuntimeTest {
         AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "publication-boundary", TestEvent.class, () -> new TestEvent("slot"))
+                .producerType(producerType)
                 .topology(disruptor -> disruptor.handleEventsWith(
                         (event, sequence, endOfBatch) -> consumed.countDown()))
                 .build();
@@ -419,8 +432,6 @@ class DisruptorRuntimeTest {
             }
         });
         awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
-        assertFalse(handle.tryPublishEvent((event, sequence) -> event.value = "late"),
-                "进入 QUIESCING 后必须拒绝新发布");
 
         releaseTranslator.countDown();
         publisher.join(2_000);
@@ -431,6 +442,70 @@ class DisruptorRuntimeTest {
         assertEquals(null, publisherFailure.get());
         assertEquals(null, shutdownFailure.get());
         assertEquals(0L, consumed.getCount(), "关闭边界前进入的发布必须被消费");
+    }
+
+    @Test
+    void waitsForEveryInFlightMultiProducerBeforeCapturingDrainTarget() throws Exception {
+        int publisherCount = 4;
+        CountDownLatch translating = new CountDownLatch(publisherCount);
+        CountDownLatch releaseTranslators = new CountDownLatch(1);
+        CountDownLatch consumed = new CountDownLatch(publisherCount);
+        AtomicReference<Throwable> publisherFailure = new AtomicReference<>();
+        AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "multi-publication-boundary", TestEvent.class, () -> new TestEvent("slot"))
+                .bufferSize(16)
+                .producerType(ProducerType.MULTI)
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> consumed.countDown()))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+        PipelineHandle<TestEvent> handle = runtime.require(
+                "multi-publication-boundary", TestEvent.class);
+        runtime.start();
+
+        Thread[] publishers = new Thread[publisherCount];
+        for (int index = 0; index < publisherCount; index++) {
+            publishers[index] = Thread.ofPlatform().name("multi-publisher-" + index).start(() -> {
+                try {
+                    handle.publishEvent((event, sequence) -> {
+                        translating.countDown();
+                        try {
+                            releaseTranslators.await();
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("发布线程被中断", interrupted);
+                        }
+                        event.number = sequence;
+                    });
+                } catch (Throwable failure) {
+                    publisherFailure.compareAndSet(null, failure);
+                }
+            });
+        }
+        assertTrue(translating.await(2, TimeUnit.SECONDS));
+
+        Thread shutdown = Thread.ofPlatform().name("multi-publisher-shutdown").start(() -> {
+            try {
+                runtime.shutdown();
+            } catch (Throwable failure) {
+                shutdownFailure.set(failure);
+            }
+        });
+        awaitCondition(() -> !handle.tryPublishEvent(TRANSLATOR, "probe", 1L),
+                Duration.ofSeconds(2));
+
+        releaseTranslators.countDown();
+        for (Thread publisher : publishers) {
+            publisher.join(2_000);
+            assertFalse(publisher.isAlive());
+        }
+        shutdown.join(2_000);
+
+        assertFalse(shutdown.isAlive());
+        assertEquals(null, publisherFailure.get());
+        assertEquals(null, shutdownFailure.get());
+        assertEquals(0L, consumed.getCount());
     }
 
     @Test
@@ -500,6 +575,7 @@ class DisruptorRuntimeTest {
         CountDownLatch consumed = new CountDownLatch(4);
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "translator-overloads", TestEvent.class, () -> new TestEvent("slot"))
+                .producerType(ProducerType.SINGLE)
                 .topology(disruptor -> disruptor.handleEventsWith(
                         (event, sequence, endOfBatch) -> consumed.countDown()))
                 .build();

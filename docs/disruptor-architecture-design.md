@@ -119,7 +119,7 @@ disruptor-spring-boot-starter
 - `publish(...)`、`tryPublish(...)` 和 `remaining()` 便捷方法；
 - 显式命名的原生逃生口 `unsafeRingBuffer()`。
 
-受管发布通过一个无锁准入协议记录在途发布。Runtime 进入 `QUIESCING` 后拒绝新发布，等待已获准发布完成后才捕获排空目标，因此“已经 claim 但 translator 尚未返回”的槽位不会被漏掉。静态 translator 路径不创建包装 lambda，但每次受管发布会增加两次原子计数操作。
+受管发布通过一个无锁准入协议记录在途发布。Runtime 进入 `QUIESCING` 后拒绝新发布，等待已获准发布完成后才捕获排空目标，因此“已经 claim 但 translator 尚未返回”的槽位不会被漏掉。`SINGLE` 利用其至多一个发布者的上游契约，通过两个 volatile 状态完成准入与关闭握手；`MULTI` 使用原子计数精确记录并发发布者。两条路径共享相同的关闭语义。
 
 句柄不复制 `EventSink` 的批量与 varargs 重载。需要这些能力或要求完全零代理时使用 `unsafeRingBuffer()`；调用方必须在关闭 Runtime 前自行停止相应生产者。运行期不再公开原生 `Disruptor<E>`，防止业务绕过 Runtime 操作生命周期。
 
@@ -212,7 +212,7 @@ Runtime 不包装业务 handler，也不实现自动重试。自动重试需要�
 ## 热路径与事件语义
 
 - topology 完成后，业务 handler 由 LMAX processor 直接调用；
-- 受管 `publishEvent/tryPublishEvent` 直接调用同一个 `RingBuffer<E>`，只增加发布准入所需的原子计数，不使用反射、动态代理或包装 translator；
+- 受管 `publishEvent/tryPublishEvent` 直接调用同一个 `RingBuffer<E>`；`SINGLE` 只增加 volatile 准入握手，`MULTI` 增加原子计数，不使用反射、动态代理或包装 translator；
 - `PipelineHandle.publish(...)` 与 `tryPublish(...)` 会为每次调用创建 translator lambda，只定位为便捷 API；
 - 静态 translator 的受管发布路径不创建包装 lambda；完全零代理路径使用 `unsafeRingBuffer()`；
 - translator 抛异常时，Disruptor 仍发布已经领取的槽位，因此 translator 不得包含可能失败的业务逻辑；

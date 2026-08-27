@@ -6,6 +6,7 @@ import com.lmax.disruptor.EventTranslatorThreeArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
+import com.lmax.disruptor.dsl.ProducerType;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -24,16 +25,20 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
     private final Disruptor<E> disruptor;
     private final RingBuffer<E> ringBuffer;
     private final TrackingThreadFactory threadFactory;
-    private final AtomicInteger activePublishers = new AtomicInteger();
+    private final boolean singleProducer;
+    private final AtomicInteger activePublishers;
     private volatile boolean acceptingPublications;
+    private volatile boolean singlePublisherActive;
 
     private ManagedPipeline(String name, Class<E> eventType, Disruptor<E> disruptor,
-                            TrackingThreadFactory threadFactory) {
+                            TrackingThreadFactory threadFactory, ProducerType producerType) {
         this.name = name;
         this.eventType = eventType;
         this.disruptor = disruptor;
         this.ringBuffer = disruptor.getRingBuffer();
         this.threadFactory = threadFactory;
+        this.singleProducer = producerType == ProducerType.SINGLE;
+        this.activePublishers = singleProducer ? null : new AtomicInteger();
     }
 
     static <E> ManagedPipeline<E> build(PipelineSpec<E> spec, ResolvedPipelineSettings<E> settings) {
@@ -58,7 +63,8 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
             throw new IllegalStateException("管道 '" + spec.name()
                     + "' 的 topology 不得调用 start()，生命周期必须由 DisruptorRuntime 托管");
         }
-        return new ManagedPipeline<>(spec.name(), spec.eventType(), disruptor, threadFactory);
+        return new ManagedPipeline<>(spec.name(), spec.eventType(), disruptor, threadFactory,
+                settings.producerType());
     }
 
     @Override
@@ -78,7 +84,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             ringBuffer.publishEvent(translator);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -91,7 +97,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             return ringBuffer.tryPublishEvent(translator);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -102,7 +108,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             ringBuffer.publishEvent(translator, arg0);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -115,7 +121,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             return ringBuffer.tryPublishEvent(translator, arg0);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -126,7 +132,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             ringBuffer.publishEvent(translator, arg0, arg1);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -139,7 +145,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             return ringBuffer.tryPublishEvent(translator, arg0, arg1);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -151,7 +157,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             ringBuffer.publishEvent(translator, arg0, arg1, arg2);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -165,7 +171,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         try {
             return ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2);
         } finally {
-            activePublishers.decrementAndGet();
+            exitPublisher();
         }
     }
 
@@ -238,7 +244,7 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
     }
 
     private boolean awaitPublishers(long deadlineNanos) {
-        while (activePublishers.get() != 0) {
+        while (hasActivePublishers()) {
             if (!parkUntil(deadlineNanos)) {
                 return false;
             }
@@ -274,12 +280,34 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         if (!acceptingPublications) {
             return false;
         }
+        if (singleProducer) {
+            // SINGLE 保证至多一个发布者；两次 volatile 读取与 active 写入形成关闭握手，
+            // 避免发布者通过首次检查后，shutdown 在其真正发布前捕获到过早的游标。
+            singlePublisherActive = true;
+            if (acceptingPublications) {
+                return true;
+            }
+            singlePublisherActive = false;
+            return false;
+        }
         activePublishers.incrementAndGet();
         if (acceptingPublications) {
             return true;
         }
         activePublishers.decrementAndGet();
         return false;
+    }
+
+    private void exitPublisher() {
+        if (singleProducer) {
+            singlePublisherActive = false;
+        } else {
+            activePublishers.decrementAndGet();
+        }
+    }
+
+    private boolean hasActivePublishers() {
+        return singleProducer ? singlePublisherActive : activePublishers.get() != 0;
     }
 
     record StopResult(StopStatus status, String message, Throwable cause) {
