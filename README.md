@@ -1,5 +1,8 @@
 # disruptor-spring-boot
 
+[![CI](https://github.com/sunker0115/disruptor-spring-boot/actions/workflows/ci.yml/badge.svg)](https://github.com/sunker0115/disruptor-spring-boot/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 基于 [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) 原生 API 的 Spring Boot Starter。
 
 项目只托管管道构建、命名注册、配置合并和 Spring 生命周期。事件拓扑、处理器、异常处理、回放、自定义处理器与事件发布仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
@@ -247,14 +250,8 @@ bash disruptor-spring-boot-tutorial/demo.sh
 
 维护者可阅读[架构设计](docs/disruptor-architecture-design.md)。
 
-## 开源状态
+## 开源与发布
 
-当前仓库尚未配置 Maven Central 发布、持续集成、贡献指南、安全策略和开源许可证。在根目录增加明确的 `LICENSE` 之前，源码不应被视为已经获得开源使用、修改或分发授权。
+项目采用 [Apache License 2.0](LICENSE) 开源。参与开发前请阅读[贡献指南](CONTRIBUTING.md)；安全问题请按照[安全策略](SECURITY.md)私密报告。推送到 `main` 和 Pull Request 会在 GitHub Actions 中使用 JDK 21 执行全仓 `clean verify`。
 
-公开发布前至少应补齐：
-
-- `LICENSE`；
-- `CONTRIBUTING.md`；
-- `SECURITY.md`；
-- CI 构建与测试；
-- Maven Central 发布、签名和项目元数据。
+当前版本尚未发布到 Maven Central，首次使用仍需按“快速开始”在本地构建安装。Maven Central 坐标、制品签名和发布自动化将在首次制品发布前单独完成。

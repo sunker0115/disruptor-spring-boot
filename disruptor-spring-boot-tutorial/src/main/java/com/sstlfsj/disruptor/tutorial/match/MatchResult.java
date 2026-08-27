@@ -3,9 +3,8 @@ package com.sstlfsj.disruptor.tutorial.match;
 import java.math.BigDecimal;
 
 /**
- * 不可变撮合产出，三形态。每条带确定性 {@code sequence}（{@link OrderBook#nextSequence()} 赋予，
- * 同输入同序 → 同 sequence，可回放）。精简自 raftkit {@code match.core.MatchResult}：LIMIT 只有 FILLED
- * 一种完成，故去掉 DoneReason / userId / execId。
+ * 不可变撮合产出，包含成交、挂单和完成三种形态。每条结果带确定性 {@code sequence}
+ * （由 {@link OrderBook#nextSequence()} 赋予），同样的输入顺序会得到同样的结果顺序，可用于回放验证。
  */
 public sealed interface MatchResult permits MatchResult.Trade, MatchResult.Open, MatchResult.Done {
 

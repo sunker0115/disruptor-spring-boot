@@ -6,8 +6,7 @@ import java.util.function.Predicate;
 
 /**
  * 单侧盘口（bids 或 asks），价格档位存储直接内嵌 {@link TreeMap}（O(log n) 有序）。
- * 语义等价 raftkit {@code TreeMapPriceLevels}：best/forEach 买侧价格降序、卖侧升序。
- * 精简自 raftkit {@code match.core.OrderSide}：去 PriceLevels 接口层（只一种实现无需抽象）、去改单 reduce。
+ * 最优价和遍历顺序在买侧按价格降序、卖侧按价格升序排列。
  */
 public final class OrderSide {
 

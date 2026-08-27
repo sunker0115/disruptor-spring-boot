@@ -17,14 +17,13 @@ import java.util.Map;
  * {@code match} stage（{@code parallelism = 1}）单线程调用。这不是性能优化而是正确性前提——并发调用会撕裂
  * TreeMap、竞态 sequence。这正是本 tutorial "为什么必须 Disruptor" 的立论核心。</p>
  *
- * <p>撮合逻辑精简自 raftkit {@code AbstractMatchHandler}：只保留 LIMIT + base 驱动（remaining 量），
- * 把 runMatch/doMatch/handleLimit 塌缩为一个 {@link #matchLimit} —— fill = min(taker, maker)，无 sink 回调、无 peek。</p>
+ * <p>教程只实现 LIMIT 订单与剩余量驱动的撮合流程。核心算法集中在 {@link #matchLimit}：
+ * {@code fill = min(taker, maker)}，不包含持久化回调或额外撮合类型。</p>
  *
  * <p>跨线程读盘口：{@link #handle} 末尾把各 symbol 的深度整体替换到 volatile {@link #depthView}，web 线程无锁读
  * （单写者安全发布）。</p>
  *
- * <p><b>后续优化点</b>（tutorial 以可读性优先，未做；详见设计文档 {@code 2026-08-21-tutorial-matching-scenario-design.md}
- * 「后续优化点」节，按收益排序）：<br>
+ * <p><b>后续优化点</b>（tutorial 以可读性优先，未做，按收益排序）：<br>
  * 1. 热路径去 {@code BigDecimal} + 去每单分配——价量改 long 定点（价已有 {@code priceLong} 编码）、复用结果容器/预分配输出事件，
  *    取代每单 {@code new ArrayList<>} 与 {@code MatchResult} 记录分配。这是撮合延迟主来源，收益最大。<br>
  * 2. 事件模型进一步原地化，减少撮合结果和挂单对象分配；Starter 路径本身已经没有反射调用。</p>

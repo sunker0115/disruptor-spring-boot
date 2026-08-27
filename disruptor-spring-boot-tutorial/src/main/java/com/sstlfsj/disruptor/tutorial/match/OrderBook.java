@@ -8,7 +8,7 @@ import java.util.List;
 /**
  * 单 symbol 盘口：bids/asks 两侧 + 价格 long 编码 + 输出 sequence。
  * <b>故意非线程安全</b>（裸集合 + {@code ++sequence}），要求单线程调用者——由 Disruptor 单消费者保证，
- * 无锁却正确。精简自 raftkit {@code match.core.OrderBook}：去 orderId/userId 索引、去重集、snapshot/restore、改单。
+ * 通过线程约束保证无锁状态更新的正确性。
  */
 public final class OrderBook {
 

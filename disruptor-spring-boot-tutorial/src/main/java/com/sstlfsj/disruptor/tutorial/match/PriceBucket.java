@@ -6,8 +6,7 @@ import java.util.Map;
 
 /**
  * 同一价位的订单桶：{@link LinkedHashMap} 保插入序 → 价格时间优先（同价先到先撮）。
- * {@code quantity} 跟踪本桶剩余总量，增删/成交时增量维护。精简自 raftkit {@code match.core.PriceBucket}
- * （去泛型、去改单 reduce）。
+ * {@code quantity} 跟踪本桶剩余总量，增删或成交时增量维护。
  */
 public final class PriceBucket {
 

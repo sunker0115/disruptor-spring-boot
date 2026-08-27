@@ -8,7 +8,7 @@ import java.math.BigDecimal;
 
 /**
  * 撮合订单（可变：累计 {@code executedQty}）。仅撮合线程访问，非线程安全——由 Disruptor 单消费者保证。
- * 精简自 raftkit {@code match.core.Order}：只保留 LIMIT + base 驱动所需字段。
+ * 教程只保留 LIMIT 订单撮合所需字段。
  */
 @Getter
 @Setter
