@@ -64,7 +64,7 @@ public record PipelineSettings(
         private Supplier<? extends WaitStrategy> waitStrategyFactory = BlockingWaitStrategy::new;
         private Function<String, ThreadFactory> threadFactoryFactory = NamedThreadFactory::new;
         private Duration shutdownTimeout = Duration.ofSeconds(10);
-        private ExceptionHandler<Object> exceptionHandler = ErrorStrategy.LOG_AND_CONTINUE.handler();
+        private ExceptionHandler<Object> exceptionHandler = ErrorStrategy.HALT.handler();
 
         private Builder() {
         }

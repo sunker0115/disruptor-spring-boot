@@ -88,18 +88,25 @@ public final class DisruptorRuntime {
             throw new IllegalStateException("DisruptorRuntime 已停止，LMAX Disruptor 不支持重新启动");
         }
 
-        List<DefaultPipelineHandle<?>> started = new ArrayList<>();
+        List<DefaultPipelineHandle<?>> attempted = new ArrayList<>();
         try {
             for (DefaultPipelineHandle<?> handle : handlesByName.values()) {
+                attempted.add(handle);
                 handle.start();
-                started.add(handle);
                 log.info("已启动 Disruptor 管道 [{}]，事件类型={}，bufferSize={}",
                         handle.name(), handle.eventType().getName(), handle.ringBuffer().getBufferSize());
             }
             state = State.RUNNING;
         } catch (RuntimeException | Error failure) {
-            Collections.reverse(started);
-            started.forEach(DefaultPipelineHandle::halt);
+            Collections.reverse(attempted);
+            for (DefaultPipelineHandle<?> handle : attempted) {
+                try {
+                    handle.halt();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                    log.warn("回滚 Disruptor 管道 [{}] 失败", handle.name(), cleanupFailure);
+                }
+            }
             state = State.STOPPED;
             throw new IllegalStateException("启动 Disruptor 管道失败，已回滚已启动管道", failure);
         }
@@ -116,20 +123,23 @@ public final class DisruptorRuntime {
 
         List<DefaultPipelineHandle<?>> reverse = new ArrayList<>(handlesByName.values());
         Collections.reverse(reverse);
-        for (DefaultPipelineHandle<?> handle : reverse) {
-            try {
-                handle.shutdown();
-                log.info("已停止 Disruptor 管道 [{}]", handle.name());
-            } catch (TimeoutException timeout) {
-                log.warn("Disruptor 管道 [{}] 在 {} 内未排空，已强制 halt",
-                        handle.name(), handle.shutdownTimeout());
-                handle.halt();
-            } catch (RuntimeException failure) {
-                log.warn("停止 Disruptor 管道 [{}] 失败，已强制 halt", handle.name(), failure);
-                handle.halt();
+        try {
+            for (DefaultPipelineHandle<?> handle : reverse) {
+                try {
+                    handle.shutdown();
+                    log.info("已停止 Disruptor 管道 [{}]", handle.name());
+                } catch (TimeoutException timeout) {
+                    log.warn("Disruptor 管道 [{}] 在 {} 内未排空，已强制 halt",
+                            handle.name(), handle.shutdownTimeout());
+                    haltAfterShutdownFailure(handle, timeout);
+                } catch (RuntimeException failure) {
+                    log.warn("停止 Disruptor 管道 [{}] 失败，已强制 halt", handle.name(), failure);
+                    haltAfterShutdownFailure(handle, failure);
+                }
             }
+        } finally {
+            state = State.STOPPED;
         }
-        state = State.STOPPED;
     }
 
     public synchronized void halt() {
@@ -138,12 +148,33 @@ public final class DisruptorRuntime {
         }
         List<DefaultPipelineHandle<?>> reverse = new ArrayList<>(handlesByName.values());
         Collections.reverse(reverse);
-        reverse.forEach(DefaultPipelineHandle::halt);
-        state = State.STOPPED;
+        try {
+            for (DefaultPipelineHandle<?> handle : reverse) {
+                try {
+                    handle.halt();
+                } catch (RuntimeException failure) {
+                    log.warn("强制停止 Disruptor 管道 [{}] 失败", handle.name(), failure);
+                }
+            }
+        } finally {
+            state = State.STOPPED;
+        }
     }
 
+    /**
+     * Runtime 是否处于已启动且未停止的托管生命周期状态；不代表每个消费者线程都健康。
+     */
     public synchronized boolean isRunning() {
         return state == State.RUNNING;
+    }
+
+    private static void haltAfterShutdownFailure(DefaultPipelineHandle<?> handle, Throwable failure) {
+        try {
+            handle.halt();
+        } catch (RuntimeException haltFailure) {
+            failure.addSuppressed(haltFailure);
+            log.warn("强制停止 Disruptor 管道 [{}] 仍然失败", handle.name(), haltFailure);
+        }
     }
 
     private static <E> DefaultPipelineHandle<E> buildHandle(PipelineSpec<E> spec,
@@ -257,7 +288,7 @@ public final class DisruptorRuntime {
         }
 
         @Override
-        public boolean isStarted() {
+        public boolean hasStarted() {
             return disruptor.hasStarted();
         }
 

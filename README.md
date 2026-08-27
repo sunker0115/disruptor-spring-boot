@@ -4,6 +4,8 @@
 
 它只托管基础设施：管道构建、命名注册、配置合并和 Spring 生命周期。拓扑、处理器、异常、回放、自定义处理器以及发布全部直接使用 Disruptor 4.0 API，不维护功能不完整的中间 DSL。
 
+构建与运行要求 JDK 21 或更高版本。
+
 ## 快速开始
 
 引入 Starter：
@@ -76,7 +78,7 @@ disruptor:
     wait-strategy: BLOCKING
     shutdown-timeout: 10s
     daemon-threads: false
-    error-strategy: LOG_AND_CONTINUE
+    error-strategy: HALT
   pipelines:
     orders:
       buffer-size: 65536
@@ -102,15 +104,15 @@ disruptor:
 
 ### 异常处理
 
-默认策略是 `LOG_AND_CONTINUE`：某条事件处理抛异常时，记录 ERROR 日志并跳过该条、继续消费后续事件——避免 Disruptor 原生 `FatalExceptionHandler` 那样一条异常就终止消费者、令序列停推而卡死整条管道。声明式可按环境切换（`LOG_AND_CONTINUE` / `HALT`；`HALT` 记录后抛出、终止该消费者，仅用于出错即停 + 人工介入的严格场景）：
+默认策略是 `HALT`：某条事件处理抛异常时，记录 ERROR 日志并终止失败消费者，避免链式拓扑把失败槽位继续交给下游。该策略要求应用监控消费者异常并由人工介入恢复。只有终端消费者、幂等处理或业务明确接受部分处理时，才应显式切换为 `LOG_AND_CONTINUE`；该策略会吞掉异常并推进消费序列，依赖当前处理器的下游也会看到该槽位：
 
 ```yaml
 disruptor:
   defaults:
-    error-strategy: LOG_AND_CONTINUE
+    error-strategy: HALT
   pipelines:
     orders:
-      error-strategy: HALT
+      error-strategy: LOG_AND_CONTINUE
 ```
 
 需要完全自定义（按事件类型、单条重试计数、失败投递通道等）时，用编程式逃生口：
@@ -122,7 +124,7 @@ PipelineSpec.builder("orders", OrderEvent.class, OrderEvent::new)
         .build();
 ```
 
-需要处理器级差异化策略时，在 `topology` 中直接调用 `disruptor.handleExceptionsFor(handler).with(...)`。优先级同其它旋钮：`PipelineSpec.exceptionHandler` > `disruptor.pipelines.<name>.error-strategy` > `disruptor.defaults.error-strategy` > 框架默认 `LOG_AND_CONTINUE`。Starter 不在消费者外包裹委托层，也不会让异常事件伪装成已成功处理后流向下游。
+需要处理器级差异化策略时，在 `topology` 中直接调用 `disruptor.handleExceptionsFor(handler).with(...)`。优先级同其它旋钮：`PipelineSpec.exceptionHandler` > `disruptor.pipelines.<name>.error-strategy` > `disruptor.defaults.error-strategy` > 框架默认 `HALT`。Starter 不在消费者外包裹委托层。
 
 ### 事件槽位复用
 
@@ -146,9 +148,9 @@ runtime.require("order-audit", OrderEvent.class);
 
 `DisruptorRuntime` 是一次性状态机：重复启动或停止是幂等的，停止后重新启动会失败。Spring 在最早阶段启动、最晚阶段停止；关闭时按启动逆序逐条排空，超时后 `halt`，并继续关闭其余管道。
 
-`PipelineHandle.disruptor()` 和 `ringBuffer()` 是完整原生逃生口。默认不要自行调用 `start`、`halt` 或 `shutdown`，生命周期由 Runtime 或 Spring 托管。
+`PipelineHandle.disruptor()` 和 `ringBuffer()` 是完整原生逃生口。`PipelineHandle.hasStarted()` 表示底层实例是否曾启动，停止后仍为 `true`；`DisruptorRuntime.isRunning()` 只表示 Runtime 处于已启动且未停止的托管生命周期状态，两者都不是消费者健康检查。默认不要自行调用 `start`、`halt` 或 `shutdown`，生命周期由 Runtime 或 Spring 托管。
 
-classpath 存在 Micrometer 时，Starter 注册 `disruptor.runtime.running`、`disruptor.pipeline.buffer.size`、`disruptor.pipeline.remaining.capacity` 和 `disruptor.pipeline.backlog`。这些 Gauge 只在采集时读取原生状态，不包装发布或消费路径；可用 `disruptor.metrics.enabled=false` 关闭。
+classpath 存在 Micrometer 时，Starter 注册 `disruptor.runtime.running`、`disruptor.pipeline.buffer.size`、`disruptor.pipeline.remaining.capacity` 和 `disruptor.pipeline.backlog`。其中 `disruptor.runtime.running` 是托管生命周期指标，不是消费者健康指标。这些 Gauge 只在采集时读取原生状态，不包装发布或消费路径；可用 `disruptor.metrics.enabled=false` 关闭。
 
 ## 纯 Java 用法
 

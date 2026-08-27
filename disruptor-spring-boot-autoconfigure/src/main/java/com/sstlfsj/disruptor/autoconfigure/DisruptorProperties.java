@@ -91,14 +91,19 @@ public class DisruptorProperties {
         ErrorStrategy errorStrategy = override == null || override.errorStrategy == null
                 ? defaults.errorStrategy : override.errorStrategy;
 
-        return PipelineSettings.builder()
-                .bufferSize(bufferSize)
-                .producerType(producerType)
-                .waitStrategy(waitStrategy.factory())
-                .threadFactory(name -> new NamedThreadFactory(name, daemonThreads))
-                .shutdownTimeout(shutdownTimeout)
-                .exceptionHandler(errorStrategy.handler())
-                .build();
+        try {
+            return PipelineSettings.builder()
+                    .bufferSize(bufferSize)
+                    .producerType(producerType)
+                    .waitStrategy(waitStrategy.factory())
+                    .threadFactory(name -> new NamedThreadFactory(name, daemonThreads))
+                    .shutdownTimeout(shutdownTimeout)
+                    .exceptionHandler(errorStrategy.handler())
+                    .build();
+        } catch (IllegalArgumentException failure) {
+            throw new IllegalArgumentException(
+                    "管道 '" + pipelineName + "' 配置无效：" + failure.getMessage(), failure);
+        }
     }
 
     public static class Defaults {
@@ -118,8 +123,8 @@ public class DisruptorProperties {
         /** 消费线程是否为 daemon 线程。 */
         private boolean daemonThreads;
 
-        /** 消费异常的默认处置策略;默认记录并跳过、继续消费(避免一条异常卡死整条管道)。 */
-        private ErrorStrategy errorStrategy = ErrorStrategy.LOG_AND_CONTINUE;
+        /** 消费异常的默认处置策略；默认停止失败消费者，避免失败槽位继续流向下游。 */
+        private ErrorStrategy errorStrategy = ErrorStrategy.HALT;
 
         public int getBufferSize() {
             return bufferSize;

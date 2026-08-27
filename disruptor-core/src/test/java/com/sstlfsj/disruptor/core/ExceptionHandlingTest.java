@@ -6,17 +6,21 @@ import com.lmax.disruptor.ExceptionHandler;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 异常处理一等能力:默认安全(不卡死)、策略语义、以及 spec &gt; settings 的解析优先级。
+ * 异常处理一等能力：默认保护拓扑一致性、显式继续策略的原生传播语义、以及配置解析优先级。
  */
 class ExceptionHandlingTest {
 
@@ -24,42 +28,71 @@ class ExceptionHandlingTest {
             (event, sequence, number) -> event.number = number;
 
     /**
-     * 毒丸回归:默认 LOG_AND_CONTINUE 下,某条事件处理抛异常必须被跳过、管道继续消费后续事件,
-     * 而不是像 Disruptor 原生 FatalExceptionHandler 那样终止消费者、卡死整条管道。
+     * 默认 HALT 下，上游失败后序列不得推进，依赖它的下游不能把失败槽位当作成功结果处理。
      */
     @Test
-    void defaultStrategySkipsFailedEventAndKeepsConsuming() throws Exception {
-        CountDownLatch succeeded = new CountDownLatch(4);
-        EventHandler<TestEvent> handler = (event, sequence, endOfBatch) -> {
-            if (event.number == 2L) {
-                throw new IllegalStateException("boom on " + event.number);
-            }
-            succeeded.countDown();
+    void defaultStrategyHaltsBeforeFailedEventReachesDownstream() throws Exception {
+        CountDownLatch downstream = new CountDownLatch(1);
+        EventHandler<TestEvent> upstream = (event, sequence, endOfBatch) -> {
+            throw new IllegalStateException("boom on " + event.number);
         };
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
-                        "resilient", TestEvent.class, TestEvent::new)
+                        "strict", TestEvent.class, TestEvent::new)
                 .bufferSize(16)
-                .shutdownTimeout(Duration.ofSeconds(2))
-                .topology(disruptor -> disruptor.handleEventsWith(handler))
+                .shutdownTimeout(Duration.ofMillis(200))
+                .topology(disruptor -> disruptor.handleEventsWith(upstream)
+                        .then((event, sequence, endOfBatch) -> downstream.countDown()))
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
 
         runtime.start();
         try {
-            var ringBuffer = runtime.require("resilient", TestEvent.class).ringBuffer();
-            for (long i = 0; i < 5; i++) {
-                ringBuffer.publishEvent(TRANSLATOR, i);
-            }
-            // 出错的第 3 条被跳过,其余 4 条仍被消费 → 管道未卡死。
-            assertTrue(succeeded.await(2, TimeUnit.SECONDS), "出错事件后管道应继续消费,不得卡死");
+            runtime.require("strict", TestEvent.class).ringBuffer().publishEvent(TRANSLATOR, 1L);
+            assertFalse(downstream.await(300, TimeUnit.MILLISECONDS), "失败槽位不得流向依赖它的下游");
         } finally {
             runtime.shutdown();
         }
     }
 
     @Test
-    void defaultsCarryLogAndContinueHandler() {
+    void explicitLogAndContinueAdvancesSequenceAndDownstreamSeesFailedSlot() throws Exception {
+        CountDownLatch downstream = new CountDownLatch(2);
+        List<Long> seen = new CopyOnWriteArrayList<>();
+        EventHandler<TestEvent> upstream = (event, sequence, endOfBatch) -> {
+            if (event.number == 1L) {
+                throw new IllegalStateException("boom on " + event.number);
+            }
+        };
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "available", TestEvent.class, TestEvent::new)
+                .bufferSize(16)
+                .exceptionHandler(ErrorStrategy.LOG_AND_CONTINUE.handler())
+                .topology(disruptor -> disruptor.handleEventsWith(upstream)
+                        .then((event, sequence, endOfBatch) -> {
+                            seen.add(event.number);
+                            downstream.countDown();
+                        }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
+
+        runtime.start();
+        try {
+            var ringBuffer = runtime.require("available", TestEvent.class).ringBuffer();
+            ringBuffer.publishEvent(TRANSLATOR, 1L);
+            ringBuffer.publishEvent(TRANSLATOR, 2L);
+
+            assertTrue(downstream.await(2, TimeUnit.SECONDS));
+            assertEquals(List.of(1L, 2L), seen);
+        } finally {
+            runtime.shutdown();
+        }
+    }
+
+    @Test
+    void defaultsCarryHaltHandler() {
         assertNotNull(PipelineSettings.defaults().exceptionHandler());
+        assertThrows(RuntimeException.class, () -> PipelineSettings.defaults().exceptionHandler()
+                .handleEventException(new IllegalStateException("x"), 0L, new Object()));
     }
 
     @Test

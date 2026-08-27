@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.micrometer.metrics.autoconfigure.MetricsAutoConfiguration;
 import org.springframework.boot.micrometer.metrics.autoconfigure.export.simple.SimpleMetricsExportAutoConfiguration;
+import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.aot.generate.ClassNameGenerator;
 import org.springframework.aot.generate.DefaultGenerationContext;
@@ -76,7 +77,7 @@ class DisruptorAutoConfigurationTest {
     }
 
     @Test
-    void defaultErrorStrategyContinuesConsumingAfterHandlerException() {
+    void defaultErrorStrategyHaltsAfterHandlerException() {
         CountDownLatch succeeded = new CountDownLatch(2);
         contextRunner.withBean("faulty", PipelineSpec.class, () -> PipelineSpec
                         .builder("faulty", TestEvent.class, TestEvent::new)
@@ -95,7 +96,32 @@ class DisruptorAutoConfigurationTest {
                     handle.ringBuffer().publishEvent(translator, "ok-1");
                     handle.ringBuffer().publishEvent(translator, "boom");
                     handle.ringBuffer().publishEvent(translator, "ok-2");
-                    // 未配 error-strategy → 默认 LOG_AND_CONTINUE:出错事件被跳过,前后正常事件都消费,管道不卡死。
+                    assertThat(succeeded.await(300, TimeUnit.MILLISECONDS)).isFalse();
+                    assertThat(succeeded.getCount()).isEqualTo(1);
+                });
+    }
+
+    @Test
+    void explicitLogAndContinueKeepsConsumingAfterHandlerException() {
+        CountDownLatch succeeded = new CountDownLatch(2);
+        contextRunner.withBean("faulty", PipelineSpec.class, () -> PipelineSpec
+                        .builder("faulty", TestEvent.class, TestEvent::new)
+                        .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
+                            if ("boom".equals(event.value)) {
+                                throw new IllegalStateException("boom");
+                            }
+                            succeeded.countDown();
+                        }))
+                        .build())
+                .withPropertyValues("disruptor.defaults.error-strategy=log-and-continue")
+                .run(context -> {
+                    PipelineHandle<TestEvent> handle = context.getBean(DisruptorRuntime.class)
+                            .require("faulty", TestEvent.class);
+                    EventTranslatorOneArg<TestEvent, String> translator =
+                            (event, sequence, value) -> event.value = value;
+                    handle.ringBuffer().publishEvent(translator, "ok-1");
+                    handle.ringBuffer().publishEvent(translator, "boom");
+                    handle.ringBuffer().publishEvent(translator, "ok-2");
                     assertThat(succeeded.await(2, TimeUnit.SECONDS)).isTrue();
                 });
     }
@@ -125,6 +151,46 @@ class DisruptorAutoConfigurationTest {
                     assertThat(context).doesNotHaveBean(DisruptorRuntime.class);
                     assertThat(context).doesNotHaveBean(DisruptorLifecycle.class);
                 });
+    }
+
+    @Test
+    void createsAnEmptyRuntimeWhenNoPipelineSpecsExist() {
+        contextRunner.run(context -> {
+            assertThat(context).hasSingleBean(DisruptorRuntime.class);
+            assertThat(context).hasSingleBean(DisruptorLifecycle.class);
+            assertThat(context.getBean(DisruptorRuntime.class).handles()).isEmpty();
+        });
+    }
+
+    @Test
+    void backsOffForCustomRuntime() {
+        contextRunner.withUserConfiguration(CustomRuntimeConfiguration.class)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(DisruptorRuntime.class);
+                    assertThat(context).hasSingleBean(DisruptorLifecycle.class);
+                    assertThat(context.getBean(DisruptorRuntime.class))
+                            .isSameAs(CustomRuntimeConfiguration.RUNTIME);
+                });
+    }
+
+    @Test
+    void backsOffForCustomLifecycle() {
+        contextRunner.withUserConfiguration(CustomLifecycleConfiguration.class)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(DisruptorRuntime.class);
+                    assertThat(context).hasSingleBean(DisruptorLifecycle.class);
+                    assertThat(context.getBean(DisruptorLifecycle.class))
+                            .isSameAs(CustomLifecycleConfiguration.LIFECYCLE);
+                });
+    }
+
+    @Test
+    void invalidPipelineConfigurationReportsItsName() {
+        contextRunner.withUserConfiguration(SinglePipeline.class)
+                .withPropertyValues("disruptor.pipelines.orders.buffer-size=3")
+                .run(context -> assertThat(context).hasFailed()
+                        .getFailure().hasMessageContaining(
+                                "管道 'orders' 配置无效：bufferSize 必须是正的 2 的幂，实际值=3"));
     }
 
     @Test
@@ -179,6 +245,32 @@ class DisruptorAutoConfigurationTest {
                             .tag("pipeline", "orders").gauge().value()).isEqualTo(1024.0);
                     assertThat(registry.get("disruptor.pipeline.backlog")
                             .tag("pipeline", "orders").gauge().value()).isZero();
+                });
+    }
+
+    @Test
+    void canDisableMetricsOnly() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(
+                        DisruptorAutoConfiguration.class, DisruptorMetricsAutoConfiguration.class))
+                .withUserConfiguration(MetricsConfiguration.class)
+                .withPropertyValues("disruptor.metrics.enabled=false")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(DisruptorRuntime.class);
+                    assertThat(context).doesNotHaveBean(DisruptorMetrics.class);
+                });
+    }
+
+    @Test
+    void startsWithoutMicrometerOnTheClasspath() {
+        new ApplicationContextRunner()
+                .withClassLoader(new FilteredClassLoader(MeterRegistry.class))
+                .withConfiguration(AutoConfigurations.of(
+                        DisruptorAutoConfiguration.class, DisruptorMetricsAutoConfiguration.class))
+                .withUserConfiguration(SinglePipeline.class)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(DisruptorRuntime.class);
+                    assertThat(context).doesNotHaveBean("disruptorMetrics");
                 });
     }
 
@@ -239,6 +331,34 @@ class DisruptorAutoConfigurationTest {
         @Bean
         SimpleMeterRegistry meterRegistry() {
             return new SimpleMeterRegistry();
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class CustomRuntimeConfiguration {
+
+        private static final DisruptorRuntime RUNTIME = DisruptorRuntime.builder().build();
+
+        @Bean
+        DisruptorRuntime customRuntime() {
+            return RUNTIME;
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class CustomLifecycleConfiguration {
+
+        private static final DisruptorRuntime RUNTIME = DisruptorRuntime.builder().build();
+        private static final DisruptorLifecycle LIFECYCLE = new DisruptorLifecycle(RUNTIME, 123);
+
+        @Bean
+        DisruptorRuntime customRuntime() {
+            return RUNTIME;
+        }
+
+        @Bean
+        DisruptorLifecycle customLifecycle() {
+            return LIFECYCLE;
         }
     }
 

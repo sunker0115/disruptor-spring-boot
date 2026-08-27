@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.core;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
 
+import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -20,7 +21,11 @@ public interface PipelineHandle<E> {
 
     RingBuffer<E> ringBuffer();
 
-    boolean isStarted();
+    /**
+     * 是否曾调用过底层 Disruptor 的 {@code start()}。停止后仍返回 {@code true}；
+     * 当前托管生命周期状态请使用 {@link DisruptorRuntime#isRunning()}，它不代表消费者线程健康度。
+     */
+    boolean hasStarted();
 
     /**
      * 便捷阻塞发布：领取下一个槽位、用 {@code filler} 原地填充预分配事件后发布；
@@ -31,6 +36,7 @@ public interface PipelineHandle<E> {
      * {@code EventTranslator}。
      */
     default void publish(Consumer<E> filler) {
+        Objects.requireNonNull(filler, "filler 不能为空");
         ringBuffer().publishEvent((event, sequence) -> filler.accept(event));
     }
 
@@ -39,6 +45,7 @@ public interface PipelineHandle<E> {
      * 满时立即返回 {@code false}，不阻塞。分配权衡同 {@link #publish(Consumer)}。
      */
     default boolean tryPublish(Consumer<E> filler) {
+        Objects.requireNonNull(filler, "filler 不能为空");
         return ringBuffer().tryPublishEvent((event, sequence) -> filler.accept(event));
     }
 

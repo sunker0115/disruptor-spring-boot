@@ -6,9 +6,9 @@ import com.lmax.disruptor.ExceptionHandler;
  * 管道消费异常的默认处置策略(全局级,作用于一条管道的所有消费者)。映射为 Disruptor 的默认
  * {@link ExceptionHandler}。
  *
- * <p>Disruptor 原生默认是 {@code FatalExceptionHandler}:handler 抛异常即 rethrow,该消费者线程终止、
- * 序列不再推进,依赖它的下游与生产者背压随之卡死。本枚举提供两档语义清晰的替代,默认
- * {@link #LOG_AND_CONTINUE} 保证进程内安全。</p>
+ * <p>默认 {@link #HALT} 优先保护链式拓扑的一致性：handler 抛异常后终止该消费者，序列不再推进。
+ * {@link #LOG_AND_CONTINUE} 适用于终端消费者、幂等处理或业务明确接受部分处理的场景；它会吞掉异常并
+ * 推进当前消费者序列，因此依赖它的下游仍会收到失败槽位。</p>
  *
  * <p>需要完全自定义处理逻辑(按事件类型、单条重试计数、投递失败通道等)时,走
  * {@code PipelineSpec.exceptionHandler(...)} 编程式逃生口;per-handler 差异化处理走 topology 里的
@@ -16,12 +16,12 @@ import com.lmax.disruptor.ExceptionHandler;
  */
 public enum ErrorStrategy {
 
-    /** 记录 ERROR 日志并跳过出错事件,继续消费后续事件。进程内安全默认。 */
+    /** 记录 ERROR 日志并跳过出错事件，继续消费；当前消费者序列推进，下游仍会收到失败槽位。 */
     LOG_AND_CONTINUE,
 
     /**
      * 记录 ERROR 日志并向上抛出:该消费者线程终止、其序列不再推进,依赖它的下游与背压随之停滞。
-     * 仅用于"出错即停、人工介入"的严格场景,须配合监控告警使用。
+     * 默认策略；须配合监控告警和人工恢复使用。
      */
     HALT;
 

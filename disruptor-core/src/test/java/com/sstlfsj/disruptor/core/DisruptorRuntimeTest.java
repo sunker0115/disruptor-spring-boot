@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor.core;
 
 import com.lmax.disruptor.EventHandler;
+import com.lmax.disruptor.EventProcessor;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.lmax.disruptor.Sequence;
 import org.junit.jupiter.api.Test;
@@ -10,7 +11,9 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -82,8 +85,10 @@ class DisruptorRuntimeTest {
         assertSame(handle, runtime.unique(TestEvent.class));
         assertSame(handle.ringBuffer(), handle.disruptor().getRingBuffer());
         assertEquals(16, handle.ringBuffer().getBufferSize());
+        assertFalse(handle.hasStarted());
 
         runtime.start();
+        assertTrue(handle.hasStarted());
         assertTrue(started.await(2, TimeUnit.SECONDS));
         handle.ringBuffer().publishEvent(TRANSLATOR, "order-1", 42L);
 
@@ -96,6 +101,7 @@ class DisruptorRuntimeTest {
         runtime.shutdown();
         assertTrue(stopped.await(2, TimeUnit.SECONDS));
         assertFalse(runtime.isRunning());
+        assertTrue(handle.hasStarted());
     }
 
     @Test
@@ -176,6 +182,77 @@ class DisruptorRuntimeTest {
     }
 
     @Test
+    void haltsCurrentPipelineWhenAConsumerPartiallyStarts() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch stopped = new CountDownLatch(1);
+        AtomicInteger threadNumber = new AtomicInteger();
+        AtomicReference<Thread> startedThread = new AtomicReference<>();
+        EventHandler<TestEvent> firstHandler = new EventHandler<>() {
+            @Override
+            public void onEvent(TestEvent event, long sequence, boolean endOfBatch) {
+            }
+
+            @Override
+            public void onStart() {
+                started.countDown();
+            }
+
+            @Override
+            public void onShutdown() {
+                stopped.countDown();
+            }
+        };
+        PipelineSpec<TestEvent> partiallyStarted = PipelineSpec.builder(
+                        "partial", TestEvent.class, () -> new TestEvent("slot"))
+                .threadFactory(runnable -> {
+                    if (threadNumber.incrementAndGet() == 2) {
+                        throw new IllegalStateException("second consumer cannot start");
+                    }
+                    Thread thread = new Thread(runnable, "partial-start-1");
+                    startedThread.set(thread);
+                    return thread;
+                })
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        firstHandler,
+                        (event, sequence, endOfBatch) -> {
+                        }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(partiallyStarted).build();
+
+        assertThrows(IllegalStateException.class, runtime::start);
+        assertTrue(started.await(2, TimeUnit.SECONDS));
+        assertTrue(stopped.await(2, TimeUnit.SECONDS), "部分启动的当前管道也必须被 halt");
+        Thread thread = startedThread.get();
+        assertNotNull(thread);
+        thread.join(2_000);
+        assertFalse(thread.isAlive(), "启动失败后不得残留消费线程");
+        assertFalse(runtime.isRunning());
+    }
+
+    @Test
+    void rejectsNullFillersBeforeClaimingARingBufferSlot() {
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("publish-null")).build();
+        PipelineHandle<TestEvent> handle = runtime.require("publish-null", TestEvent.class);
+        long cursor = handle.ringBuffer().getCursor();
+
+        assertThrows(NullPointerException.class, () -> handle.publish(null));
+        assertEquals(cursor, handle.ringBuffer().getCursor());
+        assertThrows(NullPointerException.class, () -> handle.tryPublish(null));
+        assertEquals(cursor, handle.ringBuffer().getCursor());
+    }
+
+    @Test
+    void publishesClaimedSlotWhenFillerThrows() {
+        DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("publish-failure")).build();
+        PipelineHandle<TestEvent> handle = runtime.require("publish-failure", TestEvent.class);
+
+        assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
+            throw new IllegalStateException("boom");
+        }));
+        assertEquals(0L, handle.ringBuffer().getCursor());
+    }
+
+    @Test
     void haltsPipelineWhenShutdownExceedsTimeout() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -218,6 +295,27 @@ class DisruptorRuntimeTest {
         // onShutdown 相对 shutdown() 返回是异步的（LMAX Disruptor 在 halt() 后不 join 消费线程），
         // 因此只断言全部管道最终关闭；逆序由 DisruptorRuntime.shutdown() 的 Collections.reverse 保证。
         assertTrue(allShutdown.await(2, TimeUnit.SECONDS), "所有管道都应触发 onShutdown");
+        assertFalse(runtime.isRunning());
+    }
+
+    @Test
+    void continuesStoppingOtherPipelinesWhenOneHaltFails() throws Exception {
+        CountDownLatch healthyStopped = new CountDownLatch(1);
+        ThrowingHaltProcessor failingProcessor = new ThrowingHaltProcessor();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .add(shutdownSignalling("healthy", healthyStopped))
+                .add(PipelineSpec.builder("failing", TestEvent.class, () -> new TestEvent("slot"))
+                        .topology(disruptor -> disruptor.handleEventsWith(failingProcessor))
+                        .build())
+                .build();
+
+        runtime.start();
+        runtime.shutdown();
+
+        assertTrue(healthyStopped.await(2, TimeUnit.SECONDS),
+                "单条管道停止失败不得阻断其余管道关闭");
+        assertEquals(2, failingProcessor.haltCalls.get(),
+                "shutdown 失败后应再尝试一次强制 halt");
         assertFalse(runtime.isRunning());
     }
 
@@ -279,5 +377,33 @@ class DisruptorRuntimeTest {
     }
 
     private static final class OtherEvent {
+    }
+
+    private static final class ThrowingHaltProcessor implements EventProcessor {
+
+        private final Sequence sequence = new Sequence();
+        private final AtomicBoolean running = new AtomicBoolean();
+        private final AtomicInteger haltCalls = new AtomicInteger();
+
+        @Override
+        public Sequence getSequence() {
+            return sequence;
+        }
+
+        @Override
+        public void halt() {
+            haltCalls.incrementAndGet();
+            throw new IllegalStateException("halt failed");
+        }
+
+        @Override
+        public boolean isRunning() {
+            return running.get();
+        }
+
+        @Override
+        public void run() {
+            running.set(true);
+        }
     }
 }
