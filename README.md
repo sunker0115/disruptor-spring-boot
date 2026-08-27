@@ -1,14 +1,39 @@
 # disruptor-spring-boot
 
-一个以 LMAX Disruptor 原生 API 为核心的 Spring Boot Starter。
+基于 [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) 原生 API 的 Spring Boot Starter。
 
-它只托管基础设施：管道构建、命名注册、配置合并和 Spring 生命周期。拓扑、处理器、异常、回放、自定义处理器以及发布全部直接使用 Disruptor 4.0 API，不维护功能不完整的中间 DSL。
+项目只托管管道构建、命名注册、配置合并和 Spring 生命周期。事件拓扑、处理器、异常处理、回放、自定义处理器与事件发布仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
 
-构建与运行要求 JDK 21 或更高版本。
+当前仓库是 `1.0.0` 开发版本，尚未发布到 Maven Central。使用前需要先在本地构建并安装。
+
+## 适用场景
+
+- 希望在 Spring Boot 中声明多条命名 Disruptor 管道，并由容器统一管理生命周期；
+- 需要保留 `RingBuffer`、原生拓扑 DSL、自定义 `EventProcessor`、rewind 等完整能力；
+- 业务愿意显式处理事件复用、背压和消费失败等 Disruptor 原生语义。
+
+项目不提供持久化队列、跨进程消息传输、自动重试、消费者健康恢复或业务失败补偿。需要这些能力时，应由业务系统或消息中间件承担。
+
+## 版本要求
+
+| 组件 | 当前基线 |
+| --- | --- |
+| JDK | 21 或更高版本 |
+| Spring Boot | 4.1.0 |
+| LMAX Disruptor | 4.0.0 |
+| 构建工具 | Maven |
+
+以上是当前仓库实际编译和测试基线，不表示已经验证其它 Spring Boot 或 Disruptor 版本组合。
 
 ## 快速开始
 
-引入 Starter：
+### 1. 本地安装
+
+```bash
+mvn clean install
+```
+
+### 2. 引入 Starter
 
 ```xml
 <dependency>
@@ -18,7 +43,7 @@
 </dependency>
 ```
 
-定义一条命名管道：
+### 3. 定义命名管道
 
 ```java
 @Bean
@@ -38,17 +63,16 @@ PipelineSpec<OrderEvent> orderPipeline(
 }
 ```
 
-`topology` 参数就是原生 `Disruptor<OrderEvent>`。可以直接使用：
+`topology` 接收原生 `Disruptor<OrderEvent>`，因此可以直接使用：
 
-- `EventHandler` 的 `sequence`、`endOfBatch`、批次、生命周期、超时和 sequence callback；
+- `EventHandler` 的 `sequence`、`endOfBatch`、批次和生命周期回调；
 - `RewindableEventHandler` 与 `BatchRewindStrategy`；
 - `EventProcessorFactory`、自定义 `EventProcessor`、poller 和 barrier；
-- `handleExceptionsFor`、`then`、`and`、`after` 等官方 DSL；
-- Disruptor 后续版本新增的原生 API，无需等待 Starter 再做映射。
+- `handleExceptionsFor`、`then`、`and`、`after` 等原生拓扑 API。
 
-## 发布事件
+### 4. 发布事件
 
-按管道名取得强类型句柄，直接使用原生 `RingBuffer`：
+`DisruptorRuntime` 由自动配置注册为 Spring Bean，可通过构造器注入。按名称和事件类型获取句柄，再使用原生 `RingBuffer`：
 
 ```java
 private static final EventTranslatorTwoArg<OrderEvent, String, Long> TRANSLATOR =
@@ -62,9 +86,7 @@ boolean accepted = orders.ringBuffer()
         .tryPublishEvent(TRANSLATOR, orderId, amount);
 ```
 
-这条路径没有 Starter 代理层，能使用 `RingBuffer` 的全部单条、批量、阻塞和非阻塞发布重载。静态 translator 可以避免捕获型 lambda 带来的额外分配；业务参数和处理器自身是否分配由业务代码决定。
-
-官方发布契约会在 translator 抛出异常时仍发布已领取的槽位，因此 translator 必须只做简单字段写入且不抛异常。
+`PipelineHandle.publish(...)` 和 `tryPublish(...)` 可用于普通便捷调用。追求稳定低分配时，应直接使用 `ringBuffer()` 与静态 translator，避免捕获型 lambda。
 
 ## 配置
 
@@ -85,72 +107,84 @@ disruptor:
       producer-type: SINGLE
       wait-strategy: BUSY_SPIN
       shutdown-timeout: 30s
+      daemon-threads: false
       error-strategy: HALT
   metrics:
     enabled: true
 ```
 
-优先级固定为：
+| 属性 | 默认值 | 说明 |
+| --- | --- | --- |
+| `disruptor.enabled` | `true` | 是否启用自动配置 |
+| `disruptor.lifecycle-phase` | `Integer.MIN_VALUE` | Spring 生命周期阶段；越小越早启动、越晚停止 |
+| `disruptor.defaults.buffer-size` | `1024` | RingBuffer 容量，必须是正的 2 的幂 |
+| `disruptor.defaults.producer-type` | `MULTI` | `SINGLE` 或 `MULTI` |
+| `disruptor.defaults.wait-strategy` | `BLOCKING` | 等待策略预设 |
+| `disruptor.defaults.shutdown-timeout` | `10s` | 单条管道等待积压排空的最长时间，必须大于 0 |
+| `disruptor.defaults.daemon-threads` | `false` | 消费线程是否为 daemon 线程 |
+| `disruptor.defaults.error-strategy` | `HALT` | 默认消费异常策略 |
+| `disruptor.metrics.enabled` | `true` | classpath 存在 Micrometer 时是否注册指标 |
+
+每个 `disruptor.pipelines.<name>` 可以覆盖全部默认管道设置。最终优先级为：
 
 ```text
-安全默认值 < disruptor.defaults < disruptor.pipelines.<name> < PipelineSpec 显式选项
+框架安全默认值 < disruptor.defaults < disruptor.pipelines.<name> < PipelineSpec 显式选项
 ```
 
-支持的配置型等待策略是 `BLOCKING`、`BUSY_SPIN`、`YIELDING`、`SLEEPING`。需要构造参数的等待策略直接在 `PipelineSpec.waitStrategy(...)` 中传入工厂，避免 Starter 再造一套不完整的参数模型。
+支持的等待策略预设是 `BLOCKING`、`BUSY_SPIN`、`YIELDING` 和 `SLEEPING`。需要构造参数或自定义实现时，通过 `PipelineSpec.waitStrategy(...)` 提供原生工厂。
 
-配置中出现未定义的管道名会使应用启动失败，防止拼写错误被静默忽略。`buffer-size` 必须是正的 2 的幂。
+配置中出现没有对应 `PipelineSpec` Bean 的管道名时，应用启动失败；非法配置的错误信息会包含管道名。
 
-## 原生语义
+## 重要运行语义
 
-### 异常处理
+### 消费异常
 
-默认策略是 `HALT`：某条事件处理抛异常时，记录 ERROR 日志并终止失败消费者，避免链式拓扑把失败槽位继续交给下游。该策略要求应用监控消费者异常并由人工介入恢复。只有终端消费者、幂等处理或业务明确接受部分处理时，才应显式切换为 `LOG_AND_CONTINUE`；该策略会吞掉异常并推进消费序列，依赖当前处理器的下游也会看到该槽位：
+默认 `HALT` 会记录错误并终止失败消费者，使其序列不再推进，避免链式拓扑把失败槽位继续交给下游。代价是该管道可能产生持续背压，应用必须监控线程异常并准备人工恢复或进程重启机制。
+
+只有终端消费者、幂等处理或业务明确接受部分处理时，才应使用 `LOG_AND_CONTINUE`。该策略吞掉异常并推进当前消费者序列，因此依赖它的下游仍会收到失败槽位。
 
 ```yaml
 disruptor:
-  defaults:
-    error-strategy: HALT
   pipelines:
-    orders:
+    audit:
       error-strategy: LOG_AND_CONTINUE
 ```
 
-需要完全自定义（按事件类型、单条重试计数、失败投递通道等）时，用编程式逃生口：
+完整自定义策略使用 `PipelineSpec.exceptionHandler(...)`；处理器级差异化策略使用原生 `disruptor.handleExceptionsFor(handler).with(...)`。
 
-```java
-PipelineSpec.builder("orders", OrderEvent.class, OrderEvent::new)
-        .exceptionHandler(myExceptionHandler)
-        .topology(...)
-        .build();
-```
+### 事件发布与槽位复用
 
-需要处理器级差异化策略时，在 `topology` 中直接调用 `disruptor.handleExceptionsFor(handler).with(...)`。优先级同其它旋钮：`PipelineSpec.exceptionHandler` > `disruptor.pipelines.<name>.error-strategy` > `disruptor.defaults.error-strategy` > 框架默认 `HALT`。Starter 不在消费者外包裹委托层。
-
-### 事件槽位复用
-
-事件由 `EventFactory<E>` 预分配，不要求无参构造。发布方应写全本次事件需要的字段。如果存在可选字段，在原生 DAG 的叶子后显式添加清理 handler：
+事件由 `EventFactory<E>` 预分配并循环复用，发布方必须写全本次事件需要的字段。可选字段应在拓扑叶子后由业务显式清理：
 
 ```java
 disruptor.handleEventsWith(process)
         .then((event, sequence, endOfBatch) -> event.reset());
 ```
 
-Starter 不猜测业务字段，也不自动插入清理阶段。
+Disruptor 在 translator 抛异常时仍会发布已经领取的槽位。translator 应只做简单字段赋值，并且不得抛异常。
 
-### 多管道与生命周期
+### 生命周期
 
-管道按名称全局唯一，同一事件类型可以对应多条管道：
+`DisruptorRuntime` 是一次性状态机：`NEW → RUNNING → STOPPED`。处于 `RUNNING` 时重复调用 `start()` 不产生额外动作，重复停止也是幂等的；进入 `STOPPED` 后再次启动会失败。
 
-```java
-runtime.require("orders", OrderEvent.class);
-runtime.require("order-audit", OrderEvent.class);
-```
+启动失败时，Runtime 会逆序 `halt` 所有已经尝试启动的管道，包括发生部分启动的当前管道。正常关闭按启动逆序逐条排空；单条管道超时或停止失败时会强制 `halt`，并继续关闭其它管道。
 
-`DisruptorRuntime` 是一次性状态机：重复启动或停止是幂等的，停止后重新启动会失败。Spring 在最早阶段启动、最晚阶段停止；关闭时按启动逆序逐条排空，超时后 `halt`，并继续关闭其余管道。
+`PipelineHandle.hasStarted()` 表示底层 Disruptor 是否曾经启动，停止后仍返回 `true`。`DisruptorRuntime.isRunning()` 只表示 Runtime 处于已启动且未停止的托管生命周期状态，两者都不表示消费者线程健康。
 
-`PipelineHandle.disruptor()` 和 `ringBuffer()` 是完整原生逃生口。`PipelineHandle.hasStarted()` 表示底层实例是否曾启动，停止后仍为 `true`；`DisruptorRuntime.isRunning()` 只表示 Runtime 处于已启动且未停止的托管生命周期状态，两者都不是消费者健康检查。默认不要自行调用 `start`、`halt` 或 `shutdown`，生命周期由 Runtime 或 Spring 托管。
+业务代码不应通过 `PipelineHandle.disruptor()` 自行调用 `start()`、`halt()` 或 `shutdown()`。
 
-classpath 存在 Micrometer 时，Starter 注册 `disruptor.runtime.running`、`disruptor.pipeline.buffer.size`、`disruptor.pipeline.remaining.capacity` 和 `disruptor.pipeline.backlog`。其中 `disruptor.runtime.running` 是托管生命周期指标，不是消费者健康指标。这些 Gauge 只在采集时读取原生状态，不包装发布或消费路径；可用 `disruptor.metrics.enabled=false` 关闭。
+### 指标
+
+classpath 同时存在 Micrometer 和 `MeterRegistry` 时，自动注册以下 Gauge：
+
+| 指标 | 标签 | 含义 |
+| --- | --- | --- |
+| `disruptor.runtime.running` | 无 | Runtime 托管生命周期状态，不是健康检查 |
+| `disruptor.pipeline.buffer.size` | `pipeline`、`event.type` | RingBuffer 固定容量 |
+| `disruptor.pipeline.remaining.capacity` | `pipeline`、`event.type` | 当前剩余可写槽位数 |
+| `disruptor.pipeline.backlog` | `pipeline`、`event.type` | 基于 cursor 与最小 gating sequence 计算的近似积压 |
+
+指标只在采集时读取原生状态，不包装发布或消费热路径。
 
 ## 纯 Java 用法
 
@@ -176,23 +210,51 @@ try {
 }
 ```
 
-完整示例见 `disruptor-spring-boot-example`，撮合场景见 `disruptor-spring-boot-tutorial`。
+## 示例与验证
 
-## 模块
+- `disruptor-spring-boot-example`：原生菱形 DAG、分片、异常处理、事件清理、背压和纯 Java 示例；
+- `disruptor-spring-boot-tutorial`：单写者撮合 Web 教程；
+- `disruptor-benchmarks`：原生实例与 Runtime 构建实例的 JMH 发布路径对比。
 
-| 模块 | 职责 |
-| --- | --- |
-| `disruptor-core` | `PipelineSpec`、`PipelineSettings`、`PipelineHandle`、`DisruptorRuntime`；无 Spring 依赖 |
-| `disruptor-benchmarks` | 原生实例与 Runtime 构建实例的 JMH 发布路径对比 |
-| `disruptor-spring-boot-autoconfigure` | 属性绑定、命名设置解析、自动配置、`SmartLifecycle`、配置元数据 |
-| `disruptor-spring-boot-starter` | 聚合 `spring-boot-starter` 与自动配置模块 |
-| `disruptor-spring-boot-example` | 原生 DAG、分片、清理、背压和纯 Java 示例 |
-| `disruptor-spring-boot-tutorial` | 单写者撮合教程 |
-
-## 本地验证
+运行全仓测试：
 
 ```bash
 mvn test
 ```
 
-项目在父 POM 中显式启用注解处理，因此新版本 JDK 下也会生成 Spring Boot 配置元数据。发布、签名和中央仓库工程不属于当前仓库能力范围。
+启动撮合教程前先完成一次本地安装：
+
+```bash
+mvn -pl disruptor-spring-boot-tutorial spring-boot:run
+```
+
+另开终端执行：
+
+```bash
+bash disruptor-spring-boot-tutorial/demo.sh
+```
+
+## 模块
+
+| 模块 | 职责 |
+| --- | --- |
+| `disruptor-core` | 纯 Java 管道定义、运行时句柄、注册表和生命周期 |
+| `disruptor-spring-boot-autoconfigure` | 属性绑定、自动配置、Spring 生命周期和 Micrometer 指标 |
+| `disruptor-spring-boot-starter` | 面向使用方的依赖聚合模块 |
+| `disruptor-spring-boot-example` | 核心能力示例 |
+| `disruptor-spring-boot-tutorial` | 撮合业务教程 |
+| `disruptor-benchmarks` | JMH 基准 |
+
+维护者可阅读[架构设计](docs/disruptor-architecture-design.md)。
+
+## 开源状态
+
+当前仓库尚未配置 Maven Central 发布、持续集成、贡献指南、安全策略和开源许可证。在根目录增加明确的 `LICENSE` 之前，源码不应被视为已经获得开源使用、修改或分发授权。
+
+公开发布前至少应补齐：
+
+- `LICENSE`；
+- `CONTRIBUTING.md`；
+- `SECURITY.md`；
+- CI 构建与测试；
+- Maven Central 发布、签名和项目元数据。
