@@ -119,9 +119,28 @@ disruptor-spring-boot-starter
 - `publish(...)`、`tryPublish(...)` 和 `remaining()` 便捷方法；
 - 显式命名的原生逃生口 `unsafeRingBuffer()`。
 
-受管发布通过一个无锁准入协议记录在途发布。Runtime 进入 `QUIESCING` 后拒绝新发布，等待已获准发布完成后才捕获排空目标，因此“已经 claim 但 translator 尚未返回”的槽位不会被漏掉。`SINGLE` 利用其至多一个发布者的上游契约，通过两个 volatile 状态完成准入与关闭握手；`MULTI` 使用原子计数精确记录并发发布者。两条路径共享相同的关闭语义。
+#### 发布所有权模型
 
-句柄不复制 `EventSink` 的批量与 varargs 重载。需要这些能力或要求完全零代理时使用 `unsafeRingBuffer()`；调用方必须在关闭 Runtime 前自行停止相应生产者。运行期不再公开原生 `Disruptor<E>`，防止业务绕过 Runtime 操作生命周期。
+`ProducerType.SINGLE/MULTI` 决定 RingBuffer 的生产者并发模型；受管发布/外部托管发布决定生产者生命周期由谁负责。两者是正交维度：
+
+| 发布所有权 | SINGLE | MULTI | 关闭责任 |
+| --- | --- | --- | --- |
+| Runtime 受管 | volatile 双标志握手 | 原子计数准入 | Runtime 关闭入口、等待在途发布并排空 |
+| 应用外部托管 | 原生零代理 | 原生零代理 | 应用先停止生产者，Runtime 再排空 |
+
+受管发布通过无锁准入协议记录在途发布。Runtime 进入 `QUIESCING` 后拒绝新发布，等待已获准发布完成后才捕获排空目标，因此“已经 claim 但 translator 尚未返回”的槽位不会被漏掉。`SINGLE` 利用其至多一个发布者的上游契约，通过两个 volatile 状态完成准入与关闭握手；`MULTI` 使用原子计数精确记录并发发布者。两条路径提供相同的关闭语义。
+
+外部托管发布通过 `unsafeRingBuffer()` 使用完整原生 API，不经过准入协议。应用必须遵守：
+
+```text
+停止外部入口 → 等待全部生产线程退出 → DisruptorRuntime.shutdown()
+```
+
+同一管道可以混用两种入口，但 Runtime 只能证明受管发布的关闭边界。只要存在原生发布者，整条管道的无损关闭就以“原生生产者已停止”为前置条件；Runtime 无法从 cursor 判断一个已经通过业务检查但尚未 claim 的原生发布者。
+
+不增加 `publication-mode` 配置。配置开关会让同一个 `publishEvent()` 在不同环境下具有不同关闭语义，代码审查无法从调用点判断责任归属。显式的 `publishEvent/tryPublishEvent` 与 `unsafeRingBuffer()` 让性能选择和生命周期责任同时出现在代码中。
+
+句柄不复制 `EventSink` 的批量与 varargs 重载。需要这些能力或完全零代理时使用 `unsafeRingBuffer()`。运行期不公开原生 `Disruptor<E>`，防止业务绕过 Runtime 操作消费者生命周期；只开放 RingBuffer 不会允许调用方自行 `start()`、`halt()` 或 `shutdown()`。
 
 ### DisruptorRuntime
 

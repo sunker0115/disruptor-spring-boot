@@ -75,7 +75,11 @@ PipelineSpec<OrderEvent> orderPipeline(
 
 ### 4. 发布事件
 
-`DisruptorRuntime` 由自动配置注册为 Spring Bean，可通过构造器注入。按名称和事件类型获取句柄，再通过受管入口发布：
+`DisruptorRuntime` 由自动配置注册为 Spring Bean，可通过构造器注入。发布方式分为受管发布和外部托管的原生发布；`ProducerType.SINGLE/MULTI` 只决定生产者并发模型，与发布生命周期归属是两个独立维度。
+
+#### 受管发布（默认）
+
+按名称和事件类型获取句柄，通过受管入口发布：
 
 ```java
 private static final EventTranslatorTwoArg<OrderEvent, String, Long> TRANSLATOR =
@@ -88,7 +92,29 @@ PipelineHandle<OrderEvent> orders = runtime.require("orders", OrderEvent.class);
 boolean accepted = orders.tryPublishEvent(TRANSLATOR, orderId, amount);
 ```
 
-`publishEvent/tryPublishEvent` 支持 0 至 3 个参数的原生 translator，并参与关闭准入屏障；`publish/tryPublish` 是接受 `Consumer<E>` 的便捷入口。需要批量发布、varargs 或完全绕过受管入口时可以使用 `unsafeRingBuffer()`，但必须在 Runtime 关闭前自行停止这些生产者。
+`publishEvent/tryPublishEvent` 支持 0 至 3 个参数的原生 translator，并参与 Runtime 的关闭准入屏障；`publish/tryPublish` 是接受 `Consumer<E>` 的便捷入口。Runtime 关闭时会拒绝新发布、等待在途发布完成，再排空消费者。
+
+#### 原生发布（外部托管）
+
+需要批量发布、varargs、完整 `EventSink` API 或完全零代理路径时，可以显式获取原生 RingBuffer：
+
+```java
+RingBuffer<OrderEvent> ringBuffer = orders.unsafeRingBuffer();
+ringBuffer.publishEvent(TRANSLATOR, orderId, amount);
+```
+
+该入口不参与 Runtime 的发布准入。应用必须按以下顺序关闭：
+
+```text
+停止外部入口 → 等待全部生产线程退出 → runtime.shutdown()
+```
+
+| 发布方式 | SINGLE | MULTI | 关闭责任 |
+| --- | --- | --- | --- |
+| 受管入口 | 单生产者优化准入 | 并发发布者准入 | Runtime 托管 |
+| `unsafeRingBuffer()` | 原生零代理 | 原生零代理 | 应用托管生产者 |
+
+同一管道可以混用两种入口，但只要存在原生发布者，整条管道的无损关闭就依赖应用先停止这些原生生产者。`unsafe` 指生命周期绕过 Runtime，并不表示 RingBuffer API 本身不安全。
 
 ## 配置
 
@@ -164,7 +190,7 @@ disruptor.handleEventsWith(process)
 
 Disruptor 在 translator 抛异常时仍会发布已经领取的槽位。translator 应只做简单字段赋值，并且不得抛异常。
 
-受管 `publishEvent/tryPublishEvent` 在 Runtime 进入关闭阶段后分别抛出 `IllegalStateException` 或返回 `false`。已经获准但尚未完成的发布会先完成，再被纳入本次排空目标。`unsafeRingBuffer()` 不参与该协议，与关闭并发发布的结果不受保证。
+受管 `publishEvent/tryPublishEvent` 在 Runtime 进入关闭阶段后分别抛出 `IllegalStateException` 或返回 `false`。已经获准但尚未完成的发布会先完成，再被纳入本次排空目标。通过 `unsafeRingBuffer()` 发布的事件不参与该协议；若原生生产者与 Runtime 关闭并发，Runtime 只能保证受管入口的边界，不能承诺整条管道无损关闭。
 
 命名管道按彼此独立的生命周期单元处理。要求无损级联的阶段应放在同一条 Disruptor topology 中；handler 向另一条受管管道继续发布时，应用必须先停止上游并自行编排关闭顺序。
 
