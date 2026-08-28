@@ -10,7 +10,7 @@
     </parent>
     <artifactId>disruptor-spring-boot-tutorial</artifactId>
 
-    <description>真实场景教程:撮合 web 小应用 —— 下单 tryPublish 进环立刻返回 202/429，后台单线程 Disruptor 撮合，读侧观测盘口与成交。</description>
+    <description>真实场景教程：并发 HTTP 下单经唯一发布线程进入 SINGLE RingBuffer，后台单线程撮合，读侧观测盘口与成交。</description>
 
     <dependencies>
         <dependency>

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 撮合 tutorial 一键演示：下单 → 后台单线程 Disruptor 撮合 → 读侧观测 → 背压。
+# 撮合 tutorial 一键演示：下单 → 单入口线程发布 → 后台单线程 Disruptor 撮合 → 读侧观测 → 背压。
 #
 # 用法：
 #   1) 另开一个终端启动应用：
@@ -9,8 +9,8 @@
 #
 # 看什么：把启动应用那个终端拉出来，观察日志主干
 #   [matching/accept] → [matching/match] → [matching/emit]
-# 关键：所有 [matching/match] 都打印在【同一个线程名】上 —— 并发进来的订单被单线程无锁串行撮合，
-# 盘口却始终正确。这就是"为什么必须 Disruptor 而不是线程池"的价值证据。
+# 关键：并发 HTTP 请求先由 matching-order-ingress 线程串行入环，所有 [matching/match] 也在唯一
+# 消费线程上执行。生产与消费两侧都遵守单线程所有权，盘口无需通过并发锁保护。
 #
 set -euo pipefail
 BASE="${BASE:-http://localhost:8080}"
@@ -41,7 +41,7 @@ codes=""
 for i in $(seq 1 60); do codes="$codes $(post BUY 80 1)"; done
 echo "  60 次快速下单的 HTTP 状态分布:"
 echo "$codes" | tr ' ' '\n' | grep -v '^$' | sort | uniq -c
-echo "  （出现 429 = RingBuffer 满、tryPublish 回推背压；默认 buffer=1024 时需更高频，"
+echo "  （出现 429 = 订单确定未入环，通常是入口队列或 RingBuffer 已满；默认 buffer=1024 时需更高频，"
 echo "    要稳定复现可用更小 buffer 启动：--disruptor.pipelines.matching.buffer-size=16）"
 
 echo

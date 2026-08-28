@@ -17,6 +17,15 @@ import org.springframework.web.client.RestClient;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -88,5 +97,39 @@ class MatchingFlowTest {
             });
             assertThat(book.asks()).isEmpty();
         });
+    }
+
+    @Test
+    void concurrentHttpRequestsAreSerializedBeforePublishingToSingleProducerRing() throws Exception {
+        int requestCount = 16;
+        CountDownLatch ready = new CountDownLatch(requestCount);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService callers = Executors.newFixedThreadPool(requestCount);
+        List<Future<ResponseEntity<AcceptedResponse>>> futures = new ArrayList<>();
+        try {
+            for (int index = 0; index < requestCount; index++) {
+                int orderNumber = index;
+                futures.add(callers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return place("CONCURRENT-" + orderNumber, Side.BUY, "90", "1");
+                }));
+            }
+            assertThat(ready.await(2, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+
+            Set<Long> orderIds = new HashSet<>();
+            for (Future<ResponseEntity<AcceptedResponse>> future : futures) {
+                ResponseEntity<AcceptedResponse> response = future.get(5, TimeUnit.SECONDS);
+                assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+                assertThat(response.getBody()).isNotNull();
+                orderIds.add(response.getBody().orderId());
+            }
+            assertThat(orderIds).hasSize(requestCount);
+        } finally {
+            start.countDown();
+            callers.shutdownNow();
+            assertThat(callers.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
+        }
     }
 }

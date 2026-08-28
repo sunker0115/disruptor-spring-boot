@@ -244,7 +244,7 @@ try {
 ## 示例与验证
 
 - `disruptor-spring-boot-example`：原生菱形 DAG、分片、异常处理、事件清理、背压和纯 Java 示例；
-- `disruptor-spring-boot-tutorial`：单写者撮合 Web 教程；
+- `disruptor-spring-boot-tutorial`：并发 HTTP 请求经有界单入口线程串行发布的撮合 Web 教程；
 - `disruptor-benchmarks`：原生实例、受管发布与 `unsafeRingBuffer()` 的 JMH 发布路径对比。
 
 运行全仓测试：
@@ -273,7 +273,7 @@ bash disruptor-spring-boot-tutorial/demo.sh
 | `disruptor-spring-boot-autoconfigure` | 属性绑定、自动配置、Spring 生命周期和 Micrometer 指标 |
 | `disruptor-spring-boot-starter` | 面向使用方的依赖聚合模块 |
 | `disruptor-spring-boot-example` | 核心能力示例 |
-| `disruptor-spring-boot-tutorial` | 撮合业务教程 |
+| `disruptor-spring-boot-tutorial` | 单生产者、单撮合消费者的 Web 业务教程 |
 | `disruptor-benchmarks` | JMH 基准 |
 
 维护者可阅读[架构设计](docs/disruptor-architecture-design.md)。

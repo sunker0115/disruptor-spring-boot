@@ -138,6 +138,8 @@ disruptor-spring-boot-starter
 
 同一管道可以混用两种入口，但 Runtime 只能证明受管发布的关闭边界。只要存在原生发布者，整条管道的无损关闭就以“原生生产者已停止”为前置条件；Runtime 无法从 cursor 判断一个已经通过业务检查但尚未 claim 的原生发布者。
 
+撮合教程展示外部托管发布的完整边界：并发 HTTP 请求先提交到容量等于 RingBuffer 的有界单线程入口，只有该线程调用 `unsafeRingBuffer().tryPublishEvent(...)`，因此 `ProducerType.SINGLE` 的所有权契约不依赖 Web 容器线程模型。请求等待该次发布完成后返回：`202` 表示已经入环，`429` 表示确定未入环。入口实现 `SmartLifecycle`，phase 比 `DisruptorLifecycle` 大 1；Spring 启动时 Runtime 先就绪，停止时入口先拒绝新请求并排空已接收的发布任务，随后 Runtime 才捕获游标并排空消费者。入口队列与 RingBuffer 都是有界的，不使用 `CallerRunsPolicy`，避免请求线程在过载时越权成为第二个生产者。
+
 不增加 `publication-mode` 配置。配置开关会让同一个 `publishEvent()` 在不同环境下具有不同关闭语义，代码审查无法从调用点判断责任归属。显式的 `publishEvent/tryPublishEvent` 与 `unsafeRingBuffer()` 让性能选择和生命周期责任同时出现在代码中。
 
 句柄不复制 `EventSink` 的批量与 varargs 重载。需要这些能力或完全零代理时使用 `unsafeRingBuffer()`。运行期不公开原生 `Disruptor<E>`，防止业务绕过 Runtime 操作消费者生命周期；只开放 RingBuffer 不会允许调用方自行 `start()`、`halt()` 或 `shutdown()`。
@@ -287,7 +289,7 @@ Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runt
 - 配置覆盖、非法配置、未知命名配置和零管道；
 - 自动配置开关、自定义 Bean 回退、AOT 元数据与可选 Micrometer；
 - 指标在启动、积压、排空和停止阶段的变化；
-- example 与 tutorial 的真实端到端流程。
+- example 与 tutorial 的真实端到端流程，以及 tutorial 并发 HTTP 请求的单生产者串行化。
 
 全仓验证命令：
 
