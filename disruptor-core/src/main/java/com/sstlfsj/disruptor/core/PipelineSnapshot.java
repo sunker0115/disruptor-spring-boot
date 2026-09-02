@@ -33,6 +33,9 @@ public record PipelineSnapshot(
         if (gracefulTermination && lifecycle != PipelineLifecycle.TERMINATED) {
             throw new IllegalArgumentException("只有 TERMINATED 状态的管道可以标记为优雅终止");
         }
+        if (health != deriveHealth(lifecycle, failure, expectedConsumers, createdConsumers, aliveConsumers)) {
+            throw new IllegalArgumentException("health 必须与管道状态一致");
+        }
     }
 
     public static PipelineSnapshot create(

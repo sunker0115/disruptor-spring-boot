@@ -94,6 +94,15 @@ class PipelineSnapshotTest {
                 "orders", PipelineLifecycle.STOPPING, false, 0, 0, 0, 0, 0, null, true));
     }
 
+    @Test
+    void canonicalConstructorRejectsInvalidHealth() {
+        assertThrows(NullPointerException.class, () -> new PipelineSnapshot(
+                "orders", PipelineLifecycle.NEW, null, false, 0, 0, 0, 0, 0, null, false));
+        assertThrows(IllegalArgumentException.class, () -> new PipelineSnapshot(
+                "orders", PipelineLifecycle.NEW, PipelineHealth.HEALTHY,
+                false, 0, 0, 0, 0, 0, null, false));
+    }
+
     private static void assertHealth(
             PipelineLifecycle lifecycle,
             Throwable failure,
