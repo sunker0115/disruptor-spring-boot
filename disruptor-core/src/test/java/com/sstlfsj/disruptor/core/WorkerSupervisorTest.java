@@ -113,6 +113,24 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void treatsNormalReturnDuringStartingAsUnexpectedFailureAndCannotMarkRunning() throws Exception {
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
+        Thread worker = worker(supervisor, () -> { }, "starting-return-worker");
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        worker.join(TEST_TIMEOUT.toMillis());
+
+        assertFalse(worker.isAlive());
+        assertInstanceOf(WorkerSupervisor.UnexpectedWorkerExitException.class,
+                supervisor.snapshot().failure());
+        assertEquals(ShutdownMode.IMMEDIATE, supervisor.snapshot().shutdownMode());
+        assertThrows(IllegalStateException.class, supervisor::markRunning);
+        assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+    }
+
+    @Test
     void keepsFirstFailure() {
         WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
         IllegalStateException first = new IllegalStateException("first");
@@ -244,6 +262,41 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void ordinaryThrowableDuringQuiescingIsNotRecordedOrUpgraded() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch gracefulApplied = new CountDownLatch(1);
+        CountDownLatch throwNow = new CountDownLatch(1);
+        RuntimeException shutdownExit = new RuntimeException("backend halted");
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> {
+            if (mode == ShutdownMode.GRACEFUL) {
+                gracefulApplied.countDown();
+            }
+        });
+        Thread worker = worker(supervisor, () -> {
+            entered.countDown();
+            await(throwNow);
+            throw shutdownExit;
+        }, "quiescing-failure-worker");
+        worker.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(gracefulApplied.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        throwNow.countDown();
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertSame(shutdownExit, uncaught.get());
+        assertNull(result.failure());
+        assertEquals(ShutdownMode.GRACEFUL, result.shutdownMode());
+        assertTrue(result.gracefulTermination());
+    }
+
+    @Test
     void deadlineRecordsTimeoutAndInterruptsRemainingWorker() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -335,6 +388,34 @@ class WorkerSupervisorTest {
 
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
         assertEquals("workers", terminate(supervisor).name());
+    }
+
+    @Test
+    void failAfterGracefulTerminationDoesNotChangeSnapshotsOrTermination() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT,
+                (mode, deadlineNanos) -> release.countDown());
+        Thread worker = worker(supervisor, () -> {
+            entered.countDown();
+            await(release);
+        }, "terminated-worker");
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        WorkerSnapshot terminated = terminate(supervisor);
+
+        supervisor.fail(new IllegalStateException("too late"));
+
+        assertEquals(terminated, supervisor.snapshot());
+        assertEquals(terminated, terminate(supervisor));
+        assertNull(supervisor.snapshot().failure());
+        assertEquals(ShutdownMode.GRACEFUL, supervisor.snapshot().shutdownMode());
+        assertTrue(supervisor.snapshot().gracefulTermination());
     }
 
     private static WorkerSupervisor supervisor(

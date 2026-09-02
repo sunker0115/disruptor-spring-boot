@@ -68,14 +68,15 @@ public final class WorkerSupervisor {
                 worker.run();
             } catch (Throwable workerFailure) {
                 thrown = workerFailure;
-                if (!isExpectedShutdownExit(workerFailure)) {
+                if (!isShutdownInProgress()) {
                     fail(workerFailure);
                 }
                 WorkerSupervisor.<RuntimeException>sneakyThrow(workerFailure);
             } finally {
                 aliveWorkers.decrementAndGet();
                 if (thrown == null
-                        && lifecycle.get() == PipelineLifecycle.RUNNING
+                        && (lifecycle.get() == PipelineLifecycle.STARTING
+                        || lifecycle.get() == PipelineLifecycle.RUNNING)
                         && shutdownMode.get() == null) {
                     fail(new UnexpectedWorkerExitException(name, current.getName()));
                 }
@@ -117,13 +118,21 @@ public final class WorkerSupervisor {
                         "进入 RUNNING 前必须登记全部 worker，expected=" + expectedWorkers
                                 + "，registered=" + workers.size());
             }
+            if (failure.get() != null || shutdownMode.get() != null) {
+                throw new IllegalStateException("已失败或已请求停机的 supervisor 不能进入 RUNNING");
+            }
             lifecycle.set(PipelineLifecycle.RUNNING);
         }
     }
 
     public void fail(Throwable workerFailure) {
         Objects.requireNonNull(workerFailure, "failure 不能为空");
-        failure.compareAndSet(null, workerFailure);
+        synchronized (stateLock) {
+            if (lifecycle.get() == PipelineLifecycle.TERMINATED) {
+                return;
+            }
+            failure.compareAndSet(null, workerFailure);
+        }
         requestShutdown(ShutdownMode.IMMEDIATE);
     }
 
@@ -304,22 +313,9 @@ public final class WorkerSupervisor {
         }
     }
 
-    private boolean isExpectedShutdownExit(Throwable workerFailure) {
+    private boolean isShutdownInProgress() {
         PipelineLifecycle current = lifecycle.get();
-        if (current != PipelineLifecycle.QUIESCING && current != PipelineLifecycle.STOPPING) {
-            return false;
-        }
-        if (Thread.currentThread().isInterrupted()) {
-            return true;
-        }
-        Throwable cause = workerFailure;
-        while (cause != null) {
-            if (cause instanceof InterruptedException) {
-                return true;
-            }
-            cause = cause.getCause();
-        }
-        return false;
+        return current == PipelineLifecycle.QUIESCING || current == PipelineLifecycle.STOPPING;
     }
 
     private boolean allWorkersStopped() {
