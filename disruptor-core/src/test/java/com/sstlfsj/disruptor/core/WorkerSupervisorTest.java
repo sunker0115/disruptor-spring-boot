@@ -391,8 +391,7 @@ class WorkerSupervisorTest {
             }
             WorkerSupervisor current = supervisorReference.get();
             gracefulActionEntered.countDown();
-            AtomicReference<Throwable> failure = failureReference(current);
-            while (failure.get() != firstFailure && System.nanoTime() < deadlineNanos) {
+            while (current.snapshot().failure() != firstFailure && System.nanoTime() < deadlineNanos) {
                 Thread.onSpinWait();
             }
             synchronized (stateLock(current)) {
@@ -497,6 +496,122 @@ class WorkerSupervisorTest {
         assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
         assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
         assertFalse(worker.isAlive());
+    }
+
+    @Test
+    void immediateUpgradeBeforeTerminationCommitIsAppliedBeforeTermination() throws Exception {
+        CountDownLatch beforeFirstCommit = new CountDownLatch(1);
+        CountDownLatch allowFirstCommit = new CountDownLatch(1);
+        AtomicInteger commitAttempts = new AtomicInteger();
+        List<ShutdownMode> appliedModes = new CopyOnWriteArrayList<>();
+        WorkerSupervisor supervisor = WorkerSupervisor.buildForTesting(
+                WorkerSupervisor.builder()
+                        .name("workers")
+                        .expectedWorkers(1)
+                        .shutdownTimeout(TEST_TIMEOUT)
+                        .stopAction((mode, deadlineNanos) -> appliedModes.add(mode)),
+                () -> {
+                    if (commitAttempts.getAndIncrement() == 0) {
+                        beforeFirstCommit.countDown();
+                        await(allowFirstCommit);
+                    }
+                });
+        supervisor.markStarting();
+        supervisor.register(new Thread(() -> { }, "unstarted-worker"));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(beforeFirstCommit.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        allowFirstCommit.countDown();
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
+        assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
+        assertFalse(result.gracefulTermination());
+    }
+
+    @Test
+    void registeredWorkerStartedAfterTerminationDoesNotRunUserTask() throws Exception {
+        AtomicBoolean taskRan = new AtomicBoolean();
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
+        Thread worker = worker(supervisor, () -> taskRan.set(true), "late-worker");
+        supervisor.markStarting();
+        supervisor.register(worker);
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        terminate(supervisor);
+
+        worker.start();
+        worker.join(TEST_TIMEOUT.toMillis());
+
+        assertFalse(worker.isAlive());
+        assertFalse(taskRan.get());
+        assertEquals(PipelineLifecycle.TERMINATED, supervisor.snapshot().lifecycle());
+    }
+
+    @Test
+    void registeredWorkerAdmittedDuringGracefulShutdownCanFinishItsWork() throws Exception {
+        CountDownLatch gracefulActionEntered = new CountDownLatch(1);
+        CountDownLatch allowGracefulActionToReturn = new CountDownLatch(1);
+        CountDownLatch taskRan = new CountDownLatch(1);
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> {
+            gracefulActionEntered.countDown();
+            await(allowGracefulActionToReturn);
+        });
+        Thread worker = worker(supervisor, taskRan::countDown, "late-graceful-worker");
+        supervisor.markStarting();
+        supervisor.register(worker);
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(gracefulActionEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        worker.start();
+        worker.join(TEST_TIMEOUT.toMillis());
+        allowGracefulActionToReturn.countDown();
+
+        assertFalse(worker.isAlive());
+        assertTrue(taskRan.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        assertTrue(terminate(supervisor).gracefulTermination());
+    }
+
+    @Test
+    void gracefulTerminationCommitWaitsForWorkerAdmittedAfterAllStoppedCheck() throws Exception {
+        CountDownLatch beforeCommit = new CountDownLatch(1);
+        CountDownLatch allowCommit = new CountDownLatch(1);
+        CountDownLatch taskEntered = new CountDownLatch(1);
+        CountDownLatch releaseTask = new CountDownLatch(1);
+        WorkerSupervisor supervisor = WorkerSupervisor.buildForTesting(
+                WorkerSupervisor.builder()
+                        .name("workers")
+                        .expectedWorkers(1)
+                        .shutdownTimeout(TEST_TIMEOUT)
+                        .stopAction((mode, deadlineNanos) -> { }),
+                () -> {
+                    beforeCommit.countDown();
+                    await(allowCommit);
+                });
+        Thread worker = worker(supervisor, () -> {
+            taskEntered.countDown();
+            await(releaseTask);
+        }, "commit-race-worker");
+        supervisor.markStarting();
+        supervisor.register(worker);
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(beforeCommit.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        worker.start();
+        assertTrue(taskEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        allowCommit.countDown();
+        controlThread(supervisor).join(200);
+        assertTrue(controlThread(supervisor).isAlive());
+        assertFalse(supervisor.termination().toCompletableFuture().isDone());
+        releaseTask.countDown();
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertTrue(result.gracefulTermination());
+        assertEquals(0, result.aliveWorkers());
     }
 
     @Test
@@ -648,11 +763,6 @@ class WorkerSupervisorTest {
 
     private static Object stateLock(WorkerSupervisor supervisor) {
         return fieldValue(supervisor, "stateLock", Object.class);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static AtomicReference<Throwable> failureReference(WorkerSupervisor supervisor) {
-        return fieldValue(supervisor, "failure", AtomicReference.class);
     }
 
     private static Thread controlThread(WorkerSupervisor supervisor) {

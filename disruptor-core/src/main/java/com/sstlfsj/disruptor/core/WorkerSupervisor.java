@@ -11,8 +11,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /** 监督一组已登记 worker 的启动、失败和终止。 */
 public final class WorkerSupervisor {
@@ -24,23 +22,33 @@ public final class WorkerSupervisor {
     private final Duration shutdownTimeout;
     private final long shutdownTimeoutNanos;
     private final StopAction stopAction;
+    private final Runnable beforeTerminationCommit;
     private final Object stateLock = new Object();
     private final Set<Thread> workers = Collections.newSetFromMap(new IdentityHashMap<>());
-    private final AtomicReference<PipelineLifecycle> lifecycle =
-            new AtomicReference<>(PipelineLifecycle.NEW);
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
-    private final AtomicReference<ShutdownMode> shutdownMode = new AtomicReference<>();
-    private final AtomicInteger aliveWorkers = new AtomicInteger();
     private final CompletableFuture<WorkerSnapshot> termination = new CompletableFuture<>();
     private final CompletionStage<WorkerSnapshot> terminationView = termination.minimalCompletionStage();
-    private volatile Thread controlThread;
-    private volatile boolean gracefulTermination;
+    private PipelineLifecycle lifecycle = PipelineLifecycle.NEW;
+    private Throwable failure;
+    private ShutdownMode shutdownMode;
+    private int aliveWorkers;
+    private long shutdownDeadlineNanos;
+    private Thread controlThread;
+    private boolean gracefulTermination;
 
     private WorkerSupervisor(
             String name,
             int expectedWorkers,
             Duration shutdownTimeout,
             StopAction stopAction) {
+        this(name, expectedWorkers, shutdownTimeout, stopAction, () -> { });
+    }
+
+    private WorkerSupervisor(
+            String name,
+            int expectedWorkers,
+            Duration shutdownTimeout,
+            StopAction stopAction,
+            Runnable beforeTerminationCommit) {
         this.name = requireName(name);
         if (expectedWorkers <= 0) {
             throw new IllegalArgumentException("expectedWorkers 必须大于 0，实际值=" + expectedWorkers);
@@ -49,6 +57,8 @@ public final class WorkerSupervisor {
         this.shutdownTimeout = requirePositiveTimeout(shutdownTimeout);
         this.shutdownTimeoutNanos = shutdownTimeout.toNanos();
         this.stopAction = Objects.requireNonNull(stopAction, "stopAction 不能为空");
+        this.beforeTerminationCommit = Objects.requireNonNull(
+                beforeTerminationCommit, "beforeTerminationCommit 不能为空");
     }
 
     @Builder(builderMethodName = "builder")
@@ -60,6 +70,18 @@ public final class WorkerSupervisor {
         return new WorkerSupervisor(name, expectedWorkers, shutdownTimeout, stopAction);
     }
 
+    static WorkerSupervisor buildForTesting(
+            WorkerSupervisorBuilder builder,
+            Runnable beforeTerminationCommit) {
+        Objects.requireNonNull(builder, "builder 不能为空");
+        return new WorkerSupervisor(
+                builder.name,
+                builder.expectedWorkers,
+                builder.shutdownTimeout,
+                builder.stopAction,
+                beforeTerminationCommit);
+    }
+
     public Runnable supervise(Runnable worker) {
         Objects.requireNonNull(worker, "worker 不能为空");
         return () -> {
@@ -68,20 +90,27 @@ public final class WorkerSupervisor {
                 if (!workers.contains(current)) {
                     throw new IllegalStateException("worker 线程必须先登记：" + current.getName());
                 }
+                if (shutdownMode == ShutdownMode.IMMEDIATE
+                        || lifecycle == PipelineLifecycle.TERMINATED) {
+                    return;
+                }
+                aliveWorkers++;
             }
-            aliveWorkers.incrementAndGet();
             Throwable thrown = null;
             try {
                 worker.run();
             } catch (Throwable workerFailure) {
                 thrown = workerFailure;
-                failWorkerUnlessStopping(workerFailure);
-                WorkerSupervisor.<RuntimeException>sneakyThrow(workerFailure);
             } finally {
-                aliveWorkers.decrementAndGet();
-                if (thrown == null) {
-                    failUnexpectedWorkerExit(current);
+                ShutdownSignal signal;
+                synchronized (stateLock) {
+                    aliveWorkers--;
+                    signal = recordWorkerExitLocked(current, thrown);
                 }
+                applyShutdownSignal(signal);
+            }
+            if (thrown != null) {
+                WorkerSupervisor.<RuntimeException>sneakyThrow(thrown);
             }
         };
     }
@@ -89,7 +118,7 @@ public final class WorkerSupervisor {
     public void register(Thread thread) {
         Objects.requireNonNull(thread, "thread 不能为空");
         synchronized (stateLock) {
-            PipelineLifecycle current = lifecycle.get();
+            PipelineLifecycle current = lifecycle;
             if (current != PipelineLifecycle.NEW && current != PipelineLifecycle.STARTING) {
                 throw new IllegalStateException("不能在 " + current + " 状态登记 worker");
             }
@@ -104,26 +133,29 @@ public final class WorkerSupervisor {
     }
 
     public void markStarting() {
-        if (!lifecycle.compareAndSet(PipelineLifecycle.NEW, PipelineLifecycle.STARTING)) {
-            throw new IllegalStateException("只有 NEW 状态可以进入 STARTING，当前状态=" + lifecycle.get());
+        synchronized (stateLock) {
+            if (lifecycle != PipelineLifecycle.NEW) {
+                throw new IllegalStateException("只有 NEW 状态可以进入 STARTING，当前状态=" + lifecycle);
+            }
+            lifecycle = PipelineLifecycle.STARTING;
         }
     }
 
     public void markRunning() {
         synchronized (stateLock) {
-            if (lifecycle.get() != PipelineLifecycle.STARTING) {
+            if (lifecycle != PipelineLifecycle.STARTING) {
                 throw new IllegalStateException(
-                        "只有 STARTING 状态可以进入 RUNNING，当前状态=" + lifecycle.get());
+                        "只有 STARTING 状态可以进入 RUNNING，当前状态=" + lifecycle);
             }
             if (workers.size() != expectedWorkers) {
                 throw new IllegalStateException(
                         "进入 RUNNING 前必须登记全部 worker，expected=" + expectedWorkers
                                 + "，registered=" + workers.size());
             }
-            if (failure.get() != null || shutdownMode.get() != null) {
+            if (failure != null || shutdownMode != null) {
                 throw new IllegalStateException("已失败或已请求停机的 supervisor 不能进入 RUNNING");
             }
-            lifecycle.set(PipelineLifecycle.RUNNING);
+            lifecycle = PipelineLifecycle.RUNNING;
         }
     }
 
@@ -131,10 +163,12 @@ public final class WorkerSupervisor {
         Objects.requireNonNull(workerFailure, "failure 不能为空");
         ShutdownSignal signal;
         synchronized (stateLock) {
-            if (lifecycle.get() == PipelineLifecycle.TERMINATED) {
+            if (lifecycle == PipelineLifecycle.TERMINATED) {
                 return;
             }
-            failure.compareAndSet(null, workerFailure);
+            if (failure == null) {
+                failure = workerFailure;
+            }
             signal = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
         }
         applyShutdownSignal(signal);
@@ -144,7 +178,7 @@ public final class WorkerSupervisor {
         Objects.requireNonNull(requestedMode, "mode 不能为空");
         ShutdownSignal signal;
         synchronized (stateLock) {
-            if (lifecycle.get() == PipelineLifecycle.TERMINATED) {
+            if (lifecycle == PipelineLifecycle.TERMINATED) {
                 return;
             }
             signal = prepareShutdownLocked(requestedMode);
@@ -153,33 +187,34 @@ public final class WorkerSupervisor {
     }
 
     private ShutdownSignal prepareShutdownLocked(ShutdownMode requestedMode) {
-        ShutdownMode currentMode = shutdownMode.get();
-        boolean interruptForUpgrade = currentMode == ShutdownMode.GRACEFUL
-                && requestedMode == ShutdownMode.IMMEDIATE;
-        if (currentMode == null) {
-            shutdownMode.set(requestedMode);
-            moveToShutdownState(requestedMode);
-        } else if (interruptForUpgrade) {
-            shutdownMode.set(ShutdownMode.IMMEDIATE);
-            lifecycle.set(PipelineLifecycle.STOPPING);
+        ShutdownMode currentMode = shutdownMode;
+        boolean modeChanged = currentMode == null
+                || currentMode == ShutdownMode.GRACEFUL && requestedMode == ShutdownMode.IMMEDIATE;
+        if (!modeChanged) {
+            return ShutdownSignal.NONE;
         }
+        shutdownMode = requestedMode;
+        moveToShutdownState(requestedMode);
+        boolean startControlThread = false;
         if (controlThread == null) {
+            shutdownDeadlineNanos = deadlineAfter(shutdownTimeoutNanos);
             controlThread = Thread.ofVirtual()
                     .name("worker-supervisor-" + name)
                     .unstarted(this::controlShutdown);
-            return new ShutdownSignal(controlThread, interruptForUpgrade);
+            startControlThread = true;
         }
-        return new ShutdownSignal(null, interruptForUpgrade);
+        return new ShutdownSignal(
+                controlThread,
+                startControlThread,
+                requestedMode == ShutdownMode.IMMEDIATE);
     }
 
     private void applyShutdownSignal(ShutdownSignal signal) {
-        if (signal.interruptForUpgrade()) {
+        if (signal.interruptWorkers()) {
             interruptAliveWorkers();
         }
-        if (signal.threadToStart() != null) {
-            signal.threadToStart().start();
-        } else {
-            java.util.concurrent.locks.LockSupport.unpark(controlThread);
+        if (signal.startControlThread()) {
+            signal.controlThread().start();
         }
     }
 
@@ -189,24 +224,18 @@ public final class WorkerSupervisor {
 
     public WorkerSnapshot snapshot() {
         synchronized (stateLock) {
-            return WorkerSnapshot.builder()
-                    .name(name)
-                    .lifecycle(lifecycle.get())
-                    .expectedWorkers(expectedWorkers)
-                    .registeredWorkers(workers.size())
-                    .aliveWorkers(aliveWorkers.get())
-                    .failure(failure.get())
-                    .shutdownMode(shutdownMode.get())
-                    .gracefulTermination(gracefulTermination)
-                    .build();
+            return snapshotLocked();
         }
     }
 
     private void controlShutdown() {
-        long deadlineNanos = deadlineAfter(shutdownTimeoutNanos);
+        long deadlineNanos;
+        synchronized (stateLock) {
+            deadlineNanos = shutdownDeadlineNanos;
+        }
         ShutdownMode appliedMode = null;
         while (true) {
-            ShutdownMode requestedMode = shutdownMode.get();
+            ShutdownMode requestedMode = requestedShutdownMode();
             if (requestedMode != appliedMode) {
                 if (requestedMode == ShutdownMode.IMMEDIATE) {
                     interruptAliveWorkers();
@@ -220,12 +249,18 @@ public final class WorkerSupervisor {
             if (waitResult == WaitResult.UPGRADED) {
                 continue;
             }
-            if (waitResult != WaitResult.ALL_STOPPED) {
-                recordTerminationFailure(waitResult, deadlineNanos);
-                interruptAliveWorkers();
+            if (waitResult == WaitResult.ALL_STOPPED) {
+                if (finishTermination(appliedMode, true)) {
+                    return;
+                }
+                continue;
             }
-            boolean allStopped = waitResult == WaitResult.ALL_STOPPED || allWorkersStopped();
-            if (finishTermination(appliedMode, allStopped)) {
+
+            applyShutdownSignal(recordTerminationFailure(waitResult, deadlineNanos));
+            if (appliedMode != ShutdownMode.IMMEDIATE) {
+                continue;
+            }
+            if (finishTermination(appliedMode, false)) {
                 return;
             }
         }
@@ -245,7 +280,7 @@ public final class WorkerSupervisor {
                 continue;
             }
             while (worker.isAlive()) {
-                if (shutdownMode.get() != appliedMode) {
+                if (requestedShutdownMode() != appliedMode) {
                     return WaitResult.UPGRADED;
                 }
                 long remaining = deadlineNanos - System.nanoTime();
@@ -261,54 +296,53 @@ public final class WorkerSupervisor {
                 }
             }
         }
-        return shutdownMode.get() == appliedMode
+        return requestedShutdownMode() == appliedMode
                 ? WaitResult.ALL_STOPPED
                 : WaitResult.UPGRADED;
     }
 
-    private void recordTerminationFailure(WaitResult waitResult, long deadlineNanos) {
-        if (waitResult == WaitResult.TIMED_OUT) {
-            fail(new WorkerTerminationTimeoutException(
-                    name, shutdownTimeout, aliveThreadNames(), deadlineNanos));
-        } else {
-            fail(new IllegalStateException("worker 监督控制线程在等待终止时被中断：" + name));
+    private ShutdownSignal recordTerminationFailure(WaitResult waitResult, long deadlineNanos) {
+        Throwable terminationFailure = waitResult == WaitResult.TIMED_OUT
+                ? new WorkerTerminationTimeoutException(
+                        name, shutdownTimeout, aliveThreadNames(), deadlineNanos)
+                : new IllegalStateException("worker 监督控制线程在等待终止时被中断：" + name);
+        synchronized (stateLock) {
+            if (lifecycle == PipelineLifecycle.TERMINATED) {
+                return ShutdownSignal.NONE;
+            }
+            if (failure == null) {
+                failure = terminationFailure;
+            }
+            return prepareShutdownLocked(ShutdownMode.IMMEDIATE);
         }
     }
 
     private boolean finishTermination(ShutdownMode appliedMode, boolean allStopped) {
+        beforeTerminationCommit.run();
         WorkerSnapshot result;
         synchronized (stateLock) {
-            if (shutdownMode.get() != appliedMode) {
+            if (shutdownMode != appliedMode || allStopped && aliveWorkers != 0) {
                 return false;
             }
             int registeredWorkers = workers.size();
-            gracefulTermination = shutdownMode.get() == ShutdownMode.GRACEFUL
-                    && failure.get() == null
+            gracefulTermination = shutdownMode == ShutdownMode.GRACEFUL
+                    && failure == null
                     && registeredWorkers == expectedWorkers
                     && allStopped
-                    && aliveWorkers.get() == 0;
-            lifecycle.set(PipelineLifecycle.TERMINATED);
-            result = WorkerSnapshot.builder()
-                    .name(name)
-                    .lifecycle(PipelineLifecycle.TERMINATED)
-                    .expectedWorkers(expectedWorkers)
-                    .registeredWorkers(registeredWorkers)
-                    .aliveWorkers(aliveWorkers.get())
-                    .failure(failure.get())
-                    .shutdownMode(shutdownMode.get())
-                    .gracefulTermination(gracefulTermination)
-                    .build();
+                    && aliveWorkers == 0;
+            lifecycle = PipelineLifecycle.TERMINATED;
+            result = snapshotLocked();
         }
         termination.complete(result);
         return true;
     }
 
     private void moveToShutdownState(ShutdownMode requestedMode) {
-        PipelineLifecycle current = lifecycle.get();
+        PipelineLifecycle current = lifecycle;
         if (requestedMode == ShutdownMode.GRACEFUL && current == PipelineLifecycle.RUNNING) {
-            lifecycle.set(PipelineLifecycle.QUIESCING);
+            lifecycle = PipelineLifecycle.QUIESCING;
         } else {
-            lifecycle.set(PipelineLifecycle.STOPPING);
+            lifecycle = PipelineLifecycle.STOPPING;
         }
     }
 
@@ -320,41 +354,37 @@ public final class WorkerSupervisor {
         }
     }
 
-    private void failWorkerUnlessStopping(Throwable workerFailure) {
-        ShutdownSignal signal;
-        synchronized (stateLock) {
-            if (shutdownMode.get() != null || lifecycle.get() == PipelineLifecycle.TERMINATED) {
-                return;
-            }
-            failure.compareAndSet(null, workerFailure);
-            signal = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
+    private ShutdownSignal recordWorkerExitLocked(Thread worker, Throwable workerFailure) {
+        if (shutdownMode != null
+                || (lifecycle != PipelineLifecycle.STARTING
+                && lifecycle != PipelineLifecycle.RUNNING)) {
+            return ShutdownSignal.NONE;
         }
-        applyShutdownSignal(signal);
+        if (failure == null) {
+            failure = workerFailure != null
+                    ? workerFailure
+                    : new UnexpectedWorkerExitException(name, worker.getName(), lifecycle);
+        }
+        return prepareShutdownLocked(ShutdownMode.IMMEDIATE);
     }
 
-    private void failUnexpectedWorkerExit(Thread worker) {
-        ShutdownSignal signal;
+    private ShutdownMode requestedShutdownMode() {
         synchronized (stateLock) {
-            PipelineLifecycle current = lifecycle.get();
-            if (shutdownMode.get() != null
-                    || (current != PipelineLifecycle.STARTING
-                    && current != PipelineLifecycle.RUNNING)) {
-                return;
-            }
-            failure.compareAndSet(null,
-                    new UnexpectedWorkerExitException(name, worker.getName(), current));
-            signal = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
+            return shutdownMode;
         }
-        applyShutdownSignal(signal);
     }
 
-    private boolean allWorkersStopped() {
-        for (Thread worker : workerSnapshot()) {
-            if (worker != Thread.currentThread() && worker.isAlive()) {
-                return false;
-            }
-        }
-        return true;
+    private WorkerSnapshot snapshotLocked() {
+        return WorkerSnapshot.builder()
+                .name(name)
+                .lifecycle(lifecycle)
+                .expectedWorkers(expectedWorkers)
+                .registeredWorkers(workers.size())
+                .aliveWorkers(aliveWorkers)
+                .failure(failure)
+                .shutdownMode(shutdownMode)
+                .gracefulTermination(gracefulTermination)
+                .build();
     }
 
     private List<String> aliveThreadNames() {
@@ -435,6 +465,11 @@ public final class WorkerSupervisor {
         INTERRUPTED
     }
 
-    private record ShutdownSignal(Thread threadToStart, boolean interruptForUpgrade) {
+    private record ShutdownSignal(
+            Thread controlThread,
+            boolean startControlThread,
+            boolean interruptWorkers) {
+
+        private static final ShutdownSignal NONE = new ShutdownSignal(null, false, false);
     }
 }
