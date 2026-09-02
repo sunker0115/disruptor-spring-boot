@@ -250,7 +250,7 @@ public final class WorkerSupervisor {
                 continue;
             }
             if (waitResult == WaitResult.ALL_STOPPED) {
-                if (finishTermination(appliedMode, true)) {
+                if (finishTermination(appliedMode)) {
                     return;
                 }
                 continue;
@@ -260,7 +260,8 @@ public final class WorkerSupervisor {
             if (appliedMode != ShutdownMode.IMMEDIATE) {
                 continue;
             }
-            if (finishTermination(appliedMode, false)) {
+            awaitWorkersAfterDeadline();
+            if (finishTermination(appliedMode)) {
                 return;
             }
         }
@@ -301,6 +302,25 @@ public final class WorkerSupervisor {
                 : WaitResult.UPGRADED;
     }
 
+    private void awaitWorkersAfterDeadline() {
+        boolean interrupted = false;
+        for (Thread worker : workerSnapshot()) {
+            if (worker == Thread.currentThread()) {
+                continue;
+            }
+            while (worker.isAlive()) {
+                try {
+                    worker.join();
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private ShutdownSignal recordTerminationFailure(WaitResult waitResult, long deadlineNanos) {
         Throwable terminationFailure = waitResult == WaitResult.TIMED_OUT
                 ? new WorkerTerminationTimeoutException(
@@ -317,24 +337,27 @@ public final class WorkerSupervisor {
         }
     }
 
-    private boolean finishTermination(ShutdownMode appliedMode, boolean allStopped) {
+    private boolean finishTermination(ShutdownMode appliedMode) {
         beforeTerminationCommit.run();
         WorkerSnapshot result;
         synchronized (stateLock) {
-            if (shutdownMode != appliedMode || allStopped && aliveWorkers != 0) {
+            if (shutdownMode != appliedMode || aliveWorkers != 0 || hasAliveWorkerLocked()) {
                 return false;
             }
             int registeredWorkers = workers.size();
             gracefulTermination = shutdownMode == ShutdownMode.GRACEFUL
                     && failure == null
                     && registeredWorkers == expectedWorkers
-                    && allStopped
                     && aliveWorkers == 0;
             lifecycle = PipelineLifecycle.TERMINATED;
             result = snapshotLocked();
         }
         termination.complete(result);
         return true;
+    }
+
+    private boolean hasAliveWorkerLocked() {
+        return workers.stream().anyMatch(Thread::isAlive);
     }
 
     private void moveToShutdownState(ShutdownMode requestedMode) {

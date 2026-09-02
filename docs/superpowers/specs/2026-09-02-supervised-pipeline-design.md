@@ -124,7 +124,9 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 6. 中断并等待仍存活线程；
 7. 完成终止快照与 `termination()`。
 
-故障或立即停止不等待无法推进的 gating sequence，直接 halt、唤醒和 join。线程退出、停止异常和超时都聚合到终止结果，但首个消费故障保持主因。
+故障或立即停止不等待无法推进的 gating sequence，直接 halt、唤醒和 join。关闭 deadline 只用于判定优雅等待或普通 join 已经超时：到期时锁存首个 `WorkerTerminationTimeoutException`、把请求模式单调升级为 `IMMEDIATE`、中断 worker，并由同一个控制线程串行执行一次 `StopAction(IMMEDIATE)`；deadline 不因升级而延长。
+
+超时不是终止捷径。抗中断 worker 仍存活时，生命周期保持 `STOPPING`，`termination()` 不完成；控制线程在 deadline 后通过线程终止通知继续等待，不做忙轮询。只有所有已经进入监督范围的 worker 实际退出，才能在同一状态锁内提交 `TERMINATED` 和终止快照。因此 `TERMINATED` 永远蕴含存活 worker 数为 0，该语义同时适用于后续 `EventLoop` 的 `awaitTermination`。线程退出、停止异常和超时都聚合到终止结果，但首个故障保持主因。
 
 ### Spring 可观测性
 
@@ -145,6 +147,8 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 - 已接受发布要么完成发布并纳入关闭目标，要么调用方收到明确非成功结果。
 - 关闭、失败或中断后，没有受管发布者永久等待容量。
 - 消费线程永远不等待自身终止。
+- deadline 到期只触发首因和 `IMMEDIATE` 升级，不得在 worker 存活时完成 `termination()`。
+- `TERMINATED` 快照中的存活 worker 数必须为 0。
 - Runtime 关闭耗时受单一总截止时间约束，不随管道数量线性叠加。
 - 快照、健康和指标不得改变 RingBuffer 热路径。
 

@@ -38,6 +38,9 @@ public record WorkerSnapshot(
             throw new IllegalArgumentException(
                     "aliveWorkers 必须在 0 到 registeredWorkers 之间，实际值=" + aliveWorkers);
         }
+        if (lifecycle == PipelineLifecycle.TERMINATED && aliveWorkers != 0) {
+            throw new IllegalArgumentException("TERMINATED 状态不能仍有存活 worker");
+        }
         if (gracefulTermination
                 && (lifecycle != PipelineLifecycle.TERMINATED
                 || shutdownMode != ShutdownMode.GRACEFUL

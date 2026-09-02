@@ -447,14 +447,18 @@ class WorkerSupervisorTest {
         supervisor.markRunning();
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
 
-        WorkerSnapshot result = terminate(supervisor);
-        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, result.failure());
-        assertEquals(PipelineLifecycle.TERMINATED, result.lifecycle());
-        assertEquals(1, result.aliveWorkers());
+        WorkerSnapshot stopping = awaitFailure(supervisor);
+        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
+        assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
+        assertEquals(1, stopping.aliveWorkers());
+        assertFalse(supervisor.termination().toCompletableFuture().isDone());
         assertTrue(interrupts.get() >= 1);
         release.countDown();
-        worker.join(TEST_TIMEOUT.toMillis());
-        assertFalse(worker.isAlive());
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertEquals(PipelineLifecycle.TERMINATED, result.lifecycle());
+        assertEquals(0, result.aliveWorkers());
+        assertSame(stopping.failure(), result.failure());
     }
 
     @Test
@@ -484,17 +488,17 @@ class WorkerSupervisorTest {
         supervisor.markRunning();
         supervisor.requestShutdown(ShutdownMode.GRACEFUL);
 
-        WorkerSnapshot result;
-        try {
-            result = terminate(supervisor);
-        } finally {
-            release.countDown();
-            worker.join(TEST_TIMEOUT.toMillis());
-        }
-
-        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, result.failure());
-        assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
+        WorkerSnapshot stopping = awaitFailure(supervisor);
+        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
+        assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
+        assertEquals(ShutdownMode.IMMEDIATE, stopping.shutdownMode());
         assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
+        assertFalse(supervisor.termination().toCompletableFuture().isDone());
+        release.countDown();
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertSame(stopping.failure(), result.failure());
+        assertEquals(0, result.aliveWorkers());
         assertFalse(worker.isAlive());
     }
 
@@ -655,6 +659,11 @@ class WorkerSupervisorTest {
                 .registeredWorkers(2).build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
                 .aliveWorkers(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .aliveWorkers(1)
+                .shutdownMode(ShutdownMode.IMMEDIATE)
+                .build());
     }
 
     @Test
@@ -740,6 +749,17 @@ class WorkerSupervisorTest {
         } catch (Exception failure) {
             throw new AssertionError("等待 supervisor 终止失败", failure);
         }
+    }
+
+    private static WorkerSnapshot awaitFailure(WorkerSupervisor supervisor) {
+        long deadline = System.nanoTime() + TEST_TIMEOUT.toNanos();
+        WorkerSnapshot snapshot = supervisor.snapshot();
+        while (snapshot.failure() == null && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+            snapshot = supervisor.snapshot();
+        }
+        assertTrue(snapshot.failure() != null, "等待 supervisor 失败首因超时");
+        return snapshot;
     }
 
     private static void await(CountDownLatch latch) {

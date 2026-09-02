@@ -184,11 +184,11 @@ public final class WorkerSupervisor {
 }
 ```
 
-实现使用原子状态和首因 CAS；停止动作只在命名 JDK 21 虚拟控制线程执行；worker 包装器在记录后原样重抛 Throwable；控制线程跳过对自身的 join。
+实现使用单一状态锁线性化生命周期、首因和单调停机模式；停止动作只在命名 JDK 21 虚拟控制线程串行执行，每个实际模式至多一次；worker 包装器在记录后原样重抛 Throwable。deadline 到期只锁存超时首因、升级 `IMMEDIATE` 并中断 worker，不得提前完成 `termination()`；控制线程在 deadline 后通过线程终止通知等待实际退出，不做忙轮询，也不延长 deadline。
 
 - [ ] **Step 4: 补齐竞态测试并运行**
 
-补充重复停止、正常提前返回、关闭与失败同时发生、UncaughtExceptionHandler 收到同一异常、全部 worker 退出才完成 termination。
+补充重复停止、正常提前返回、关闭与失败同时发生、UncaughtExceptionHandler 收到同一异常、超时升级动作序列，以及抗中断 worker 全部退出后才完成 termination。
 
 ```bash
 $MVN -pl disruptor-core -Dtest=WorkerSupervisorTest test
