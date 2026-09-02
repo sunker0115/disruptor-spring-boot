@@ -205,33 +205,29 @@ public final class WorkerSupervisor {
     private void controlShutdown() {
         long deadlineNanos = deadlineAfter(shutdownTimeoutNanos);
         ShutdownMode appliedMode = null;
-        boolean allStopped = false;
-        try {
-            while (true) {
-                ShutdownMode requestedMode = shutdownMode.get();
-                if (requestedMode != appliedMode) {
-                    if (requestedMode == ShutdownMode.IMMEDIATE) {
-                        interruptAliveWorkers();
-                    }
-                    invokeStopAction(requestedMode, deadlineNanos);
-                    appliedMode = requestedMode;
-                    continue;
+        while (true) {
+            ShutdownMode requestedMode = shutdownMode.get();
+            if (requestedMode != appliedMode) {
+                if (requestedMode == ShutdownMode.IMMEDIATE) {
+                    interruptAliveWorkers();
                 }
+                invokeStopAction(requestedMode, deadlineNanos);
+                appliedMode = requestedMode;
+                continue;
+            }
 
-                WaitResult waitResult = awaitWorkers(deadlineNanos, appliedMode);
-                if (waitResult == WaitResult.ALL_STOPPED) {
-                    allStopped = true;
-                    break;
-                }
-                if (waitResult == WaitResult.UPGRADED) {
-                    continue;
-                }
+            WaitResult waitResult = awaitWorkers(deadlineNanos, appliedMode);
+            if (waitResult == WaitResult.UPGRADED) {
+                continue;
+            }
+            if (waitResult != WaitResult.ALL_STOPPED) {
                 recordTerminationFailure(waitResult, deadlineNanos);
                 interruptAliveWorkers();
-                break;
             }
-        } finally {
-            finishTermination(allStopped || allWorkersStopped());
+            boolean allStopped = waitResult == WaitResult.ALL_STOPPED || allWorkersStopped();
+            if (finishTermination(appliedMode, allStopped)) {
+                return;
+            }
         }
     }
 
@@ -279,9 +275,12 @@ public final class WorkerSupervisor {
         }
     }
 
-    private void finishTermination(boolean allStopped) {
+    private boolean finishTermination(ShutdownMode appliedMode, boolean allStopped) {
         WorkerSnapshot result;
         synchronized (stateLock) {
+            if (shutdownMode.get() != appliedMode) {
+                return false;
+            }
             int registeredWorkers = workers.size();
             gracefulTermination = shutdownMode.get() == ShutdownMode.GRACEFUL
                     && failure.get() == null
@@ -301,6 +300,7 @@ public final class WorkerSupervisor {
                     .build();
         }
         termination.complete(result);
+        return true;
     }
 
     private void moveToShutdownState(ShutdownMode requestedMode) {

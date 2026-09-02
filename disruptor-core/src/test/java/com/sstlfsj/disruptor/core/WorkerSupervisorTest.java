@@ -459,6 +459,47 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void gracefulTimeoutStillAppliesImmediateStopActionBeforeTermination() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        List<ShutdownMode> appliedModes = new CopyOnWriteArrayList<>();
+        WorkerSupervisor supervisor = supervisor(1, Duration.ofMillis(50),
+                (mode, deadlineNanos) -> appliedModes.add(mode));
+        Thread worker = worker(supervisor, () -> {
+            entered.countDown();
+            boolean done = false;
+            while (!done) {
+                try {
+                    release.await();
+                    done = true;
+                } catch (InterruptedException ignored) {
+                    // 故意保持存活，让 GRACEFUL 等待触发绝对截止时间。
+                }
+            }
+        }, "graceful-timeout-worker");
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+
+        WorkerSnapshot result;
+        try {
+            result = terminate(supervisor);
+        } finally {
+            release.countDown();
+            worker.join(TEST_TIMEOUT.toMillis());
+        }
+
+        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, result.failure());
+        assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
+        assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
+        assertFalse(worker.isAlive());
+    }
+
+    @Test
     void validatesRegistrationAndLifecycleTransitions() {
         WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
         Thread first = new Thread(() -> { });
