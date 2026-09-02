@@ -2,6 +2,7 @@ package com.sstlfsj.disruptor.core;
 
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -297,6 +298,84 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void acceptedShutdownWinsRaceWithWorkerFailureReporting() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch throwNow = new CountDownLatch(1);
+        RuntimeException shutdownExit = new RuntimeException("shutdown race");
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
+        Thread worker = worker(supervisor, () -> {
+            entered.countDown();
+            await(throwNow);
+            throw shutdownExit;
+        }, "shutdown-race-worker");
+        worker.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.markRunning();
+
+        synchronized (stateLock(supervisor)) {
+            throwNow.countDown();
+            awaitThreadState(worker, Thread.State.BLOCKED);
+            supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        }
+
+        WorkerSnapshot result = terminate(supervisor);
+        assertSame(shutdownExit, uncaught.get());
+        assertNull(result.failure());
+        assertEquals(ShutdownMode.GRACEFUL, result.shutdownMode());
+        assertTrue(result.gracefulTermination());
+    }
+
+    @Test
+    void failPublishesFailureAndImmediateTransitionInOneCriticalSection() throws Exception {
+        RuntimeException firstFailure = new RuntimeException("late failure");
+        CountDownLatch gracefulActionEntered = new CountDownLatch(1);
+        AtomicReference<WorkerSupervisor> supervisorReference = new AtomicReference<>();
+        AtomicReference<ShutdownMode> modeObservedUnderStateLock = new AtomicReference<>();
+        AtomicReference<PipelineLifecycle> lifecycleObservedUnderStateLock = new AtomicReference<>();
+        AtomicBoolean controlThreadPrepared = new AtomicBoolean();
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> {
+            if (mode != ShutdownMode.GRACEFUL) {
+                return;
+            }
+            WorkerSupervisor current = supervisorReference.get();
+            gracefulActionEntered.countDown();
+            AtomicReference<Throwable> failure = failureReference(current);
+            while (failure.get() != firstFailure && System.nanoTime() < deadlineNanos) {
+                Thread.onSpinWait();
+            }
+            synchronized (stateLock(current)) {
+                WorkerSnapshot snapshot = current.snapshot();
+                modeObservedUnderStateLock.set(snapshot.shutdownMode());
+                lifecycleObservedUnderStateLock.set(snapshot.lifecycle());
+                controlThreadPrepared.set(controlThread(current) != null);
+            }
+        });
+        supervisorReference.set(supervisor);
+        supervisor.markStarting();
+        supervisor.register(new Thread(() -> { }, "unstarted-worker"));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(gracefulActionEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        Thread failer = Thread.ofPlatform().name("late-failer")
+                .start(() -> supervisor.fail(firstFailure));
+        failer.join(TEST_TIMEOUT.toMillis());
+        WorkerSnapshot result = terminate(supervisor);
+
+        assertFalse(failer.isAlive());
+        assertEquals(ShutdownMode.IMMEDIATE, modeObservedUnderStateLock.get());
+        assertEquals(PipelineLifecycle.STOPPING, lifecycleObservedUnderStateLock.get());
+        assertTrue(controlThreadPrepared.get());
+        assertSame(firstFailure, result.failure());
+        assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
+    }
+
+    @Test
     void deadlineRecordsTimeoutAndInterruptsRemainingWorker() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -451,6 +530,37 @@ class WorkerSupervisorTest {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new AssertionError("等待 latch 被中断", interrupted);
+        }
+    }
+
+    private static void awaitThreadState(Thread thread, Thread.State expected) {
+        long deadline = System.nanoTime() + TEST_TIMEOUT.toNanos();
+        while (thread.getState() != expected && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertEquals(expected, thread.getState());
+    }
+
+    private static Object stateLock(WorkerSupervisor supervisor) {
+        return fieldValue(supervisor, "stateLock", Object.class);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AtomicReference<Throwable> failureReference(WorkerSupervisor supervisor) {
+        return fieldValue(supervisor, "failure", AtomicReference.class);
+    }
+
+    private static Thread controlThread(WorkerSupervisor supervisor) {
+        return fieldValue(supervisor, "controlThread", Thread.class);
+    }
+
+    private static <T> T fieldValue(WorkerSupervisor supervisor, String name, Class<T> type) {
+        try {
+            Field field = WorkerSupervisor.class.getDeclaredField(name);
+            field.setAccessible(true);
+            return type.cast(field.get(supervisor));
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("读取测试同步字段失败：" + name, failure);
         }
     }
 

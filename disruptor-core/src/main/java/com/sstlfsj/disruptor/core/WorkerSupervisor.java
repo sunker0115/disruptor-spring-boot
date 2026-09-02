@@ -68,17 +68,12 @@ public final class WorkerSupervisor {
                 worker.run();
             } catch (Throwable workerFailure) {
                 thrown = workerFailure;
-                if (!isShutdownInProgress()) {
-                    fail(workerFailure);
-                }
+                failWorkerUnlessStopping(workerFailure);
                 WorkerSupervisor.<RuntimeException>sneakyThrow(workerFailure);
             } finally {
                 aliveWorkers.decrementAndGet();
-                if (thrown == null
-                        && (lifecycle.get() == PipelineLifecycle.STARTING
-                        || lifecycle.get() == PipelineLifecycle.RUNNING)
-                        && shutdownMode.get() == null) {
-                    fail(new UnexpectedWorkerExitException(name, current.getName()));
+                if (thrown == null) {
+                    failUnexpectedWorkerExit(current);
                 }
             }
         };
@@ -127,44 +122,53 @@ public final class WorkerSupervisor {
 
     public void fail(Throwable workerFailure) {
         Objects.requireNonNull(workerFailure, "failure 不能为空");
+        Thread threadToStart;
         synchronized (stateLock) {
             if (lifecycle.get() == PipelineLifecycle.TERMINATED) {
                 return;
             }
             failure.compareAndSet(null, workerFailure);
+            threadToStart = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
         }
-        requestShutdown(ShutdownMode.IMMEDIATE);
+        startOrWakeControlThread(threadToStart);
     }
 
     public void requestShutdown(ShutdownMode requestedMode) {
         Objects.requireNonNull(requestedMode, "mode 不能为空");
-        Thread threadToStart = null;
-        Thread threadToWake;
+        Thread threadToStart;
         synchronized (stateLock) {
             if (lifecycle.get() == PipelineLifecycle.TERMINATED) {
                 return;
             }
-            ShutdownMode currentMode = shutdownMode.get();
-            if (currentMode == null) {
-                shutdownMode.set(requestedMode);
-                moveToShutdownState(requestedMode);
-            } else if (currentMode == ShutdownMode.GRACEFUL
-                    && requestedMode == ShutdownMode.IMMEDIATE) {
-                shutdownMode.set(ShutdownMode.IMMEDIATE);
-                lifecycle.set(PipelineLifecycle.STOPPING);
-            }
-            if (controlThread == null) {
-                controlThread = Thread.ofVirtual()
-                        .name("worker-supervisor-" + name)
-                        .unstarted(this::controlShutdown);
-                threadToStart = controlThread;
-            }
-            threadToWake = controlThread;
+            threadToStart = prepareShutdownLocked(requestedMode);
         }
+        startOrWakeControlThread(threadToStart);
+    }
+
+    private Thread prepareShutdownLocked(ShutdownMode requestedMode) {
+        ShutdownMode currentMode = shutdownMode.get();
+        if (currentMode == null) {
+            shutdownMode.set(requestedMode);
+            moveToShutdownState(requestedMode);
+        } else if (currentMode == ShutdownMode.GRACEFUL
+                && requestedMode == ShutdownMode.IMMEDIATE) {
+            shutdownMode.set(ShutdownMode.IMMEDIATE);
+            lifecycle.set(PipelineLifecycle.STOPPING);
+        }
+        if (controlThread == null) {
+            controlThread = Thread.ofVirtual()
+                    .name("worker-supervisor-" + name)
+                    .unstarted(this::controlShutdown);
+            return controlThread;
+        }
+        return null;
+    }
+
+    private void startOrWakeControlThread(Thread threadToStart) {
         if (threadToStart != null) {
             threadToStart.start();
         } else {
-            java.util.concurrent.locks.LockSupport.unpark(threadToWake);
+            java.util.concurrent.locks.LockSupport.unpark(controlThread);
         }
     }
 
@@ -223,8 +227,7 @@ public final class WorkerSupervisor {
         try {
             stopAction.stop(mode, deadlineNanos);
         } catch (Throwable stopFailure) {
-            failure.compareAndSet(null, stopFailure);
-            upgradeToImmediate();
+            fail(stopFailure);
         }
     }
 
@@ -255,21 +258,10 @@ public final class WorkerSupervisor {
 
     private void recordTerminationFailure(WaitResult waitResult, long deadlineNanos) {
         if (waitResult == WaitResult.TIMED_OUT) {
-            failure.compareAndSet(null, new WorkerTerminationTimeoutException(
+            fail(new WorkerTerminationTimeoutException(
                     name, shutdownTimeout, aliveThreadNames(), deadlineNanos));
         } else {
-            failure.compareAndSet(null,
-                    new IllegalStateException("worker 监督控制线程在等待终止时被中断：" + name));
-        }
-        upgradeToImmediate();
-    }
-
-    private void upgradeToImmediate() {
-        synchronized (stateLock) {
-            if (lifecycle.get() != PipelineLifecycle.TERMINATED) {
-                shutdownMode.set(ShutdownMode.IMMEDIATE);
-                lifecycle.set(PipelineLifecycle.STOPPING);
-            }
+            fail(new IllegalStateException("worker 监督控制线程在等待终止时被中断：" + name));
         }
     }
 
@@ -313,9 +305,31 @@ public final class WorkerSupervisor {
         }
     }
 
-    private boolean isShutdownInProgress() {
-        PipelineLifecycle current = lifecycle.get();
-        return current == PipelineLifecycle.QUIESCING || current == PipelineLifecycle.STOPPING;
+    private void failWorkerUnlessStopping(Throwable workerFailure) {
+        Thread threadToStart;
+        synchronized (stateLock) {
+            if (shutdownMode.get() != null || lifecycle.get() == PipelineLifecycle.TERMINATED) {
+                return;
+            }
+            failure.compareAndSet(null, workerFailure);
+            threadToStart = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
+        }
+        startOrWakeControlThread(threadToStart);
+    }
+
+    private void failUnexpectedWorkerExit(Thread worker) {
+        Thread threadToStart;
+        synchronized (stateLock) {
+            PipelineLifecycle current = lifecycle.get();
+            if (shutdownMode.get() != null
+                    || (current != PipelineLifecycle.STARTING
+                    && current != PipelineLifecycle.RUNNING)) {
+                return;
+            }
+            failure.compareAndSet(null, new UnexpectedWorkerExitException(name, worker.getName()));
+            threadToStart = prepareShutdownLocked(ShutdownMode.IMMEDIATE);
+        }
+        startOrWakeControlThread(threadToStart);
     }
 
     private boolean allWorkersStopped() {
