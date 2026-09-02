@@ -35,8 +35,9 @@ public record PipelineSnapshot(
         if (lifecycle == PipelineLifecycle.TERMINATED && aliveConsumers != 0) {
             throw new IllegalArgumentException("TERMINATED 状态不能仍有存活 consumer");
         }
-        if (gracefulTermination && lifecycle != PipelineLifecycle.TERMINATED) {
-            throw new IllegalArgumentException("只有 TERMINATED 状态的管道可以标记为优雅终止");
+        if (gracefulTermination
+                && (lifecycle != PipelineLifecycle.TERMINATED || failure != null)) {
+            throw new IllegalArgumentException("优雅终止标记必须与无故障终止状态一致");
         }
         if (health != deriveHealth(lifecycle, failure, expectedConsumers, createdConsumers, aliveConsumers)) {
             throw new IllegalArgumentException("health 必须与管道状态一致");

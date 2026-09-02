@@ -112,6 +112,11 @@ class PipelineSnapshotTest {
                 .createdConsumers(1)
                 .aliveConsumers(1)
                 .build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .failure(new IllegalStateException("failed"))
+                .gracefulTermination(true)
+                .build());
     }
 
     @Test

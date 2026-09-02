@@ -425,7 +425,7 @@ class WorkerSupervisorTest {
     void deadlineRecordsTimeoutAndInterruptsRemainingWorker() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
-        AtomicInteger interrupts = new AtomicInteger();
+        CountDownLatch workerInterrupted = new CountDownLatch(1);
         WorkerSupervisor supervisor = supervisor(1, Duration.ofMillis(50), (mode, deadlineNanos) -> { });
         Thread worker = worker(supervisor, () -> {
             entered.countDown();
@@ -435,7 +435,7 @@ class WorkerSupervisorTest {
                     release.await();
                     done = true;
                 } catch (InterruptedException interrupted) {
-                    interrupts.incrementAndGet();
+                    workerInterrupted.countDown();
                 }
             }
         }, "stubborn-worker");
@@ -453,7 +453,7 @@ class WorkerSupervisorTest {
             assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
             assertEquals(1, stopping.aliveWorkers());
             assertFalse(supervisor.termination().toCompletableFuture().isDone());
-            assertTrue(interrupts.get() >= 1);
+            assertTrue(workerInterrupted.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
         } finally {
             release.countDown();
             worker.join(TEST_TIMEOUT.toMillis());
