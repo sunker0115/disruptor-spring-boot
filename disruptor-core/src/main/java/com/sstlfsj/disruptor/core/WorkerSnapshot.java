@@ -1,5 +1,7 @@
 package com.sstlfsj.disruptor.core;
 
+import lombok.Builder;
+
 import java.util.Objects;
 
 /**
@@ -8,6 +10,7 @@ import java.util.Objects;
  * @param failure 首个失败原因；尚未失败时为 {@code null}
  * @param shutdownMode 已请求的停机方式；尚未请求停机时为 {@code null}
  */
+@Builder(builderMethodName = "builder")
 public record WorkerSnapshot(
         String name,
         PipelineLifecycle lifecycle,

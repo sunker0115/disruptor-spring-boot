@@ -110,6 +110,7 @@ class WorkerSupervisorTest {
 
         WorkerSnapshot result = terminate(supervisor);
         assertInstanceOf(WorkerSupervisor.UnexpectedWorkerExitException.class, result.failure());
+        assertTrue(result.failure().getMessage().contains("RUNNING"));
         assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
     }
 
@@ -126,6 +127,7 @@ class WorkerSupervisorTest {
         assertFalse(worker.isAlive());
         assertInstanceOf(WorkerSupervisor.UnexpectedWorkerExitException.class,
                 supervisor.snapshot().failure());
+        assertTrue(supervisor.snapshot().failure().getMessage().contains("STARTING"));
         assertEquals(ShutdownMode.IMMEDIATE, supervisor.snapshot().shutdownMode());
         assertThrows(IllegalStateException.class, supervisor::markRunning);
         assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
@@ -179,6 +181,51 @@ class WorkerSupervisorTest {
         assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
         assertEquals(ShutdownMode.IMMEDIATE, result.shutdownMode());
         assertFalse(result.gracefulTermination());
+    }
+
+    @Test
+    void immediateUpgradeInterruptsWorkerWhileGracefulActionIsStillRunning() throws Exception {
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch workerInterrupted = new CountDownLatch(1);
+        CountDownLatch gracefulActionEntered = new CountDownLatch(1);
+        CountDownLatch allowGracefulActionToReturn = new CountDownLatch(1);
+        List<ShutdownMode> appliedModes = new CopyOnWriteArrayList<>();
+        WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> {
+            appliedModes.add(mode);
+            if (mode == ShutdownMode.GRACEFUL) {
+                gracefulActionEntered.countDown();
+                await(allowGracefulActionToReturn);
+            }
+        });
+        Thread worker = worker(supervisor, () -> {
+            workerEntered.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException interrupted) {
+                workerInterrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+        }, "blocked-graceful-worker");
+
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(workerEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        assertTrue(gracefulActionEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        assertEquals(1L, workerInterrupted.getCount());
+
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        boolean interruptedBeforeGracefulActionReturned =
+                workerInterrupted.await(200, TimeUnit.MILLISECONDS);
+        List<ShutdownMode> modesBeforeGracefulActionReturned = List.copyOf(appliedModes);
+        allowGracefulActionToReturn.countDown();
+
+        assertTrue(interruptedBeforeGracefulActionReturned);
+        assertEquals(List.of(ShutdownMode.GRACEFUL), modesBeforeGracefulActionReturned);
+        assertEquals(ShutdownMode.IMMEDIATE, terminate(supervisor).shutdownMode());
+        assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
     }
 
     @Test
@@ -446,20 +493,27 @@ class WorkerSupervisorTest {
                 .stopAction((mode, deadline) -> { }).build());
         assertThrows(NullPointerException.class, () -> WorkerSupervisor.builder()
                 .name("workers").expectedWorkers(1).shutdownTimeout(TEST_TIMEOUT).build());
-        assertThrows(IllegalArgumentException.class, () -> new WorkerSnapshot(
-                "workers", PipelineLifecycle.RUNNING, 1, 0, 1, null, null, false));
-        assertThrows(IllegalArgumentException.class, () -> new WorkerSnapshot(
-                "workers", PipelineLifecycle.RUNNING, 1, 2, 0, null, null, false));
-        assertThrows(IllegalArgumentException.class, () -> new WorkerSnapshot(
-                "workers", PipelineLifecycle.RUNNING, 1, 1, -1, null, null, false));
+        assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
+                .registeredWorkers(0).aliveWorkers(1).build());
+        assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
+                .registeredWorkers(2).build());
+        assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
+                .aliveWorkers(-1).build());
     }
 
     @Test
     void terminationStageCannotCompleteSupervisor() {
         WorkerSupervisor supervisor = supervisor(1, TEST_TIMEOUT, (mode, deadlineNanos) -> { });
         CompletionStage<WorkerSnapshot> stage = supervisor.termination();
-        WorkerSnapshot forged = new WorkerSnapshot("forged", PipelineLifecycle.TERMINATED,
-                1, 0, 0, null, ShutdownMode.GRACEFUL, true);
+        WorkerSnapshot forged = WorkerSnapshot.builder()
+                .name("forged")
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .expectedWorkers(1)
+                .registeredWorkers(0)
+                .aliveWorkers(0)
+                .shutdownMode(ShutdownMode.GRACEFUL)
+                .gracefulTermination(true)
+                .build();
 
         assertTrue(stage.toCompletableFuture().complete(forged));
         assertEquals(PipelineLifecycle.NEW, supervisor.snapshot().lifecycle());
@@ -507,6 +561,16 @@ class WorkerSupervisorTest {
                 .shutdownTimeout(shutdownTimeout)
                 .stopAction(stopAction)
                 .build();
+    }
+
+    private static WorkerSnapshot.WorkerSnapshotBuilder validWorkerSnapshotBuilder() {
+        return WorkerSnapshot.builder()
+                .name("workers")
+                .lifecycle(PipelineLifecycle.RUNNING)
+                .expectedWorkers(1)
+                .registeredWorkers(1)
+                .aliveWorkers(0)
+                .gracefulTermination(false);
     }
 
     private static Thread worker(WorkerSupervisor supervisor, Runnable task, String name) {
