@@ -128,7 +128,7 @@ final class TaskSlot {
 定时任务登记也先进入任务队列，由 EventLoop 线程加入本地索引最小堆。排序键为：
 
 ```text
-deadlineNanos → priority → acceptedSequence
+deadlineNanos 升序 → priority 降序 → acceptedSequence 升序
 ```
 
 priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或已经开始执行的普通任务。
@@ -153,9 +153,9 @@ priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或
 - loop 内重入提交若容量满同样拒绝，绝不阻塞自身；
 - 不提供 `CallerRuns` 和静默 discard；两者破坏线程封闭或 Future 终态；
 - `tryExecute` 只用布尔值表达容量/状态拒绝，详细原因从快照读取；
-- `submit/schedule` 的任务异常由 Future 捕获；
-- 裸 `execute` 异常交给任务异常处理器，默认 SLF4J 记录并继续；
-- `Error`、processor、队列、模块生命周期异常属于基础设施故障，逃逸给 core supervisor。
+- `submit/schedule` 的用户任务异常由 Future 捕获；
+- 裸 `execute` 的用户任务 `Throwable` 交给任务异常处理器，默认 SLF4J 记录并继续；
+- 只有逃出用户任务边界的 processor、队列、模块生命周期异常才属于基础设施故障，并交给 core supervisor fail-stop。
 
 ## 关闭语义
 
