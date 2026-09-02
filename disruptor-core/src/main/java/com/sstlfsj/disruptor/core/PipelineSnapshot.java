@@ -1,5 +1,7 @@
 package com.sstlfsj.disruptor.core;
 
+import lombok.Builder;
+
 import java.util.Objects;
 
 /**
@@ -38,7 +40,8 @@ public record PipelineSnapshot(
         }
     }
 
-    public static PipelineSnapshot create(
+    @Builder(builderMethodName = "builder")
+    private static PipelineSnapshot buildSnapshot(
             String name,
             PipelineLifecycle lifecycle,
             boolean acceptingPublications,

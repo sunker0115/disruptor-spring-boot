@@ -67,11 +67,31 @@ Expected: 只包含实施计划和设计自审修改，没有未知业务代码�
 @Test
 void runningPipelineIsHealthyOnlyWhenEveryConsumerIsAlive() {
     assertEquals(PipelineHealth.HEALTHY,
-            PipelineSnapshot.create("orders", PipelineLifecycle.RUNNING,
-                    true, 2, 2, 2, 16, 0, null, false).health());
+            PipelineSnapshot.builder()
+                    .name("orders")
+                    .lifecycle(PipelineLifecycle.RUNNING)
+                    .acceptingPublications(true)
+                    .expectedConsumers(2)
+                    .createdConsumers(2)
+                    .aliveConsumers(2)
+                    .bufferSize(16)
+                    .backlog(0)
+                    .gracefulTermination(false)
+                    .build()
+                    .health());
     assertEquals(PipelineHealth.UNHEALTHY,
-            PipelineSnapshot.create("orders", PipelineLifecycle.RUNNING,
-                    false, 2, 2, 1, 16, 3, null, false).health());
+            PipelineSnapshot.builder()
+                    .name("orders")
+                    .lifecycle(PipelineLifecycle.RUNNING)
+                    .acceptingPublications(false)
+                    .expectedConsumers(2)
+                    .createdConsumers(2)
+                    .aliveConsumers(1)
+                    .bufferSize(16)
+                    .backlog(3)
+                    .gracefulTermination(false)
+                    .build()
+                    .health());
 }
 ```
 
@@ -92,7 +112,7 @@ public enum PublicationResult { PUBLISHED, CAPACITY_EXHAUSTED, TIMED_OUT, NOT_RU
 public enum ShutdownMode { GRACEFUL, IMMEDIATE }
 ```
 
-`PipelineSnapshot.create(...)` 必须只按生命周期、消费者计数和 failure 派生 health；构造参数拒绝负数、存活数大于已创建数及已创建数大于预期数。
+`PipelineSnapshot.builder()` 只接收状态事实字段，并在 `build()` 内按生命周期、消费者计数和 failure 派生 health；canonical constructor 拒绝负数、存活数大于已创建数及已创建数大于预期数。
 
 - [ ] **Step 4: 运行测试确认通过**
 

@@ -75,6 +75,8 @@ NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED
 
 `PipelineSnapshot` 至少包含：管道名、生命周期、健康、是否接受发布、预期/已创建/存活消费者数、RingBuffer 容量和近似积压、首个故障、是否优雅终止。
 
+`PipelineSnapshot.builder()` 只接收除 `health` 外的状态事实字段；`build()` 内部派生健康状态，再通过 canonical constructor 保持所有不变量校验。
+
 故障与生命周期分轴。关闭期间不得清除、包装掉或用后续异常覆盖首个故障。
 
 ### 消费者监督

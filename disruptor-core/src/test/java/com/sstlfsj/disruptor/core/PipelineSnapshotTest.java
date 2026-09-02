@@ -47,8 +47,18 @@ class PipelineSnapshotTest {
     void preservesSnapshotFields() {
         IllegalStateException failure = new IllegalStateException("boom");
 
-        PipelineSnapshot snapshot = PipelineSnapshot.create(
-                "orders", PipelineLifecycle.RUNNING, true, 3, 3, 3, 1024, 12, failure, false);
+        PipelineSnapshot snapshot = PipelineSnapshot.builder()
+                .name("orders")
+                .lifecycle(PipelineLifecycle.RUNNING)
+                .acceptingPublications(true)
+                .expectedConsumers(3)
+                .createdConsumers(3)
+                .aliveConsumers(3)
+                .bufferSize(1024)
+                .backlog(12)
+                .failure(failure)
+                .gracefulTermination(false)
+                .build();
 
         assertEquals("orders", snapshot.name());
         assertEquals(PipelineLifecycle.RUNNING, snapshot.lifecycle());
@@ -62,36 +72,40 @@ class PipelineSnapshotTest {
         assertSame(failure, snapshot.failure());
         assertFalse(snapshot.gracefulTermination());
 
-        assertNull(PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 0, 0, 0, 0, 0, null, false).failure());
+        assertNull(PipelineSnapshot.builder()
+                .name("orders")
+                .lifecycle(PipelineLifecycle.NEW)
+                .acceptingPublications(false)
+                .expectedConsumers(0)
+                .createdConsumers(0)
+                .aliveConsumers(0)
+                .bufferSize(0)
+                .backlog(0)
+                .gracefulTermination(false)
+                .build()
+                .failure());
     }
 
     @Test
     void rejectsInvalidSnapshotArguments() {
-        assertThrows(NullPointerException.class, () -> PipelineSnapshot.create(
-                null, PipelineLifecycle.NEW, false, 0, 0, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                " ", PipelineLifecycle.NEW, false, 0, 0, 0, 0, 0, null, false));
-        assertThrows(NullPointerException.class, () -> PipelineSnapshot.create(
-                "orders", null, false, 0, 0, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, -1, 0, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 1, -1, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 1, 1, -1, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 0, 0, 0, -1, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 0, 0, 0, 0, -1, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 1, 2, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.NEW, false, 1, 1, 2, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.STARTING, true, 0, 0, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> PipelineSnapshot.create(
-                "orders", PipelineLifecycle.STOPPING, false, 0, 0, 0, 0, 0, null, true));
+        assertThrows(NullPointerException.class, () -> newSnapshotBuilder().name(null).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().name(" ").build());
+        assertThrows(NullPointerException.class, () -> newSnapshotBuilder().lifecycle(null).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().expectedConsumers(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .expectedConsumers(1).createdConsumers(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .expectedConsumers(1).createdConsumers(1).aliveConsumers(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().bufferSize(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().backlog(-1).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .expectedConsumers(1).createdConsumers(2).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .expectedConsumers(1).createdConsumers(1).aliveConsumers(2).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.STARTING).acceptingPublications(true).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.STOPPING).gracefulTermination(true).build());
     }
 
     @Test
@@ -110,10 +124,32 @@ class PipelineSnapshotTest {
             int createdConsumers,
             int aliveConsumers,
             PipelineHealth expectedHealth) {
-        PipelineSnapshot snapshot = PipelineSnapshot.create(
-                "orders", lifecycle, false, expectedConsumers, createdConsumers, aliveConsumers,
-                1024, 0, failure, lifecycle == PipelineLifecycle.TERMINATED);
+        PipelineSnapshot snapshot = PipelineSnapshot.builder()
+                .name("orders")
+                .lifecycle(lifecycle)
+                .acceptingPublications(false)
+                .expectedConsumers(expectedConsumers)
+                .createdConsumers(createdConsumers)
+                .aliveConsumers(aliveConsumers)
+                .bufferSize(1024)
+                .backlog(0)
+                .failure(failure)
+                .gracefulTermination(lifecycle == PipelineLifecycle.TERMINATED)
+                .build();
 
         assertEquals(expectedHealth, snapshot.health());
+    }
+
+    private static PipelineSnapshot.PipelineSnapshotBuilder newSnapshotBuilder() {
+        return PipelineSnapshot.builder()
+                .name("orders")
+                .lifecycle(PipelineLifecycle.NEW)
+                .acceptingPublications(false)
+                .expectedConsumers(0)
+                .createdConsumers(0)
+                .aliveConsumers(0)
+                .bufferSize(0)
+                .backlog(0)
+                .gracefulTermination(false);
     }
 }
