@@ -13,6 +13,7 @@
 - 生命周期与健康分轴，首个基础设施故障永久锁存到终止快照。
 - 受管发布提供非阻塞和有界、可中断等待，不再提供无限阻塞入口。
 - 关闭请求可以从消费线程内安全发起，不自等待、不自 `join`。
+- 所有后端共享绝对关闭截止时间、worker 监督和真实终止语义。
 - `DisruptorRuntime` 只聚合多条管道，不再拥有另一套管道状态判断。
 - Spring 健康和指标只读取统一快照，不在发布或消费热路径埋点。
 
@@ -25,71 +26,93 @@
 
 ## 方案比较
 
-| 方案 | 优点 | 缺点 | 结论 |
+| 方案 | 架构边界与优点 | 正确性与代价 | 结论 |
 | --- | --- | --- | --- |
-| 在现有 `ManagedPipeline` 局部增加线程存活判断 | 改动少 | 生命周期、故障、发布、指标继续各自判断，无法支持独立 EventLoop 关闭 | 不采用 |
-| 直接引入 `cn.wjybxx.commons.disruptor` | 获得可中断 barrier 和无界实现 | 替换 LMAX 语义、生态和 topology，形成第二套底座 | 不采用 |
-| 把单条 LMAX 管道提升为受监督生命周期单元 | 保留 LMAX，统一关闭、故障和观察模型，可供 concurrent 复用 | 需要重构 core | 采用 |
+| 统一监督器 + 非阻塞分阶段后端协议 | core 统一生命周期、首因、deadline、worker 与终止；LMAX 和 EventLoop 只适配后端动作 | 单锁线性化，后端动作由单控制线程串行，可确定性测试 | 采用 |
+| passive worker 记录器 + 后端各自协调关闭 | 后端实现最自由 | LMAX 与 EventLoop 必须重复模式升级、deadline 和终止提交，长期必然漂移 | 不采用 |
+| 阻塞排空线程 + 独立 watchdog | 可保留阻塞回调 | graceful 与 force 要么并发破坏后端线程封闭，要么仍被阻塞；还会泄漏不可强杀线程 | 不采用 |
 
 ## 最终模型
 
 ### 类型与职责
 
-- `WorkerSupervisor`：core 内可供同仓模块复用的线程监督 SPI，只管理状态、首因、停止请求与终止信号，不感知任务队列。
-- `DisruptorPipeline<E>`：组合 `WorkerSupervisor` 的单条 LMAX 管道生命周期控制器，内部实现保持不可替换。
+- `WorkerSupervisor`：core 提供的统一受监督生命周期控制器；管理生命周期、worker 登记与入场、首因、关闭模式、绝对截止时间和真实线程终止。
+- `ShutdownBackend`：仅供项目内部后端实现的非阻塞阶段协议；不暴露任意用户回调。
+- `ShutdownDeadline`：基于 `System.nanoTime()` 的不可变绝对截止时间；Runtime 和 Group 创建一次并传给所有 child。
+- `DisruptorPipeline<E>`：组合 `WorkerSupervisor` 和 LMAX `ShutdownBackend` 的单管道生命周期单元。
 - `PipelineHandle<E>`：发布入口与快照读取，不拥有生命周期。
 - `PipelineSnapshot`：不可变状态事实源。
-- `DisruptorRuntime`：构建并聚合多条 `DisruptorPipeline`，负责批量启动、回滚和总截止时间等待。
+- `DisruptorRuntime`：构建并聚合多条 `DisruptorPipeline`，负责批量启动、回滚、共享截止时间和真实终止聚合。
 
-核心接口语义：
+后端阶段协议固定为：
 
 ```java
-public interface DisruptorPipeline<E> {
-    PipelineHandle<E> handle();
-    PipelineSnapshot snapshot();
-    void start();
-    void requestShutdown(ShutdownMode mode);
-    CompletionStage<PipelineSnapshot> termination();
+public interface ShutdownBackend {
+    void beginQuiesce() throws Throwable;
+    boolean isDrained() throws Throwable;
+    void stop(ShutdownMode mode) throws Throwable;
 }
 ```
 
-`requestShutdown` 只发出幂等请求，不阻塞调用线程。真正的排空、halt 和 join 由 JDK 21 虚拟控制线程执行；该线程只存在于关闭或故障冷路径。`DisruptorRuntime.shutdown()` 先向所有管道发出请求，再在同一个 Runtime 级截止时间内等待各自 `termination()`。
+约束如下：
 
-`WorkerSupervisor` 不是通用线程池框架。它只服务于本仓库中两种已经确定的单线程消费者：LMAX 管道 processor，以及 concurrent 显式无界后端的 worker。这样无界后端无需伪装成 LMAX RingBuffer，也不会复制第二套生命周期状态机。
+- 三个方法只能由 supervisor 的命名虚拟控制线程调用，且绝不在状态锁内调用。
+- 后端调用严格串行，不允许并发重入。
+- 方法只做有界、非阻塞的内部动作，不得等待 sequence、等待 Future、`join` worker 或调用业务 handler/module。
+- `beginQuiesce()` 至多一次；`isDrained()` 只在 `QUIESCING` 期间调用；`stop(GRACEFUL)` 和 `stop(IMMEDIATE)` 各至多一次。
+- graceful stop 后若 worker 未在 deadline 前退出，可以继续串行调用一次 immediate stop。
+- 后端动作抛出的首个异常进入 supervisor 首因，随后单调升级为 `IMMEDIATE`。
+- `isDrained()` 返回 true 后必须回到状态锁重新确认仍为同一次 `GRACEFUL + QUIESCING`，才能提交 drain 和 `STOPPING`；并发 immediate、故障或 deadline 永远优先。
 
-### 状态与健康
+supervisor 配置一个默认 `shutdownTimeout`，只用于没有上层协调者的独立关闭或自主故障。`requestShutdown(mode, deadline)` 只在线性化点关闭准入、推进状态、冻结首次 deadline，并启动或唤醒控制线程；它不执行排空、后端 stop 或线程等待。worker 自主故障使用默认 timeout 生成 deadline；Runtime/Group 在 child 尚未开始关闭时传入共享 deadline。并发请求以状态锁内第一个线性化的 deadline 为准，后续不得覆盖或延长。消费线程发起关闭时不会等待自身。
+
+### 状态、健康与 worker 入场
 
 生命周期固定为：
 
 ```text
-NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED
+NEW --beginStart--> STARTING --markRunning--> RUNNING
+
+RUNNING --GRACEFUL--> QUIESCING --drained commit--> STOPPING
+QUIESCING --失败/超时/IMMEDIATE--> STOPPING
+NEW/STARTING/RUNNING --失败或 IMMEDIATE--> STOPPING
+NEW/STARTING --GRACEFUL--> STOPPING
+
+STOPPING --后端停止动作完成且全部已启动线程真实退出--> TERMINATED
 ```
+
+`QUIESCING` 不得直接进入 `TERMINATED`。控制线程必须先在状态锁内提交 `STOPPING`，再调用后端 stop；`TERMINATED` 只能在所有已启动 worker 完成 `join` 后提交。
+
+worker 使用动态登记与封口，不在构建 supervisor 时猜测 LMAX topology 的消费者数量：
+
+1. `markStarting()` 后允许托管 ThreadFactory 登记 worker；预先构造的 EventLoop worker 也可在 `NEW` 登记。
+2. 后端完成全部线程创建和启动后调用 `sealWorkers()`；封口后的登记数成为本生命周期的预期 worker 数。
+3. wrapper 入场时记录 `startedWorkers` 和 `aliveWorkers`，并完成只读 `workersStarted()` 信号。
+4. `markRunning()` 只允许在登记已封口、worker 数大于 0、全部登记 worker 已入场且仍存活时执行。
+5. wrapper 只允许在 `STARTING/RUNNING` 入场；在 `NEW/STOPPING/TERMINATED` 不执行用户 runnable。每个线程只能经历一次 `REGISTERED → ALIVE → EXITED`。
+6. worker 在 `STARTING/RUNNING/QUIESCING` 正常或异常提前退出都属于基础设施故障并触发 fail-stop；只有 `STOPPING` 中的普通退出是预期退出。
 
 健康由快照派生，不增加可独立漂移的状态机：
 
 - `NEW/STARTING`：`STARTING`；
-- `RUNNING` 且全部已创建消费者线程存活、无故障：`HEALTHY`；
-- `RUNNING` 但消费者数量不足或已有故障：`UNHEALTHY`；
+- `RUNNING` 且登记已封口、全部已启动 worker 存活、无故障：`HEALTHY`；
+- `RUNNING` 但 worker 数量不足或已有故障：`UNHEALTHY`；
 - `QUIESCING/STOPPING`：`OUT_OF_SERVICE`；
 - `TERMINATED`：`TERMINATED`。
 
-`PipelineSnapshot` 至少包含：管道名、生命周期、健康、是否接受发布、预期/已创建/存活消费者数、RingBuffer 容量和近似积压、首个故障、是否优雅终止。
-
-`PipelineSnapshot.builder()` 只接收除 `health` 外的状态事实字段；`build()` 内部派生健康状态，再通过 canonical constructor 保持所有不变量校验。
-
 故障与生命周期分轴。关闭期间不得清除、包装掉或用后续异常覆盖首个故障。
 
-### 消费者监督
+### 启动协议
 
-托管 `ThreadFactory` 包装每个 LMAX 消费线程：
+LMAX 管道的启动顺序是：
 
-1. 线程进入时登记存活；
-2. 正常退出时注销；
-3. `RUNNING` 期间退出，无论由未捕获异常还是 processor 意外返回，都触发该管道 fail-stop；
-4. 捕获到的异常原样重新抛出，让用户配置的 `UncaughtExceptionHandler` 仍能收到原始异常；
-5. 故障回调只请求停止，不在当前消费者线程中等待终止。
+1. supervisor 进入 `STARTING`；
+2. 调用 `Disruptor.start()`，由托管 ThreadFactory 动态登记并启动全部 processor 线程；
+3. `Disruptor.start()` 返回后封口 worker 登记；
+4. 等待全部 worker 实际入场，再提交 `RUNNING` 和启动完成信号；
+5. 任一步失败都锁存原始首因并使用同一 lifecycle 进入 `IMMEDIATE` 回滚。
 
-一个消费者失败后：立即关闭发布准入、锁存首个故障、halt 其余 processor、唤醒容量等待者，并在控制线程中等待其他消费线程退出。不会停止 Runtime 中无关的其他管道。
+这样支持 LMAX 任意原生 topology，不依赖反射读取 ConsumerRepository，也不把线程已创建误认为线程已运行。
 
 ### 发布协议
 
@@ -100,33 +123,40 @@ PublicationResult tryPublishEvent(...);
 PublicationResult publishEvent(..., Duration timeout) throws InterruptedException;
 ```
 
-结果固定为：
+结果固定为：`PUBLISHED`、`CAPACITY_EXHAUSTED`、`TIMED_OUT`、`NOT_RUNNING`、`PIPELINE_FAILED`。
 
-- `PUBLISHED`：事件已经发布；
-- `CAPACITY_EXHAUSTED`：非阻塞尝试时容量不足；
-- `TIMED_OUT`：有界等待到期；
-- `NOT_RUNNING`：未启动或已开始关闭；
-- `PIPELINE_FAILED`：管道已锁存故障。
+有界等待通过反复调用 LMAX `tryPublishEvent` 实现，绝不手工 claim。等待循环必须检查中断、截止时间、生命周期和管道故障；关闭或故障必须唤醒等待者。translator 只会在成功取得容量后执行，仍遵守“translator 不得抛出业务异常”的 LMAX 约束。
 
-有界等待通过反复调用 LMAX `tryPublishEvent` 实现，绝不手工 claim。等待循环必须检查中断、截止时间、发布准入和管道故障；关闭或故障必须唤醒等待者。translator 只会在成功取得容量后执行，仍遵守“translator 不得抛出业务异常”的 LMAX 约束。
+`unsafeRingBuffer()` 保留完整 LMAX API，包括批量、varargs、原始 sequence claim/publish。名称明确表示它绕过受管生命周期。
 
-`unsafeRingBuffer()` 保留完整 LMAX API，包括批量、varargs、原始 sequence claim/publish。名称继续明确表示它绕过受管生命周期，而不是 RingBuffer 本身线程不安全。
+### LMAX 关闭映射
 
-### 关闭协议
+`ManagedPipeline` 不调用可能阻塞排空的 LMAX `Disruptor.shutdown(timeout)`，也不再提供自带等待的 `shutdown/haltNow` 实现。其 `ShutdownBackend` 映射为：
 
-优雅关闭：
+- `beginQuiesce()`：唤醒受管发布等待者；生命周期状态已经拒绝新发布。
+- `isDrained()`：先等待已获准 publisher 数归零，只在归零后捕获一次固定 cursor；所有叶子 gating sequence 到达目标后返回 true。
+- `stop(GRACEFUL)`：排空提交后调用非阻塞 `disruptor.halt()`。
+- `stop(IMMEDIATE)`：直接调用 `disruptor.halt()`；supervisor 同时中断仍存活 worker。
 
-1. CAS 进入 `QUIESCING`，拒绝新发布并唤醒等待者；
-2. 等待已经获准的发布完成；
-3. 捕获固定目标 cursor；
-4. 等待所有叶子 gating sequence 越过目标；
-5. 进入 `STOPPING`，调用 LMAX `halt()`；
-6. 中断并等待仍存活线程；
-7. 完成终止快照与 `termination()`。
+优雅关闭固定经过：关闭准入 → 等在途发布 → 捕获 cursor → 等叶子 sequence → `STOPPING` → halt → join。故障或立即停止不等待 gating sequence。
 
-故障或立即停止不等待无法推进的 gating sequence，直接 halt、唤醒和 join。关闭 deadline 只用于判定优雅等待或普通 join 已经超时：到期时锁存首个 `WorkerTerminationTimeoutException`、把请求模式单调升级为 `IMMEDIATE`、中断 worker，并由同一个控制线程串行执行一次 `StopAction(IMMEDIATE)`；deadline 不因升级而延长。
+### deadline、首因与真实终止
 
-超时不是终止捷径。抗中断 worker 仍存活时，生命周期保持 `STOPPING`，`termination()` 不完成；控制线程在 deadline 后通过线程终止通知继续等待，不做忙轮询。只有所有已经进入监督范围的 worker 实际退出，才能在同一状态锁内提交 `TERMINATED` 和终止快照。因此 `TERMINATED` 永远蕴含存活 worker 数为 0，该语义同时适用于后续 `EventLoop` 的 `awaitTermination`。线程退出、停止异常和超时都聚合到终止结果，但首个故障保持主因。
+`ShutdownDeadline.after(Duration)` 使用饱和加法生成绝对 `deadlineNanos`。第一次关闭请求或自主故障冻结 deadline，重复请求和 `IMMEDIATE` 升级不得延长。独立管道/EventLoop 使用自己的默认 shutdown timeout；Runtime/Group 在首次请求前创建一个共享 deadline 并传给全部 child。
+
+控制线程只做非阻塞 drain probe 和有界等待，因此 deadline 不会被后端排空回调卡住。外部 `IMMEDIATE` 请求在线性化点直接把 `QUIESCING` 升级为 `STOPPING`、中断 worker 并唤醒控制线程；控制线程随后串行执行 immediate stop。
+
+deadline 到期只做三件事：若尚无首因则记录 `WorkerTerminationTimeoutException`、把模式升级为 `IMMEDIATE`、中断并强制停止后端。它不是终止捷径。抗中断 worker 仍存活时生命周期保持 `STOPPING`，`termination()` 不完成；控制线程继续等待实际线程死亡。只有后端停止动作已经执行、所有实际启动的 worker 完成 `join`，才能在状态锁内提交 `TERMINATED` 和终止快照。
+
+worker 退出前的引用清理、Future 终态化和模块 stop 属于 worker 自己的 `finally`。因此线程真实退出自然蕴含后端 cleanup 已完成，supervisor 不另设会阻塞的 cleanup 回调。
+
+`gracefulTermination` 只有同时满足以下事实才为 true：曾成功进入 `RUNNING`、graceful drain 已提交、已执行 graceful stop、最终模式仍为 `GRACEFUL`、无故障、全部登记 worker 都曾入场且已真实退出。
+
+### Runtime 聚合
+
+Runtime 为一次关闭创建一个 `ShutdownDeadline`，先向所有管道广播相同 deadline 的关闭请求，再聚合等待；不能为每条管道重新计算 timeout。到共同 deadline 时，对尚未终止的管道使用原 deadline 升级 `IMMEDIATE` 并返回或抛出聚合结果，后台继续等待 child 的真实 termination。
+
+Runtime 自身只有在所有 child 真正终止后才能提交终止状态。启动失败回滚也使用同一个绝对 deadline；不得在仍有 child 处于 `STOPPING` 时把 Runtime 标记为已终止。
 
 ### Spring 可观测性
 
@@ -135,37 +165,43 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 - `disruptor.runtime.healthy`
 - `disruptor.pipeline.healthy`
 - `disruptor.pipeline.consumers.total`
+- `disruptor.pipeline.consumers.started`
 - `disruptor.pipeline.consumers.alive`
 
 指标标签不包含异常类型或消息，避免高基数。Actuator 健康状态映射为：正常 `UP`，锁存故障 `DOWN`，未运行或关闭中 `OUT_OF_SERVICE`。具体故障只出现在健康详情和一次性日志中。
 
-## 关键不变量
+## 快照不变量
 
-- 管道只有一个生命周期与故障事实源。
-- 所有队列后端共享同一个 `WorkerSupervisor` 状态、故障和终止契约。
-- `RUNNING + HEALTHY` 必须意味着所有预期消费者均存活。
+- `0 <= aliveWorkers <= startedWorkers <= registeredWorkers`，封口后 `expectedWorkers == registeredWorkers`。
+- `RUNNING` 蕴含登记已封口、worker 数大于 0、全部登记 worker 已启动且存活。
+- `TERMINATED` 蕴含存活 worker/consumer 数为 0，且所有实际启动线程已经完成 `join`。
+- `gracefulTermination` 蕴含 `TERMINATED + GRACEFUL + 无故障 + reachedRunning + drainCommitted + gracefulStopApplied + startedWorkers == registeredWorkers + aliveWorkers == 0`。
+- 公开 `PipelineSnapshot` 的优雅终止还蕴含不再接收发布、created/started 数与封口 worker 数一致。
+- 所有队列后端共享同一个 supervisor 状态、首因、deadline 和终止契约。
 - 已接受发布要么完成发布并纳入关闭目标，要么调用方收到明确非成功结果。
 - 关闭、失败或中断后，没有受管发布者永久等待容量。
 - 消费线程永远不等待自身终止。
-- deadline 到期只触发首因和 `IMMEDIATE` 升级，不得在 worker 存活时完成 `termination()`。
-- 内部 `WorkerSnapshot` 与公开 `PipelineSnapshot` 的 `TERMINATED` 快照中，存活 worker/consumer 数必须为 0。
 - Runtime 关闭耗时受单一总截止时间约束，不随管道数量线性叠加。
 - 快照、健康和指标不得改变 RingBuffer 热路径。
 
 ## 验证
 
-- 消费者正常、异常和无异常提前退出的监督测试；
-- 多消费者中一个失败后整条管道 fail-stop；
-- RingBuffer 满时非阻塞、超时、中断、关闭和故障发布测试；
-- 发布与 quiesce 竞态测试；
-- 关闭从消费线程发起时不死锁；
-- 启动失败回滚、共享截止时间和终止主因测试；
-- 快照、Micrometer 和 Actuator 状态一致性测试；
-- 原生 topology、rewind、自定义 processor 与 `maxBatchSize` 回归测试。
+- NEW worker 不执行用户任务，未全部入场不能进入 RUNNING；
+- worker 在 STARTING、RUNNING、QUIESCING 提前退出均 fail-stop；
+- drain 一直 pending 时，外部立即升级和 deadline 强制升级都不依赖回调返回；
+- 后端阶段动作不并发，每个模式至多应用一次；
+- `QUIESCING → STOPPING → TERMINATED` 顺序和中间状态可观察；
+- 抗中断 worker 退出前 termination 不完成；
+- LMAX 在途 publisher、固定 cursor、叶子 gating 和 halt 顺序；
+- RingBuffer 满时非阻塞、超时、中断、关闭和故障发布；
+- 多管道启动失败回滚、共享截止时间、首因和真实终止聚合；
+- 快照、Micrometer 和 Actuator 状态一致性；
+- 原生 topology、rewind、自定义 processor 与 `maxBatchSize` 回归。
 
 ## 参考
 
-- LMAX Disruptor 4.0.0 `MultiProducerSequencer`、`BatchEventProcessorBuilder` 与官方用户文档；
+- LMAX Disruptor 4.0.0 `BatchEventProcessor.halt()`、`Disruptor.shutdown()`、`MultiProducerSequencer` 与官方用户文档；
 - Apache Log4j2 `AsyncLoggerDisruptor` 的发布停止与关闭顺序；
 - Agrona `AgentRunner` 的线程生命周期和异常处理边界；
-- `cn.wjybxx.commons.disruptor` 的 `ProducerBarrier`、可中断 claim 和消费者屏障设计。
+- `cn.wjybxx.commons.disruptor` 的 `ProducerBarrier`、`ConsumerBarrier.alert()`、可中断 claim 和 gating barrier 移除；
+- `Commons-Concurrent` 的 `DisruptorEventLoop` 分阶段关闭与 worker-owned cleanup。

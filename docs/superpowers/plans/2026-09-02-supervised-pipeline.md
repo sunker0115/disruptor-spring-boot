@@ -4,7 +4,7 @@
 
 **Goal:** 将 `disruptor-core` 重构为具备消费者监督、有界可中断发布、统一状态快照和异步终止信号的单管道运行时，并接入 Spring 健康与指标。
 
-**Architecture:** `WorkerSupervisor` 负责线程状态、首个故障和非阻塞停止控制；`ManagedPipeline` 组合它完成 LMAX 发布、排空和 halt；`DisruptorRuntime` 只聚合多条管道。所有运行状态由 `PipelineSnapshot` 对外呈现。
+**Architecture:** `WorkerSupervisor` 以单一状态锁和命名虚拟控制线程统一 worker 入场、生命周期、首因、共享绝对截止时间和真实终止；内部 `ShutdownBackend` 只提供非阻塞 `beginQuiesce/isDrained/stop` 阶段动作。`ManagedPipeline` 只把 LMAX 发布握手、gating 排空和 halt 映射到该协议；`DisruptorRuntime` 广播同一个 `ShutdownDeadline` 并聚合 child 的真实终止。
 
 **Tech Stack:** Java 21、LMAX Disruptor 4.0.0、JUnit 5、Spring Boot 4.1.0、Micrometer、Maven 3.9.9。
 
@@ -72,8 +72,10 @@ void runningPipelineIsHealthyOnlyWhenEveryConsumerIsAlive() {
                     .name("orders")
                     .lifecycle(PipelineLifecycle.RUNNING)
                     .acceptingPublications(true)
+                    .registrationSealed(true)
                     .expectedConsumers(2)
                     .createdConsumers(2)
+                    .startedConsumers(2)
                     .aliveConsumers(2)
                     .bufferSize(16)
                     .backlog(0)
@@ -85,8 +87,10 @@ void runningPipelineIsHealthyOnlyWhenEveryConsumerIsAlive() {
                     .name("orders")
                     .lifecycle(PipelineLifecycle.RUNNING)
                     .acceptingPublications(false)
+                    .registrationSealed(true)
                     .expectedConsumers(2)
                     .createdConsumers(2)
+                    .startedConsumers(2)
                     .aliveConsumers(1)
                     .bufferSize(16)
                     .backlog(3)
@@ -113,7 +117,7 @@ public enum PublicationResult { PUBLISHED, CAPACITY_EXHAUSTED, TIMED_OUT, NOT_RU
 public enum ShutdownMode { GRACEFUL, IMMEDIATE }
 ```
 
-`PipelineSnapshot.builder()` 只接收状态事实字段，并在 `build()` 内按生命周期、消费者计数和 failure 派生 health；canonical constructor 拒绝负数、存活数大于已创建数及已创建数大于预期数。
+`PipelineSnapshot.builder()` 只接收状态事实字段，并在 `build()` 内按生命周期、登记是否封口、消费者计数和 failure 派生 health；canonical constructor 校验 `alive <= started <= created <= expected`。`RUNNING` 要求登记已封口且全部 expected consumer 已启动并存活；`TERMINATED` 要求 alive 为 0。`gracefulTermination` 还要求不再接收发布、无 failure，并由 supervisor 已提交的 `reachedRunning/drainCommitted/gracefulStopApplied` 历史事实产生，不能仅按终态猜测。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -130,37 +134,25 @@ git add disruptor-core/pom.xml disruptor-core/src/main/java/com/sstlfsj/disrupto
 git commit -m "feat(core): add pipeline state snapshots"
 ```
 
-### Task 3: 实现 WorkerSupervisor
+### Task 3: 重构统一受监督生命周期
 
 **Files:**
 
-- Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSupervisor.java`
-- Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSnapshot.java`
+- Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownDeadline.java`
+- Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownBackend.java`
+- Rewrite: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSupervisor.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSnapshot.java`
 - Test: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/WorkerSupervisorTest.java`
 
-- [ ] **Step 1: 写首因和自停止失败测试**
+- [ ] **Step 1: 用非阻塞阶段协议替换旧停止契约并写测试**
 
-```java
-@Test
-void failureKeepsOriginalCauseAndNeverJoinsCurrentWorker() throws Exception {
-    RuntimeException boom = new RuntimeException("boom");
-    CountDownLatch stopRequested = new CountDownLatch(1);
-    WorkerSupervisor supervisor = WorkerSupervisor.builder("orders")
-            .expectedWorkers(1)
-            .shutdownTimeout(Duration.ofSeconds(1))
-            .stopAction((mode, deadline) -> stopRequested.countDown())
-            .build();
+删除“单一回调自行排空和停止”的旧契约及其测试。用可记录调用线程、并发深度和动作序列的 fake `ShutdownBackend` 验证：
 
-    Thread worker = Thread.ofPlatform().unstarted(supervisor.supervise(() -> { throw boom; }));
-    supervisor.register(worker);
-    supervisor.markRunning();
-    worker.start();
-
-    assertTrue(stopRequested.await(1, TimeUnit.SECONDS));
-    assertSame(boom, supervisor.termination().toCompletableFuture()
-            .get(1, TimeUnit.SECONDS).failure());
-}
-```
+- `beginQuiesce()` 至多一次；
+- `isDrained()` 只在 `QUIESCING` 被重复探测；
+- `stop(GRACEFUL)`、`stop(IMMEDIATE)` 各至多一次且严格串行；
+- 后端方法不在 supervisor 状态锁或调用方线程内执行；
+- 后端异常锁存为首因并升级 immediate。
 
 - [ ] **Step 2: 确认红灯**
 
@@ -168,27 +160,58 @@ void failureKeepsOriginalCauseAndNeverJoinsCurrentWorker() throws Exception {
 $MVN -pl disruptor-core -Dtest=WorkerSupervisorTest test
 ```
 
-Expected: 缺少 `WorkerSupervisor`。
+Expected: 旧 `WorkerSupervisor` 仍依赖单一阻塞停止回调，且缺少 `ShutdownDeadline/ShutdownBackend`、动态登记封口和 started worker 事实。
 
-- [ ] **Step 3: 实现最小监督器**
+- [ ] **Step 3: 实现绝对截止时间和动态 worker 入场**
+
+`ShutdownDeadline.after(Duration)` 使用饱和加法生成不可变 `deadlineNanos`。supervisor 第一次接受关闭请求后冻结 deadline，重复请求或模式升级不能延长。
 
 ```java
 public final class WorkerSupervisor {
     public Runnable supervise(Runnable worker);
     public void register(Thread thread);
     public void markStarting();
+    public void sealWorkers();
+    public CompletionStage<Void> workersStarted();
     public void markRunning();
+    public void fail(Throwable failure);
     public void requestShutdown(ShutdownMode mode);
+    public void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline);
     public CompletionStage<WorkerSnapshot> termination();
     public WorkerSnapshot snapshot();
 }
 ```
 
-实现使用单一状态锁线性化生命周期、首因和单调停机模式；停止动作只在命名 JDK 21 虚拟控制线程串行执行，每个实际模式至多一次；worker 包装器在记录后原样重抛 Throwable。deadline 到期只锁存超时首因、升级 `IMMEDIATE` 并中断 worker，不得提前完成 `termination()`；控制线程在 deadline 后通过线程终止通知等待实际退出，不做忙轮询，也不延长 deadline。
+supervisor builder 保留默认 `shutdownTimeout`，只用于独立关闭和自主 worker 故障；Runtime/Group 可以在首次请求时传入共享 deadline。登记允许发生在未封口的 `NEW/STARTING`；`sealWorkers()` 后登记数成为本生命周期 expected 数。wrapper 只允许在 `STARTING/RUNNING` 入场，并记录 `REGISTERED → ALIVE → EXITED`；`markRunning()` 要求登记已封口、至少一个 worker、`started == alive == registered`。NEW 下启动、重复入场和封口后登记都必须失败且不执行用户任务。
 
-- [ ] **Step 4: 补齐竞态测试并运行**
+- [ ] **Step 4: 实现非阻塞分阶段控制状态机**
 
-补充重复停止、正常提前返回、关闭与失败同时发生、UncaughtExceptionHandler 收到同一异常、超时升级动作序列，以及抗中断 worker 全部退出后才完成 termination。
+使用单一状态锁线性化生命周期、首因、首次 deadline 和单调停机模式。`requestShutdown` 只更新状态并启动/唤醒命名虚拟控制线程；后端动作由该线程串行执行，绝不在状态锁内执行。
+
+控制循环必须满足：
+
+- RUNNING graceful：`QUIESCING → drain committed → STOPPING → stop(GRACEFUL)`；
+- immediate、失败或超时：从任意非终止状态进入 `STOPPING → stop(IMMEDIATE)`；
+- graceful stop 后 worker 超时仍可串行升级一次 immediate stop；
+- drain probe 返回 true 后在状态锁内重新确认仍为 `GRACEFUL + QUIESCING`，并发 immediate、故障或 deadline 必须胜出；
+- drain probe 和 worker 等待均使用原始绝对 deadline；
+- deadline 到期只记录首因、升级和中断，worker 存活时不完成 termination；
+- worker 完成 `finally` 且控制线程 `join` 确认真实死亡后才提交 `TERMINATED`。
+
+- [ ] **Step 5: 补齐架构级状态机测试**
+
+至少覆盖：
+
+- drain 一直 pending 时，外部 `IMMEDIATE` 无需释放阻塞回调即可进入 `STOPPING` 并调用 immediate stop；
+- drain probe 返回 true 与并发 immediate/故障竞态时不能提交 graceful stop；
+- graceful deadline 到期沿用首次 deadline，不延长；
+- `QUIESCING` 和 `STOPPING` 均可观察，不允许 `QUIESCING → TERMINATED`；
+- worker 在 `STARTING/RUNNING/QUIESCING` 正常或异常提前退出都 fail-stop；
+- worker 从自身请求关闭不自等待，原始 Throwable 仍交给 UncaughtExceptionHandler；
+- 抗中断 worker 存活时 termination 未完成，真实退出后才完成；
+- 首因不被停止异常、超时或后续 worker 异常覆盖；
+- graceful flag 只在 `reachedRunning + drainCommitted + gracefulStopApplied + 全部 started worker 真实退出` 时成立；
+- `WorkerSnapshot` 校验 `alive <= started <= registered`、sealed expected 和 graceful path 不变量。
 
 ```bash
 $MVN -pl disruptor-core -Dtest=WorkerSupervisorTest test
@@ -196,11 +219,11 @@ $MVN -pl disruptor-core -Dtest=WorkerSupervisorTest test
 
 Expected: `BUILD SUCCESS`。
 
-- [ ] **Step 5: 提交监督器**
+- [ ] **Step 6: 提交统一生命周期**
 
 ```bash
-git add disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSupervisor.java disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSnapshot.java disruptor-core/src/test/java/com/sstlfsj/disruptor/core/WorkerSupervisorTest.java
-git commit -m "feat(core): supervise consumer workers"
+git add disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownDeadline.java disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownBackend.java disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSupervisor.java disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSnapshot.java disruptor-core/src/test/java/com/sstlfsj/disruptor/core/WorkerSupervisorTest.java
+git commit -m "refactor(core): define supervised shutdown lifecycle"
 ```
 
 ### Task 4: 把 ManagedPipeline 提升为独立生命周期单元
@@ -214,24 +237,9 @@ git commit -m "feat(core): supervise consumer workers"
 - Test: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/DisruptorRuntimeTest.java`
 - Test: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/ExceptionHandlingTest.java`
 
-- [ ] **Step 1: 写单管道终止和消费者 fail-stop 测试**
+- [ ] **Step 1: 写 LMAX 阶段映射和独立管道失败测试**
 
-```java
-@Test
-void oneConsumerFailureFailsOnlyItsPipeline() throws Exception {
-    RuntimeException boom = new RuntimeException("boom");
-    DisruptorRuntime runtime = runtimeWithFailingAndHealthyPipelines(boom);
-    runtime.start();
-    PipelineHandle<TestEvent> failed = runtime.require("failed", TestEvent.class);
-
-    assertTrue(failed.tryPublishEvent((event, sequence) -> {}));
-    awaitCondition(() -> failed.snapshot().failure() == boom, Duration.ofSeconds(1));
-
-    assertEquals(PipelineHealth.UNHEALTHY, failed.snapshot().health());
-    assertEquals(PipelineHealth.HEALTHY,
-            runtime.require("healthy", TestEvent.class).snapshot().health());
-}
-```
+覆盖在途 publisher 未归零前不能捕获 drain cursor、只捕获一次固定 cursor、所有叶子 gating 到达目标后才提交 drain，以及 `disruptor.halt()` 只在进入 `STOPPING` 后调用。一个消费者失败只能 fail-stop 所属管道，其他命名管道保持健康。
 
 - [ ] **Step 2: 运行新测试确认红灯**
 
@@ -239,27 +247,37 @@ void oneConsumerFailureFailsOnlyItsPipeline() throws Exception {
 $MVN -pl disruptor-core -Dtest=DisruptorPipelineTest test
 ```
 
-Expected: 缺少 `DisruptorPipeline`、`snapshot()` 或发布结果签名。
+Expected: `ManagedPipeline.shutdown/haltNow` 仍把排空、halt 和 join 混在阻塞方法中，尚未实现 `ShutdownBackend`。
 
-- [ ] **Step 3: 实现单管道接口和 ManagedPipeline 组合**
+- [ ] **Step 3: 实现单管道接口和 LMAX ShutdownBackend**
 
 ```java
 public interface DisruptorPipeline<E> {
     PipelineHandle<E> handle();
     PipelineSnapshot snapshot();
-    void start();
-    void requestShutdown(ShutdownMode mode);
+    CompletionStage<Void> start();
+    void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline);
     CompletionStage<PipelineSnapshot> termination();
 }
 ```
 
-`ManagedPipeline` 实现该接口并使用 `WorkerSupervisor` 包装 ThreadFactory。故障停止不等待 gating sequence；优雅停止仍按“关闭准入、等在途发布、捕获 cursor、等叶子 sequence、halt、join”执行。
+`ManagedPipeline` 实现接口并用 supervisor 包装 ThreadFactory。启动按 `markStarting → Disruptor.start → sealWorkers → workersStarted → markRunning` 执行。删除阻塞的 `shutdown/haltNow/StopResult`；后端只实现：
 
-- [ ] **Step 4: 重写 Runtime 为聚合器**
+- `beginQuiesce` 唤醒受管发布等待者；
+- `isDrained` 等在途 publisher 归零后捕获一次 cursor，再检查叶子 gating；
+- `stop` 调用非阻塞 `disruptor.halt()`，不 join、不等待 backlog。
 
-Runtime `shutdown()` 先向全部管道请求 `GRACEFUL`，再按同一绝对截止时间等待；启动失败向已尝试管道请求 `IMMEDIATE`。保留按名称和事件类型查找。
+`PipelineSnapshot` 增加 started/sealed 事实，并收紧 `RUNNING`、`TERMINATED` 和 graceful path 校验。
+
+- [ ] **Step 4: 重写 Runtime 为共享 deadline 聚合器**
+
+Runtime 一次关闭只创建一个 `ShutdownDeadline`，先向全部管道广播同一个 graceful 请求，再并行聚合 termination。到 deadline 时，对未终止 child 使用原 deadline 升级 immediate 并返回/抛出聚合结果；后台继续等待真实终止。Runtime 只有在全部 child 的 termination 完成后才能提交自身终止状态。
+
+启动失败回滚同样向全部已尝试管道广播同一个 immediate deadline；保留按名称和事件类型查找，不恢复另一套管道状态判断。
 
 - [ ] **Step 5: 运行生命周期回归测试**
+
+新增多管道共享同一绝对 deadline、Runtime 不随 child 数量线性延长、超时后 child 仍处于 `STOPPING`、最后一个 child 真实退出后 Runtime 才终止，以及任意原生 topology 动态登记/封口的测试。
 
 ```bash
 $MVN -pl disruptor-core -Dtest=DisruptorPipelineTest,DisruptorRuntimeTest,ExceptionHandlingTest,NativeCapabilitiesTest test
@@ -376,7 +394,7 @@ Expected: 健康贡献器不存在。
 
 - [ ] **Step 3: 实现条件化健康装配与 Gauge**
 
-使用 Boot 4.1 `org.springframework.boot.health.contributor` API。增加 runtime/pipeline healthy、consumer total/alive；failure 只放健康详情，不放 meter 标签。
+使用 Boot 4.1 `org.springframework.boot.health.contributor` API。增加 runtime/pipeline healthy、consumer total/started/alive；failure 只放健康详情，不放 meter 标签。
 
 - [ ] **Step 4: 运行自动配置测试**
 

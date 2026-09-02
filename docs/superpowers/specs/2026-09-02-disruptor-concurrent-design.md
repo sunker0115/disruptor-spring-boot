@@ -25,13 +25,14 @@ disruptor-concurrent(optional)├─> disruptor-spring-boot-autoconfigure -> sta
 ## 目标
 
 - 提供标准 `ScheduledExecutorService`，可直接用于 Spring、JDK 和 `CompletableFuture`。
-- 单个 EventLoop 严格单线程，有界队列，明确背压和拒绝原因。
-- 普通任务、定时登记和用户命令共享一个 RingBuffer 全序入口。
+- 单个 EventLoop 严格单线程，默认有界、显式无界，并对有界容量给出明确背压和拒绝原因。
+- 普通任务、定时登记和用户命令共享一个 `TaskQueue` 全序入口。
 - 定时任务在持续普通任务流量下不饥饿，空闲时不固定周期轮询。
 - 支持固定 EventLoopGroup、轮询选择和稳定 affinity-key 选择。
 - 提供协作取消、取消原因、截止时间、执行次数、优先级和上下文传播的类型安全 API。
 - 提供模块化启动、更新、停止 hook，覆盖 Commons 的 Agent/Module 业务场景。
-- 复用 core 的生命周期、故障、终止与快照，不复制第二套监督状态机。
+- 有界和无界实现共享同一个 `EventLoopKernel`、worker 和 core `WorkerSupervisor`，只替换 `TaskQueue` 后端。
+- 复用 core 的生命周期、首因、共享绝对截止时间、动态 worker 入场、终止与快照，不复制第二套监督状态机。
 - 以功能矩阵、并发测试和 JMH 证明相对 Commons 没有未声明退化。
 
 ## 方案比较
@@ -40,7 +41,7 @@ disruptor-concurrent(optional)├─> disruptor-spring-boot-autoconfigure -> sta
 | --- | --- | --- | --- |
 | concurrent 直接创建 LMAX RingBuffer 并自建状态机 | 实现自由 | 复制 core 的关闭、故障和发布竞态，长期漂移 | 不采用 |
 | 包装 `ScheduledThreadPoolExecutor` | 标准 API 快速 | 定时队列无界，任务执行绕过 RingBuffer，模块名和性能目标失真 | 不采用 |
-| core 受监督管道上的专用 EventLoop | 生命周期统一，保留 RingBuffer 顺序与背压，可独立演进任务语义 | 需要 core 先完成单管道重构 | 采用 |
+| 共享 EventLoopKernel + core 统一监督器 + 可替换 TaskQueue | Future、timer、module、shutdown 和 Group 只有一套语义，有界仍保留 LMAX RingBuffer 顺序与背压 | 需要 core 先完成分阶段监督生命周期 | 采用 |
 
 ## 公共 API
 
@@ -60,7 +61,7 @@ boolean tryExecute(Runnable command);
 
 标准 `execute/submit/invokeAll/invokeAny/schedule/scheduleAtFixedRate/scheduleWithFixedDelay` 保持 JDK 契约。`start()` 完成表示消费者已进入循环，而不是仅创建线程。`termination()` 返回只读 stage。
 
-Builder 配置：名称、bufferSize、maxBatchSize、ThreadFactory、任务异常处理器、容量模式和模块列表。Executor 固定为多生产者语义；`SINGLE` 只允许作为经过验证的内部优化，不能成为会被业务误用的普通配置。
+Builder 配置：名称、bufferSize、maxBatchSize、shutdownTimeout、ThreadFactory、任务异常处理器、容量模式和模块列表。Executor 固定为多生产者语义；`SINGLE` 只允许作为经过验证的内部优化，不能成为会被业务误用的普通配置。
 
 ### EventLoopGroup
 
@@ -72,7 +73,7 @@ Builder 配置：名称、bufferSize、maxBatchSize、ThreadFactory、任务异�
 - Group 自身提交和调度委派给选中的 child；
 - 单 child 内有序，跨 child 明确无序；
 - 任一 child 发生基础设施故障，Group 锁存首因并 fail-stop，不能静默重映射 affinity key；
-- Group 关闭先同时请求全部 child 停止，再聚合等待终止。
+- Group 关闭创建一个 `ShutdownDeadline`，先向全部 child 传递相同绝对 deadline 并同时请求停止，再聚合真实终止；任一 child 未真实退出时 Group 不能提交 terminated。
 
 ### 高级任务语义
 
@@ -102,6 +103,20 @@ Commons 的自定义用户事件和原始 sequence 发布由项目整体能力�
 
 ## 内部执行模型
 
+### 共享 EventLoopKernel
+
+`DisruptorEventLoop` 和 `UnboundedEventLoop` 都是同一个 `EventLoopKernel` 的门面。kernel 唯一拥有：
+
+- 标准 Executor/Future 的接受、执行、失败和取消终态；
+- timer heap、cancellation mailbox 和调度顺序；
+- module 的启动、更新、逆序停止；
+- core `WorkerSupervisor`、单一 worker 和 lifecycle snapshot；
+- graceful/immediate shutdown、首因和 termination。
+
+`TaskQueue` 是唯一可替换边界，只负责 claim/offer、单消费者 poll、容量和引用清理。任何 TaskQueue 都不得拥有第二套生命周期、Future 或 module 状态。
+
+EventLoop 启动时登记单一 worker，进入 `STARTING` 后启动并封口；worker 完成 module `onStart` 后才能提交 `RUNNING`。NEW 下意外启动的 worker 不执行循环；worker 在 `STARTING/RUNNING/QUIESCING` 提前退出都由 supervisor 视为基础设施故障。
+
 ### 有界路径
 
 每个 EventLoop 内部是一条 `TaskSlot` 管道：
@@ -118,10 +133,10 @@ final class TaskSlot {
 
 ### 容量模式
 
-- `BOUNDED`：默认，由 `DisruptorEventLoop` 完全使用固定大小 LMAX RingBuffer；满时立即拒绝，生命周期复用 `DisruptorPipeline`。
-- `UNBOUNDED`：显式选择，由 `UnboundedEventLoop` 使用分段 MPSC RingBuffer；它是独立队列实现，不伪装成 LMAX 固定 RingBuffer，也不进入默认 starter 配置。worker 生命周期直接复用 core 的 `WorkerSupervisor` SPI。
+- `BOUNDED`：默认，`EventLoopKernel` 使用固定大小 LMAX RingBuffer `TaskQueue`；满时立即拒绝。它不嵌套应用事件 `DisruptorPipeline`，避免形成第二层生命周期。
+- `UNBOUNDED`：显式选择，同一个 `EventLoopKernel` 使用分段 MPSC `TaskQueue`；它不伪装成 LMAX 固定 RingBuffer，也不进入默认 starter 配置。
 
-两种后端实现同一个内部 `TaskQueue` 契约和相同生命周期测试。无界模式必须按块回收已消费引用，并提供当前已分配块数和待处理任务数指标。它只解决突发容量，不取消内存无限增长风险；文档和健康详情必须显式标注。两种实现共享 EventLoop 任务、调度、取消和模块逻辑，不共享错误的队列假设。
+两种后端实现同一个内部 `TaskQueue` 契约，并运行同一组 EventLoop 生命周期、Future、timer、module、shutdown 和 Group 契约测试。无界模式必须按块回收已消费引用，并提供当前已分配块数和待处理任务数指标。它只解决突发容量，不取消内存无限增长风险；文档和健康详情必须显式标注。
 
 ### 调度与顺序
 
@@ -159,6 +174,16 @@ priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或
 
 ## 关闭语义
 
+EventLoop 使用 core `ShutdownBackend` 的非阻塞阶段协议：
+
+- `beginQuiesce()` 只 unpark worker；
+- worker 在 `QUIESCING` 中处理关闭前已接受的任务、取消未来 timer 和周期任务，并在所有 Future 已终态化后发布 `drained`；
+- `isDrained()` 只读取该状态，不清队列、不等待 worker；
+- `stop(GRACEFUL)` unpark worker 进入退出 `finally`；
+- `stop(IMMEDIATE)` 发布强停标志并 unpark，supervisor 同时 interrupt worker。
+
+所有阶段动作由 supervisor 控制线程串行调用，绝不并发重入。Future 终态化、队列引用清理和 module stop 由 EventLoop worker 在退出前完成；supervisor `join` 确认线程真实死亡后才完成 termination。
+
 `shutdown()`：
 
 - 立即关闭新任务准入；
@@ -171,10 +196,14 @@ priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或
 - 立即停止领取新任务；
 - 取消所有未开始 Future；
 - 清理有界和无界队列引用；
-- 尽可能返回未开始的裸 `Runnable`；
+- 返回空列表；pending 队列只允许 EventLoop worker 消费，调用线程不能为收集返回值并发破坏单消费者所有权。该取舍与 Commons `DisruptorEventLoop.shutdownNow()` 一致；
 - 正在执行的任务收到 `cancel(true)` 和线程中断；任务退出后清除任务中断位，关闭控制只依赖原子状态与 unpark。
 
 任何已接受任务在终止前必须进入成功、失败或取消终态。基础设施故障同样完成所有未完成 Future，不能留下永久等待者。
+
+`shutdown()` 和 `shutdownNow()` 都只推进状态、冻结首次 `ShutdownDeadline` 并唤醒控制路径，调用方立即返回。graceful 固定经过 `RUNNING → QUIESCING → STOPPING → TERMINATED`；立即关闭、故障或 deadline 到期单调进入 `STOPPING`。deadline 到期只锁存首因并升级 immediate，不在 worker 存活时完成 termination。
+
+`EventLoopSnapshot` 包含 worker 登记是否封口、registered/started/alive 计数。`RUNNING` 蕴含单一 worker 已登记封口、启动且存活；`gracefulTermination` 只有 EventLoop 曾进入 `RUNNING`、graceful drain 已提交、graceful stop 已应用、最终仍为 graceful、无基础设施故障、单一 worker 已真实退出时成立。
 
 ## 与 Commons 的能力审计
 
@@ -201,11 +230,14 @@ priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或
 
 ## Spring 集成
 
-用户显式添加 concurrent 依赖并声明 `DisruptorEventLoop` 或 `DisruptorEventLoopGroup` Bean。自动配置提供一个 `SmartLifecycle` 聚合器：按 bean 顺序启动、逆序关闭，使用统一总截止时间；不会自动创建隐藏的全局 EventLoop。
+用户显式添加 concurrent 依赖并声明 `DisruptorEventLoop` 或 `DisruptorEventLoopGroup` Bean。自动配置提供一个 `SmartLifecycle` 聚合器：按 bean 顺序启动，关闭时创建一个 `ShutdownDeadline` 并向所有 bean 广播，再聚合真实终止；不会自动创建隐藏的全局 EventLoop。
 
 新增指标至少包括：
 
 - `disruptor.eventloop.healthy`
+- `disruptor.eventloop.worker.registered`
+- `disruptor.eventloop.worker.started`
+- `disruptor.eventloop.worker.alive`
 - `disruptor.eventloop.queue.pending`
 - `disruptor.eventloop.queue.remaining`
 - `disruptor.eventloop.scheduled.pending`
@@ -225,10 +257,12 @@ priority 只打破相同 deadline 的平局，不允许越过更早 deadline 或
 - loop 内满队列重入不死锁；
 - shutdown/publish、shutdown/cancel、故障/终止竞态；
 - shutdown 和 shutdownNow 的 Future 终态及引用清理；
+- bounded/unbounded 共享同一个 kernel、supervisor 和快照不变量；
+- graceful 的 `QUIESCING → STOPPING → TERMINATED`、deadline immediate 升级和真实线程终止；
 - 任务异常不击穿，基础设施异常 fail-stop；
 - 模块启动回滚、update 故障和逆序停止；
 - Group affinity 稳定、child 故障和聚合终止；
-- 有界/无界后端契约一致性及无界块回收；
+- 有界/无界 TaskQueue 契约一致性及无界块回收；
 - 虚假唤醒和 lost wakeup 压测；
 - Spring 生命周期、健康和 Micrometer 指标测试；
 - JMH 对比原生 RingBuffer、EventLoop、Commons EventLoop 与 JDK 单线程执行器，不设置机器敏感的硬阈值。

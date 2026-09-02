@@ -4,7 +4,7 @@
 
 **Goal:** 新增 `disruptor-concurrent`，提供受监督、有界或显式无界、严格单线程、支持高级调度与固定 Group 的标准 JDK Executor，并完成 Spring 集成和 Commons 能力审计。
 
-**Architecture:** 默认 `DisruptorEventLoop` 使用 LMAX MPSC RingBuffer 和 core `DisruptorPipeline`；`UnboundedEventLoop` 使用分段 MPSC 队列并复用 core `WorkerSupervisor`。两者共享任务、调度、取消、模块和快照实现，公共 API 为 `EventLoop`/`ScheduledExecutorService`。
+**Architecture:** `DisruptorEventLoop` 与 `UnboundedEventLoop` 共用唯一的 `EventLoopKernel`、单一 worker 和 core `WorkerSupervisor`；两者只替换 LMAX bounded 或 segmented MPSC unbounded `TaskQueue`。Future、timer、module、shutdown、快照、首因、共享 `ShutdownDeadline` 和 Group 终止全部由同一内核实现，公共 API 为 `EventLoop`/`ScheduledExecutorService`。
 
 **Tech Stack:** Java 21、LMAX Disruptor 4.0.0、JUnit 5、Spring Boot 4.1.0、Micrometer、JMH、Maven 3.9.9。
 
@@ -108,7 +108,7 @@ public interface EventLoop extends ScheduledExecutorService {
 }
 ```
 
-`EventLoopSnapshot` 包含状态、健康、容量模式、pending、remaining、scheduled、completed、failed、cancelled、首因和 worker 线程名。
+`EventLoopSnapshot` 包含状态、健康、容量模式、worker 登记是否封口、registered/started/alive、pending、remaining、scheduled、completed、failed、cancelled、首因和 worker 线程名。快照沿用 core 不变量：`RUNNING` 时单一 worker 必须已封口、启动且存活；`TERMINATED` 时 alive 为 0。
 
 - [ ] **Step 4: 实现 BoundedTaskQueue 最小契约**
 
@@ -122,15 +122,17 @@ git add disruptor-concurrent
 git commit -m "feat(concurrent): define event loop contracts"
 ```
 
-### Task 3: 实现有界 DisruptorEventLoop 与 ExecutorService
+### Task 3: 实现共享 EventLoopKernel、有界后端与 ExecutorService
 
 **Files:**
 
 - Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoop.java`
+- Create: `.../internal/EventLoopKernel.java`
 - Create: `.../internal/EventLoopWorker.java`
 - Create: `.../internal/SubmittedTask.java`
 - Test: `.../DisruptorEventLoopTest.java`
 - Test: `.../ExecutorContractTest.java`
+- Test: `.../EventLoopBackendContractTest.java`
 
 - [ ] **Step 1: 写启动、顺序、拒绝和终止失败测试**
 
@@ -155,17 +157,27 @@ $MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,ExecutorContractTest
 
 Expected: `build()` 尚未返回可运行实现或 Executor 方法未实现。
 
-- [ ] **Step 3: 实现 EventPoller worker**
+- [ ] **Step 3: 接入 core 统一监督生命周期**
+
+`EventLoopKernel` 唯一持有 core `WorkerSupervisor`。启动时登记单一 worker，进入 `STARTING` 后启动并封口；worker 完成已配置模块启动后调用 `markRunning()`。NEW 下意外启动不得执行循环；worker 在 `STARTING/RUNNING/QUIESCING` 提前退出必须 fail-stop。
+
+kernel 实现非阻塞 `ShutdownBackend`：`beginQuiesce` 只 unpark，`isDrained` 只读取 worker 发布的 drain 事实，`stop(GRACEFUL/IMMEDIATE)` 只发布停止意图并 unpark。所有后端动作由 supervisor 控制线程串行调用；Future 终态化、TaskQueue 引用清理和模块 stop 必须在 worker `finally` 中完成，线程被 join 后才能完成 termination。
+
+- [ ] **Step 4: 实现 EventPoller worker**
 
 循环必须按以下顺序：执行到期 timer、poll 最多 `maxBatchSize` 条、模块 update、按下一 deadline park。每次成功发布调用 `LockSupport.unpark(workerThread)`；检查为空与 park 之间的发布依赖 unpark permit 防止丢唤醒。
 
-- [ ] **Step 4: 实现 ExecutorService 终态**
+- [ ] **Step 5: 实现 ExecutorService 与关闭终态**
 
-`execute` 使用非阻塞 offer，拒绝时抛包含 `NOT_STARTED/FULL/SHUTTING_DOWN/FAILED` 的 `RejectedExecutionException`。`submit` 使用 FutureTask；`shutdown` 非阻塞，`shutdownNow` 返回未开始裸 Runnable；所有 accepted Future 在 termination 前终态化。
+`execute` 使用非阻塞 offer，拒绝时抛包含 `NOT_STARTED/FULL/SHUTTING_DOWN/FAILED` 的 `RejectedExecutionException`。`submit` 使用 FutureTask；`shutdown` 与 `shutdownNow` 都使用首次冻结的 `ShutdownDeadline` 非阻塞请求 supervisor。`shutdownNow` 返回空列表，pending 队列仍只由 worker 清理，避免调用线程破坏单消费者所有权；所有 accepted Future 在 termination 前终态化。
 
-- [ ] **Step 5: 补齐任务异常测试并通过**
+graceful 必须经历 `RUNNING → QUIESCING → STOPPING → TERMINATED`；立即停止、基础设施故障和 deadline 到期单调进入 `STOPPING`。deadline 只触发首因与 immediate 升级，worker 存活时 termination 不完成。graceful flag 要求 `reachedRunning + drainCommitted + gracefulStopApplied + 单一 worker 真实退出`。
+
+- [ ] **Step 6: 补齐任务异常与关闭架构测试并通过**
 
 裸任务的 `Throwable` 进入 `TaskExceptionHandler` 后继续循环；submit 的异常只进入 Future；只有任务边界之外的 processor/queue 异常触发 core supervisor。
+
+增加参数化后端契约：bounded/unbounded 必须共用同一 kernel 快照；`QUIESCING/STOPPING` 均可观察；drain pending 时 immediate 不受阻塞；抗中断任务退出前 termination 不完成；Future、timer、module cleanup 在 termination 前完成。
 
 ```bash
 $MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,ExecutorContractTest test
@@ -173,11 +185,11 @@ $MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,ExecutorContractTest
 
 Expected: `BUILD SUCCESS`。
 
-- [ ] **Step 6: 提交有界 EventLoop**
+- [ ] **Step 7: 提交共享内核和有界 EventLoop**
 
 ```bash
 git add disruptor-concurrent
-git commit -m "feat(concurrent): add bounded disruptor event loop"
+git commit -m "feat(concurrent): add supervised event loop kernel"
 ```
 
 ### Task 4: 实现取消令牌和确定性调度
@@ -328,13 +340,13 @@ void affinitySelectionIsStableForEveryIntKey() {
 $MVN -pl disruptor-concurrent -Dtest=EventLoopGroupTest test
 ```
 
-- [ ] **Step 3: 实现固定 children 和聚合生命周期**
+- [ ] **Step 3: 实现固定 children 和共享 deadline 聚合生命周期**
 
-`next()` 使用无锁递增和 `floorMod`；`select(key)` 使用稳定 hash spread 后 `floorMod`。任一 child 基础设施故障触发所有 child `shutdownNow`，不重新映射 key。
+`next()` 使用无锁递增和 `floorMod`；`select(key)` 使用稳定 hash spread 后 `floorMod`。任一 child 基础设施故障锁存 Group 首因，以同一个 `ShutdownDeadline` 触发所有 child immediate stop，不重新映射 key。Group 只有在全部 child 真实 termination 后才能提交 terminated。
 
 - [ ] **Step 4: 验证启动回滚、委派和终止**
 
-补充 Group execute/submit/schedule、单 child 顺序、启动失败回滚、同时发停止请求后聚合等待、不可变 iterator 测试。
+补充 Group execute/submit/schedule、单 child 顺序、启动失败回滚、所有 child 收到相同绝对 deadline、同时发停止请求后聚合真实终止、不可变 iterator 测试。
 
 ```bash
 $MVN -pl disruptor-concurrent -Dtest=EventLoopGroupTest test
@@ -374,9 +386,9 @@ void consumesEveryClaimedSequenceExactlyOnceAcrossSegments() throws Exception {
 
 每个 segment 为 2 的幂固定槽数组；生产者以全局原子 sequence 定位 segment 和 offset，发布位使用 release/acquire；单消费者只按连续 sequence 前进。消费后清引用，越过整块后回收前序块。
 
-- [ ] **Step 3: 接入共享 EventLoop 内核与 WorkerSupervisor**
+- [ ] **Step 3: 仅替换共享内核的 TaskQueue 后端**
 
-`UnboundedEventLoop` 不创建 LMAX RingBuffer，也不复制状态机；只替换 TaskQueue，调度、取消、模块和 Executor 实现与 bounded 后端共用。
+`UnboundedEventLoop` 不创建 LMAX RingBuffer，也不创建第二个 supervisor 或 lifecycle；它只向同一个 `EventLoopKernel` 注入 segmented MPSC `TaskQueue`。调度、取消、Future、模块、关闭、快照和 Group 行为与 bounded 后端使用完全相同的代码路径。
 
 - [ ] **Step 4: 运行后端契约与压力测试**
 
@@ -384,7 +396,7 @@ void consumesEveryClaimedSequenceExactlyOnceAcrossSegments() throws Exception {
 $MVN -pl disruptor-concurrent -Dtest=SegmentedMpscTaskQueueTest,EventLoopBackendContractTest test
 ```
 
-Expected: 两种后端通过同一契约；无丢失、重复和遗留引用。
+Expected: 两种 TaskQueue 通过同一队列契约，两种 EventLoop 通过同一生命周期/Future/timer/module/shutdown 契约；无丢失、重复和遗留引用。
 
 - [ ] **Step 5: 提交无界后端**
 
@@ -423,7 +435,7 @@ autoconfigure 对 concurrent 使用 `<optional>true</optional>`；starter 不直
 
 - [ ] **Step 3: 实现生命周期、健康与 metrics binder**
 
-生命周期按 bean 顺序启动、逆序同时请求关闭并在总截止时间内等待。指标包括 healthy、pending、remaining（仅 bounded）、segments（仅 unbounded）、scheduled、completed、failed、cancelled。
+生命周期按 bean 顺序启动；关闭时创建一次 `ShutdownDeadline`，向所有 bean 广播后聚合真实 termination，不能为每个 bean 重算 timeout。指标包括 healthy、worker registered/started/alive、pending、remaining（仅 bounded）、segments（仅 unbounded）、scheduled、completed、failed、cancelled。
 
 - [ ] **Step 4: 运行自动配置测试**
 
