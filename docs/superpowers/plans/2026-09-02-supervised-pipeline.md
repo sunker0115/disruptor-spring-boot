@@ -54,6 +54,7 @@ Expected: 只包含实施计划和设计自审修改，没有未知业务代码�
 
 **Files:**
 
+- Modify: `disruptor-core/pom.xml`
 - Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/PipelineLifecycle.java`
 - Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/PipelineHealth.java`
 - Create: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/PipelineSnapshot.java`
@@ -125,7 +126,7 @@ Expected: `BUILD SUCCESS`。
 - [ ] **Step 5: 提交状态模型**
 
 ```bash
-git add disruptor-core/src/main/java/com/sstlfsj/disruptor/core disruptor-core/src/test/java/com/sstlfsj/disruptor/core/PipelineSnapshotTest.java
+git add disruptor-core/pom.xml disruptor-core/src/main/java/com/sstlfsj/disruptor/core disruptor-core/src/test/java/com/sstlfsj/disruptor/core/PipelineSnapshotTest.java
 git commit -m "feat(core): add pipeline state snapshots"
 ```
 
