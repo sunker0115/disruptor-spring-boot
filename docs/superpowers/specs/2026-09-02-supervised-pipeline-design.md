@@ -148,7 +148,7 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 - 关闭、失败或中断后，没有受管发布者永久等待容量。
 - 消费线程永远不等待自身终止。
 - deadline 到期只触发首因和 `IMMEDIATE` 升级，不得在 worker 存活时完成 `termination()`。
-- `TERMINATED` 快照中的存活 worker 数必须为 0。
+- 内部 `WorkerSnapshot` 与公开 `PipelineSnapshot` 的 `TERMINATED` 快照中，存活 worker/consumer 数必须为 0。
 - Runtime 关闭耗时受单一总截止时间约束，不随管道数量线性叠加。
 - 快照、健康和指标不得改变 RingBuffer 热路径。
 

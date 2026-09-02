@@ -443,17 +443,21 @@ class WorkerSupervisorTest {
         supervisor.markStarting();
         supervisor.register(worker);
         worker.start();
-        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
-        supervisor.markRunning();
-        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
-
-        WorkerSnapshot stopping = awaitFailure(supervisor);
-        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
-        assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
-        assertEquals(1, stopping.aliveWorkers());
-        assertFalse(supervisor.termination().toCompletableFuture().isDone());
-        assertTrue(interrupts.get() >= 1);
-        release.countDown();
+        WorkerSnapshot stopping;
+        try {
+            assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            supervisor.markRunning();
+            supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+            stopping = awaitFailure(supervisor);
+            assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
+            assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
+            assertEquals(1, stopping.aliveWorkers());
+            assertFalse(supervisor.termination().toCompletableFuture().isDone());
+            assertTrue(interrupts.get() >= 1);
+        } finally {
+            release.countDown();
+            worker.join(TEST_TIMEOUT.toMillis());
+        }
 
         WorkerSnapshot result = terminate(supervisor);
         assertEquals(PipelineLifecycle.TERMINATED, result.lifecycle());
@@ -465,9 +469,14 @@ class WorkerSupervisorTest {
     void gracefulTimeoutStillAppliesImmediateStopActionBeforeTermination() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch immediateApplied = new CountDownLatch(1);
         List<ShutdownMode> appliedModes = new CopyOnWriteArrayList<>();
-        WorkerSupervisor supervisor = supervisor(1, Duration.ofMillis(50),
-                (mode, deadlineNanos) -> appliedModes.add(mode));
+        WorkerSupervisor supervisor = supervisor(1, Duration.ofMillis(50), (mode, deadlineNanos) -> {
+            appliedModes.add(mode);
+            if (mode == ShutdownMode.IMMEDIATE) {
+                immediateApplied.countDown();
+            }
+        });
         Thread worker = worker(supervisor, () -> {
             entered.countDown();
             boolean done = false;
@@ -484,17 +493,22 @@ class WorkerSupervisorTest {
         supervisor.markStarting();
         supervisor.register(worker);
         worker.start();
-        assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
-        supervisor.markRunning();
-        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
-
-        WorkerSnapshot stopping = awaitFailure(supervisor);
-        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
-        assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
-        assertEquals(ShutdownMode.IMMEDIATE, stopping.shutdownMode());
-        assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
-        assertFalse(supervisor.termination().toCompletableFuture().isDone());
-        release.countDown();
+        WorkerSnapshot stopping;
+        try {
+            assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            supervisor.markRunning();
+            supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+            stopping = awaitFailure(supervisor);
+            assertTrue(immediateApplied.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+            assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
+            assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
+            assertEquals(ShutdownMode.IMMEDIATE, stopping.shutdownMode());
+            assertEquals(List.of(ShutdownMode.GRACEFUL, ShutdownMode.IMMEDIATE), appliedModes);
+            assertFalse(supervisor.termination().toCompletableFuture().isDone());
+        } finally {
+            release.countDown();
+            worker.join(TEST_TIMEOUT.toMillis());
+        }
 
         WorkerSnapshot result = terminate(supervisor);
         assertSame(stopping.failure(), result.failure());

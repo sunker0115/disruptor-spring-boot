@@ -32,6 +32,9 @@ public record PipelineSnapshot(
         if (acceptingPublications && lifecycle != PipelineLifecycle.RUNNING) {
             throw new IllegalArgumentException("只有 RUNNING 状态的管道可以接收发布");
         }
+        if (lifecycle == PipelineLifecycle.TERMINATED && aliveConsumers != 0) {
+            throw new IllegalArgumentException("TERMINATED 状态不能仍有存活 consumer");
+        }
         if (gracefulTermination && lifecycle != PipelineLifecycle.TERMINATED) {
             throw new IllegalArgumentException("只有 TERMINATED 状态的管道可以标记为优雅终止");
         }

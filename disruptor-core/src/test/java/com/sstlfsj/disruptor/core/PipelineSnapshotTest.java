@@ -39,7 +39,7 @@ class PipelineSnapshotTest {
                 PipelineHealth.OUT_OF_SERVICE);
         assertHealth(PipelineLifecycle.STOPPING, new IllegalStateException("failed"), 2, 2, 2,
                 PipelineHealth.OUT_OF_SERVICE);
-        assertHealth(PipelineLifecycle.TERMINATED, new IllegalStateException("failed"), 2, 2, 2,
+        assertHealth(PipelineLifecycle.TERMINATED, new IllegalStateException("failed"), 2, 2, 0,
                 PipelineHealth.TERMINATED);
     }
 
@@ -106,6 +106,12 @@ class PipelineSnapshotTest {
                 .lifecycle(PipelineLifecycle.STARTING).acceptingPublications(true).build());
         assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
                 .lifecycle(PipelineLifecycle.STOPPING).gracefulTermination(true).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .expectedConsumers(1)
+                .createdConsumers(1)
+                .aliveConsumers(1)
+                .build());
     }
 
     @Test
@@ -134,7 +140,7 @@ class PipelineSnapshotTest {
                 .bufferSize(1024)
                 .backlog(0)
                 .failure(failure)
-                .gracefulTermination(lifecycle == PipelineLifecycle.TERMINATED)
+                .gracefulTermination(lifecycle == PipelineLifecycle.TERMINATED && failure == null)
                 .build();
 
         assertEquals(expectedHealth, snapshot.health());
