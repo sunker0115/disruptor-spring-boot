@@ -455,16 +455,16 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 currentSupervisor = supervisor;
                 currentClosePublicationGate = closePublicationGate;
             }
-            Runnable supervisedWorker = currentSupervisor.supervise(runnable);
             Runnable monitoredWorker = () -> {
                 try {
-                    supervisedWorker.run();
+                    runnable.run();
                 } finally {
                     currentClosePublicationGate.run();
                 }
             };
+            Runnable supervisedWorker = currentSupervisor.supervise(monitoredWorker);
             Thread thread = Objects.requireNonNull(
-                    delegate.newThread(monitoredWorker),
+                    delegate.newThread(supervisedWorker),
                     "threadFactory 不能返回 null");
             currentSupervisor.register(thread);
             return thread;

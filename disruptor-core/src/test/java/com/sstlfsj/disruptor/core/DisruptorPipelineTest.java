@@ -339,6 +339,89 @@ class DisruptorPipelineTest {
         assertSame(original, uncaught.get());
     }
 
+    @Test
+    void observingStoppingAfterWorkerFailureMeansPublicationGateIsAlreadyClosed() throws Exception {
+        RuntimeException original = new RuntimeException("worker failed");
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch failWorker = new CountDownLatch(1);
+        CountDownLatch haltEntered = new CountDownLatch(1);
+        CountDownLatch allowHaltReturn = new CountDownLatch(1);
+        AtomicReference<Thread> workerThread = new AtomicReference<>();
+        EventProcessor processor = new EventProcessor() {
+            private final Sequence sequence = new Sequence();
+            private final AtomicBoolean running = new AtomicBoolean();
+
+            @Override
+            public Sequence getSequence() {
+                return sequence;
+            }
+
+            @Override
+            public void halt() {
+                haltEntered.countDown();
+                awaitUninterruptibly(allowHaltReturn);
+                running.set(false);
+            }
+
+            @Override
+            public boolean isRunning() {
+                return running.get();
+            }
+
+            @Override
+            public void run() {
+                running.set(true);
+                workerEntered.countDown();
+                awaitUninterruptibly(failWorker);
+                throw original;
+            }
+        };
+        DisruptorPipeline<TestEvent> pipeline = pipeline(PipelineSpec.builder(
+                        "failure-closes-gate-first", TestEvent.class, TestEvent::new)
+                .threadFactory(runnable -> {
+                    Thread thread = new Thread(runnable, "failure-closes-gate-first-worker");
+                    thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+                    workerThread.set(thread);
+                    return thread;
+                })
+                .topology(disruptor -> disruptor.handleEventsWith(processor))
+                .build());
+        pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertTrue(workerEntered.await(2, TimeUnit.SECONDS));
+
+        Object lifecycleLock = lifecycleLock(pipeline);
+        try {
+            boolean stoppingObservedWhileGateCloseWasBlocked;
+            synchronized (lifecycleLock) {
+                failWorker.countDown();
+                long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+                while (workerThread.get().getState() != Thread.State.BLOCKED
+                        && System.nanoTime() < deadline) {
+                    LockSupport.parkNanos(100_000L);
+                }
+                assertEquals(Thread.State.BLOCKED, workerThread.get().getState());
+                stoppingObservedWhileGateCloseWasBlocked =
+                        pipeline.snapshot().lifecycle() == PipelineLifecycle.STOPPING;
+                if (stoppingObservedWhileGateCloseWasBlocked) {
+                    assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }),
+                            "一旦可观察到 STOPPING，实际发布准入必须已经关闭");
+                }
+            }
+            if (!stoppingObservedWhileGateCloseWasBlocked) {
+                assertTrue(haltEntered.await(2, TimeUnit.SECONDS));
+                assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
+                assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }),
+                        "一旦可观察到 STOPPING，实际发布准入必须已经关闭");
+            }
+        } finally {
+            allowHaltReturn.countDown();
+        }
+
+        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+        assertSame(original, terminated.failure());
+    }
+
     private static DisruptorPipeline<TestEvent> pipeline(PipelineSpec<TestEvent> spec) {
         return ManagedPipeline.build(spec, spec.resolve(PipelineSettings.defaults()),
                 Duration.ofSeconds(2));
@@ -362,6 +445,16 @@ class DisruptorPipelineTest {
         }
         if (interrupted) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static Object lifecycleLock(DisruptorPipeline<?> pipeline) {
+        try {
+            var field = pipeline.getClass().getDeclaredField("lifecycleLock");
+            field.setAccessible(true);
+            return field.get(pipeline);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("无法读取 ManagedPipeline 生命周期锁", failure);
         }
     }
 
