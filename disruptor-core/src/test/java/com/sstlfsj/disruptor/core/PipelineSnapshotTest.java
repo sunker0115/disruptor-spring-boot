@@ -29,6 +29,20 @@ class PipelineSnapshotTest {
         PipelineSnapshot running = runningSnapshotBuilder().build();
         assertEquals(PipelineHealth.HEALTHY, running.health());
 
+        assertEquals(PipelineHealth.UNHEALTHY, runningSnapshotBuilder()
+                .startedConsumers(1)
+                .aliveConsumers(1)
+                .build()
+                .health());
+        assertEquals(PipelineHealth.UNHEALTHY, runningSnapshotBuilder()
+                .failure(new IllegalStateException("failed"))
+                .build()
+                .health());
+        assertEquals(PipelineHealth.UNHEALTHY, runningSnapshotBuilder()
+                .acceptingPublications(false)
+                .build()
+                .health());
+
         PipelineSnapshot stopping = runningSnapshotBuilder()
                 .lifecycle(PipelineLifecycle.STOPPING)
                 .acceptingPublications(false)
@@ -75,8 +89,6 @@ class PipelineSnapshotTest {
                 .createdConsumers(1).startedConsumers(1).aliveConsumers(2).build());
         assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
                 .registrationSealed(true).expectedConsumers(2).createdConsumers(1).build());
-        assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
-                .startedConsumers(1).aliveConsumers(1).build());
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
                 .lifecycle(PipelineLifecycle.TERMINATED).aliveConsumers(1).build());
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()

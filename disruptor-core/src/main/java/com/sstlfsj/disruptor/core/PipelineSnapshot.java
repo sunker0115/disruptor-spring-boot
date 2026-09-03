@@ -53,6 +53,7 @@ public record PipelineSnapshot(
         return switch (lifecycle) {
             case NEW, STARTING -> PipelineHealth.STARTING;
             case RUNNING -> failure == null
+                    && acceptingPublications
                     && registrationSealed
                     && expectedConsumers > 0
                     && createdConsumers == expectedConsumers
@@ -92,19 +93,16 @@ public record PipelineSnapshot(
             boolean reachedRunning,
             boolean drainCommitted,
             boolean gracefulStopApplied) {
-        if (acceptingPublications != (lifecycle == PipelineLifecycle.RUNNING)) {
-            throw new IllegalArgumentException("发布准入必须与 RUNNING 生命周期一致");
+        if (acceptingPublications && lifecycle != PipelineLifecycle.RUNNING) {
+            throw new IllegalArgumentException("只有 RUNNING 生命周期可以接收发布");
         }
         if (lifecycle == PipelineLifecycle.RUNNING
                 && (!registrationSealed
                 || expectedConsumers == 0
                 || createdConsumers != expectedConsumers
-                || startedConsumers != createdConsumers
-                || aliveConsumers != startedConsumers
                 || !reachedRunning
-                || failure != null
                 || shutdownMode != null)) {
-            throw new IllegalArgumentException("RUNNING 必须对应已封口且全部入场存活的无故障 consumer 集");
+            throw new IllegalArgumentException("RUNNING 必须对应已封口且曾成功启动的 consumer 集");
         }
         if ((lifecycle == PipelineLifecycle.NEW || lifecycle == PipelineLifecycle.STARTING)
                 && (reachedRunning || shutdownMode != null)) {

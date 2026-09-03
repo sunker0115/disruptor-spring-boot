@@ -38,6 +38,9 @@ public final class WorkerSupervisor {
     private PipelineLifecycle lifecycle = PipelineLifecycle.NEW;
     private boolean startupInitiated;
     private boolean registrationSealed;
+    private StartupOutcome startupOutcome = StartupOutcome.PENDING;
+    private Throwable startupOutcomeFailure;
+    private boolean startupOutcomePublicationScheduled;
     private int expectedWorkers;
     private int startedWorkers;
     private int aliveWorkers;
@@ -126,7 +129,7 @@ public final class WorkerSupervisor {
      * 生命周期推进到 {@link PipelineLifecycle#STOPPING}，启动方仍必须在自己的 finally 路径封口。</p>
      */
     public void sealWorkers() {
-        boolean completeStarted;
+        StartupNotification startupNotification;
         synchronized (stateLock) {
             if (!startupInitiated
                     || (lifecycle != PipelineLifecycle.STARTING
@@ -137,14 +140,16 @@ public final class WorkerSupervisor {
                 throw new IllegalStateException("worker 登记已经封口");
             }
             sealRegistrationLocked();
-            completeStarted = startedWorkers == expectedWorkers;
+            startupNotification = commitStartupSuccessIfReadyLocked();
             stateLock.notifyAll();
         }
-        if (completeStarted) {
-            workersStarted.complete(null);
-        }
+        publishStartupOutcome(startupNotification);
     }
 
+    /**
+     * 返回只读启动结果。结果先在状态锁内唯一提交，再由专用命名虚拟线程发布，用户依赖回调不会
+     * 同步占用 worker、关闭请求调用线程或 supervisor 控制线程。
+     */
     public CompletionStage<Void> workersStarted() {
         return workersStartedView;
     }
@@ -217,12 +222,15 @@ public final class WorkerSupervisor {
             signals = new ShutdownSignals(
                     toStart,
                     shutdownMode == ShutdownMode.IMMEDIATE,
-                    abortStartup ? startupAbortedFailureLocked() : null,
-                    false);
+                    abortStartup ? commitStartupFailureLocked() : null);
         }
         apply(signals);
     }
 
+    /**
+     * 返回只读终止信号。该信号只会在后端停止完成、全部已启动 worker 完成 join 且终态提交后发布；
+     * 因此同步执行的依赖回调不会阻塞任何内部生命周期动作。
+     */
     public CompletionStage<WorkerSnapshot> termination() {
         return terminationView;
     }
@@ -286,10 +294,10 @@ public final class WorkerSupervisor {
             workers.put(current, WorkerState.ALIVE);
             startedWorkers++;
             aliveWorkers++;
-            boolean completeStarted = registrationSealed && startedWorkers == expectedWorkers;
+            StartupNotification startupNotification = commitStartupSuccessIfReadyLocked();
             stateLock.notifyAll();
             return new WorkerAdmission(null,
-                    new ShutdownSignals(null, false, null, completeStarted));
+                    new ShutdownSignals(null, false, startupNotification));
         }
     }
 
@@ -333,7 +341,7 @@ public final class WorkerSupervisor {
         Thread toStart = ensureControlThreadLocked();
         stateLock.notifyAll();
         return new ShutdownSignals(toStart, true,
-                abortStartup ? startupAbortedFailureLocked() : null, false);
+                abortStartup ? commitStartupFailureLocked() : null);
     }
 
     private void controlShutdown() {
@@ -550,12 +558,7 @@ public final class WorkerSupervisor {
     }
 
     private void apply(ShutdownSignals signals) {
-        if (signals.completeWorkersStarted()) {
-            workersStarted.complete(null);
-        }
-        if (signals.startupFailure() != null) {
-            workersStarted.completeExceptionally(signals.startupFailure());
-        }
+        publishStartupOutcome(signals.startupNotification());
         if (signals.interruptWorkers()) {
             interruptWorkers();
         }
@@ -591,6 +594,56 @@ public final class WorkerSupervisor {
         if (shutdownDeadline == null) {
             shutdownDeadline = deadline;
         }
+    }
+
+    private StartupNotification commitStartupSuccessIfReadyLocked() {
+        if (!registrationSealed || startedWorkers != expectedWorkers) {
+            return null;
+        }
+        return commitStartupOutcomeLocked(StartupOutcome.SUCCESS, null);
+    }
+
+    private StartupNotification commitStartupFailureLocked() {
+        if (startupOutcome != StartupOutcome.PENDING) {
+            return null;
+        }
+        return commitStartupOutcomeLocked(StartupOutcome.FAILURE, startupAbortedFailureLocked());
+    }
+
+    private StartupNotification commitStartupOutcomeLocked(
+            StartupOutcome outcome,
+            Throwable outcomeFailure) {
+        if (startupOutcome != StartupOutcome.PENDING) {
+            return null;
+        }
+        if (startupOutcomePublicationScheduled) {
+            throw new IllegalStateException("启动结果通知已调度但结果仍为 PENDING");
+        }
+        if (outcome == StartupOutcome.PENDING) {
+            throw new IllegalArgumentException("不能提交 PENDING 启动结果");
+        }
+        if (outcome == StartupOutcome.FAILURE) {
+            Objects.requireNonNull(outcomeFailure, "启动失败原因不能为空");
+        }
+        startupOutcome = outcome;
+        startupOutcomeFailure = outcomeFailure;
+        startupOutcomePublicationScheduled = true;
+        return new StartupNotification(startupOutcome, startupOutcomeFailure);
+    }
+
+    private void publishStartupOutcome(StartupNotification notification) {
+        if (notification == null) {
+            return;
+        }
+        Thread.ofVirtual()
+                .name("worker-supervisor-" + name + "-startup-notifier")
+                .start(() -> {
+                    if (notification.outcome() == StartupOutcome.SUCCESS) {
+                        workersStarted.complete(null);
+                    } else {
+                        workersStarted.completeExceptionally(notification.failure());
+                    }
+                });
     }
 
     private void sealRegistrationLocked() {
@@ -677,6 +730,12 @@ public final class WorkerSupervisor {
         EXITED
     }
 
+    private enum StartupOutcome {
+        PENDING,
+        SUCCESS,
+        FAILURE
+    }
+
     private enum ControlStep {
         BEGIN_QUIESCE,
         PROBE_DRAIN,
@@ -693,11 +752,12 @@ public final class WorkerSupervisor {
 
     private record WorkerAdmission(Throwable failure, ShutdownSignals signals) { }
 
+    private record StartupNotification(StartupOutcome outcome, Throwable failure) { }
+
     private record ShutdownSignals(
             Thread controlThreadToStart,
             boolean interruptWorkers,
-            Throwable startupFailure,
-            boolean completeWorkersStarted) {
-        private static final ShutdownSignals NONE = new ShutdownSignals(null, false, null, false);
+            StartupNotification startupNotification) {
+        private static final ShutdownSignals NONE = new ShutdownSignals(null, false, null);
     }
 }

@@ -7,7 +7,9 @@ import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -66,6 +68,137 @@ class WorkerSupervisorTest {
 
         supervisor.requestShutdown(ShutdownMode.GRACEFUL);
         assertTrue(terminate(supervisor).gracefulTermination());
+    }
+
+    @Test
+    void successfulStartupCallbackCannotBlockTheLastWorkerAdmission() throws Exception {
+        CountDownLatch callbackEntered = new CountDownLatch(1);
+        CountDownLatch abortCallback = new CountDownLatch(1);
+        CountDownLatch taskEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        AtomicReference<Thread> callbackThread = new AtomicReference<>();
+        RecordingBackend backend = new RecordingBackend();
+        backend.onImmediateStop = releaseWorker::countDown;
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        supervisor.workersStarted().whenComplete((ignored, failure) -> {
+            callbackThread.set(Thread.currentThread());
+            callbackEntered.countDown();
+            awaitTerminationOrAbort(supervisor, abortCallback);
+        });
+        Thread worker = worker(supervisor, () -> {
+            taskEntered.countDown();
+            awaitIgnoringInterrupts(releaseWorker);
+        }, "callback-isolation-worker");
+        supervisor.markStarting();
+        supervisor.register(worker);
+        supervisor.sealWorkers();
+
+        worker.start();
+        assertTrue(callbackEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        boolean workerWasAdmitted = taskEntered.await(200, TimeUnit.MILLISECONDS);
+        if (!workerWasAdmitted) {
+            abortCallback.countDown();
+        }
+        supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        supervisor.markRunning();
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        terminate(supervisor);
+
+        assertTrue(workerWasAdmitted, "启动完成回调不应阻塞最后一个 worker");
+        assertTrue(callbackThread.get().isVirtual());
+        assertEquals("worker-supervisor-workers-startup-notifier", callbackThread.get().getName());
+    }
+
+    @Test
+    void failedStartupCallbackCannotBlockShutdownControl() throws Exception {
+        CountDownLatch callbackEntered = new CountDownLatch(1);
+        CountDownLatch abortCallback = new CountDownLatch(1);
+        AtomicReference<Thread> callbackThread = new AtomicReference<>();
+        RecordingBackend backend = new RecordingBackend();
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        supervisor.workersStarted().whenComplete((ignored, failure) -> {
+            callbackThread.set(Thread.currentThread());
+            callbackEntered.countDown();
+            awaitTerminationOrAbort(supervisor, abortCallback);
+        });
+        supervisor.markStarting();
+        supervisor.register(worker(supervisor, () -> { }, "never-started"));
+        supervisor.sealWorkers();
+        Thread requester = Thread.ofVirtual().name("shutdown-requester")
+                .unstarted(() -> supervisor.requestShutdown(ShutdownMode.IMMEDIATE));
+
+        requester.start();
+        assertTrue(callbackEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        boolean controlAdvanced = backend.immediateStopped.await(200, TimeUnit.MILLISECONDS);
+        if (!controlAdvanced) {
+            abortCallback.countDown();
+        }
+        requester.join(TEST_TIMEOUT.toMillis());
+        terminate(supervisor);
+
+        assertTrue(controlAdvanced, "启动失败回调不应阻塞 backend stop");
+        assertFalse(requester.isAlive());
+        assertTrue(callbackThread.get().isVirtual());
+        assertEquals("worker-supervisor-workers-startup-notifier", callbackThread.get().getName());
+    }
+
+    @Test
+    void lastAdmissionBeforeShutdownCommitsStartupSuccess() throws Exception {
+        CountDownLatch beforeAdmission = new CountDownLatch(1);
+        CountDownLatch allowAdmission = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        RecordingBackend backend = new RecordingBackend();
+        backend.onImmediateStop = releaseWorker::countDown;
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        Runnable supervised = supervisor.supervise(() -> awaitIgnoringInterrupts(releaseWorker));
+        Thread worker = Thread.ofPlatform().name("success-before-shutdown-worker").unstarted(() -> {
+            beforeAdmission.countDown();
+            await(allowAdmission);
+            supervised.run();
+        });
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(beforeAdmission.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.sealWorkers();
+
+        allowAdmission.countDown();
+        awaitCondition(() -> supervisor.snapshot().startedWorkers() == 1);
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+
+        supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+    }
+
+    @Test
+    void failureBeforeLastAdmissionCommitsStartupFailure() throws Exception {
+        CountDownLatch beforeAdmission = new CountDownLatch(1);
+        CountDownLatch allowAdmission = new CountDownLatch(1);
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
+        Runnable supervised = supervisor.supervise(() -> { });
+        Thread worker = Thread.ofPlatform().name("failure-before-success-worker").unstarted(() -> {
+            beforeAdmission.countDown();
+            awaitIgnoringInterrupts(allowAdmission);
+            supervised.run();
+        });
+        worker.setUncaughtExceptionHandler((thread, failure) -> { });
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        assertTrue(beforeAdmission.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        supervisor.sealWorkers();
+
+        IllegalStateException original = new IllegalStateException("startup failed");
+        supervisor.fail(original);
+        allowAdmission.countDown();
+
+        ExecutionException startupFailure = assertThrows(ExecutionException.class,
+                () -> supervisor.workersStarted().toCompletableFuture()
+                        .get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        assertSame(original, startupFailure.getCause());
+        WorkerSnapshot terminated = terminate(supervisor);
+        assertEquals(PipelineLifecycle.TERMINATED, terminated.lifecycle());
+        assertSame(original, terminated.failure());
     }
 
     @Test
@@ -557,7 +690,9 @@ class WorkerSupervisorTest {
         assertThrows(IllegalArgumentException.class,
                 () -> ShutdownDeadline.after(Duration.ofNanos(-1)));
         assertTrue(ShutdownDeadline.after(Duration.ZERO).isExpired());
-        assertTrue(ShutdownDeadline.after(Duration.ofSeconds(Long.MAX_VALUE)).remainingNanos() > 0);
+        ShutdownDeadline saturated = ShutdownDeadline.after(Duration.ofSeconds(Long.MAX_VALUE));
+        assertTrue(saturated.remainingNanos() > 0);
+        assertFalse(saturated.isExpired());
 
         assertThrows(NullPointerException.class, () -> WorkerSupervisor.builder()
                 .shutdownTimeout(TEST_TIMEOUT).shutdownBackend(new RecordingBackend()).build());
@@ -682,6 +817,23 @@ class WorkerSupervisorTest {
         }
         if (interrupted) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void awaitTerminationOrAbort(
+            WorkerSupervisor supervisor,
+            CountDownLatch abortCallback) {
+        while (!supervisor.termination().toCompletableFuture().isDone()
+                && abortCallback.getCount() != 0) {
+            try {
+                supervisor.termination().toCompletableFuture().get(20, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+                // 回调必须能暴露同步完成导致的 worker/request 阻塞，测试清理通过 abortCallback 退出。
+            } catch (TimeoutException ignored) {
+                // 继续等待终止或测试清理信号。
+            } catch (ExecutionException impossible) {
+                throw new AssertionError("termination 不应异常完成", impossible);
+            }
         }
     }
 
