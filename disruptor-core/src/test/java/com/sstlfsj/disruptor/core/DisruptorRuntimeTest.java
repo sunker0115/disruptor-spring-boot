@@ -15,6 +15,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -226,8 +227,8 @@ class DisruptorRuntimeTest {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(partiallyStarted).build();
 
         assertThrows(IllegalStateException.class, runtime::start);
-        assertTrue(started.await(2, TimeUnit.SECONDS));
-        assertTrue(stopped.await(2, TimeUnit.SECONDS), "部分启动的当前管道也必须被 halt");
+        assertEquals(1L, started.getCount(), "失败竞态中未入场 worker 不得执行 LMAX 用户 runnable");
+        assertEquals(1L, stopped.getCount(), "未执行 onStart 的 worker 不应伪造 onShutdown 回调");
         Thread thread = startedThread.get();
         assertNotNull(thread);
         thread.join(2_000);
@@ -333,13 +334,13 @@ class DisruptorRuntimeTest {
 
         assertTrue(healthyStopped.await(2, TimeUnit.SECONDS),
                 "单条管道停止失败不得阻断其余管道关闭");
-        assertEquals(1, failingProcessor.haltCalls.get(),
-                "同一次关闭不得重复调用失败的 halt");
+        assertEquals(2, failingProcessor.haltCalls.get(),
+                "graceful halt 失败后应再应用一次 immediate halt，两个阶段各至多一次");
         assertFalse(runtime.isRunning());
     }
 
     @RepeatedTest(20)
-    void drainsInflightEventsEvenWhenConsumerThreadHasNotEnteredRun() throws Exception {
+    void drainsInflightEventsAfterDelayedConsumerEntry() throws Exception {
         int total = 128;
         CountDownLatch consumerThreadCreated = new CountDownLatch(1);
         CountDownLatch allowConsumerToRun = new CountDownLatch(1);
@@ -363,8 +364,11 @@ class DisruptorRuntimeTest {
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
 
-        runtime.start();
+        var start = runtime.startAsync().toCompletableFuture();
         assertTrue(consumerThreadCreated.await(2, TimeUnit.SECONDS));
+        assertFalse(start.isDone(), "全部 consumer 实际入场前启动不能完成");
+        allowConsumerToRun.countDown();
+        start.get(2, TimeUnit.SECONDS);
         PipelineHandle<TestEvent> handle = runtime.require("drain", TestEvent.class);
         for (int i = 0; i < total; i++) {
             handle.publishEvent(TRANSLATOR, "v", (long) i);
@@ -378,7 +382,6 @@ class DisruptorRuntimeTest {
             }
         });
         awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
-        allowConsumerToRun.countDown();
         shutdown.join(2_000);
 
         assertFalse(shutdown.isAlive());
@@ -600,6 +603,123 @@ class DisruptorRuntimeTest {
         runtime.shutdown();
     }
 
+    @Test
+    void asynchronousStartCompletesOnlyAfterEveryPipelineWorkerEntered() throws Exception {
+        CountDownLatch delayedThreadCreated = new CountDownLatch(1);
+        CountDownLatch allowDelayedEntry = new CountDownLatch(1);
+        PipelineSpec<TestEvent> delayed = PipelineSpec.builder(
+                        "delayed", TestEvent.class, () -> new TestEvent("slot"))
+                .threadFactory(runnable -> new Thread(() -> {
+                    delayedThreadCreated.countDown();
+                    awaitUninterruptibly(allowDelayedEntry);
+                    runnable.run();
+                }, "runtime-delayed-worker"))
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> { }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .add(spec("first"))
+                .add(delayed)
+                .build();
+
+        var start = runtime.startAsync().toCompletableFuture();
+
+        assertTrue(delayedThreadCreated.await(2, TimeUnit.SECONDS));
+        assertFalse(start.isDone());
+        allowDelayedEntry.countDown();
+        start.get(2, TimeUnit.SECONDS);
+
+        assertTrue(runtime.isRunning());
+        assertEquals(List.of(PipelineHealth.HEALTHY, PipelineHealth.HEALTHY),
+                runtime.handles().stream().map(PipelineHandle::snapshot)
+                        .map(PipelineSnapshot::health).toList());
+        runtime.shutdown();
+    }
+
+    @Test
+    void consumerFailureStopsOnlyItsOwningPipeline() throws Exception {
+        CountDownLatch failedHandlerEntered = new CountDownLatch(1);
+        PipelineSpec<TestEvent> failing = PipelineSpec.builder(
+                        "failing", TestEvent.class, () -> new TestEvent("slot"))
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> {
+                            failedHandlerEntered.countDown();
+                            throw new IllegalStateException("pipeline failed");
+                        }))
+                .build();
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .add(failing)
+                .add(spec("healthy"))
+                .build();
+        PipelineHandle<TestEvent> failingHandle = runtime.require("failing", TestEvent.class);
+        PipelineHandle<TestEvent> healthyHandle = runtime.require("healthy", TestEvent.class);
+        runtime.start();
+
+        failingHandle.publishEvent(TRANSLATOR, "fail", 1L);
+
+        assertTrue(failedHandlerEntered.await(2, TimeUnit.SECONDS));
+        awaitCondition(() -> failingHandle.snapshot().lifecycle() == PipelineLifecycle.TERMINATED,
+                Duration.ofSeconds(2));
+        assertEquals(PipelineHealth.TERMINATED, failingHandle.snapshot().health());
+        assertNotNull(failingHandle.snapshot().failure());
+        assertEquals(PipelineHealth.HEALTHY, healthyHandle.snapshot().health());
+        assertTrue(healthyHandle.tryPublishEvent(TRANSLATOR, "still-running", 2L));
+
+        assertThrows(DisruptorShutdownException.class, runtime::halt,
+                "已锁存的 consumer 基础设施故障必须进入 Runtime 聚合结果");
+    }
+
+    @Test
+    void shutdownSharesOneDeadlineAndTerminationWaitsForActualWorkerExit() throws Exception {
+        int pipelineCount = 3;
+        CountDownLatch handlersEntered = new CountDownLatch(pipelineCount);
+        CountDownLatch releaseHandlers = new CountDownLatch(1);
+        DisruptorRuntime.Builder builder = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofMillis(150));
+        for (int index = 0; index < pipelineCount; index++) {
+            String name = "blocked-" + index;
+            builder.add(PipelineSpec.builder(name, TestEvent.class, () -> new TestEvent("slot"))
+                    .topology(disruptor -> disruptor.handleEventsWith(
+                            (event, sequence, endOfBatch) -> {
+                                handlersEntered.countDown();
+                                awaitUninterruptibly(releaseHandlers);
+                            }))
+                    .build());
+        }
+        DisruptorRuntime runtime = builder.build();
+        runtime.start();
+        for (PipelineHandle<?> rawHandle : runtime.handles()) {
+            @SuppressWarnings("unchecked")
+            PipelineHandle<TestEvent> handle = (PipelineHandle<TestEvent>) rawHandle;
+            handle.publishEvent(TRANSLATOR, "blocked", 1L);
+        }
+        assertTrue(handlersEntered.await(2, TimeUnit.SECONDS));
+
+        long startedAt = System.nanoTime();
+        assertThrows(DisruptorShutdownException.class, runtime::shutdown);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
+
+        assertTrue(elapsed.compareTo(Duration.ofMillis(500)) < 0,
+                "关闭预算必须是全局一次性的，不能按 child 线性叠加，实际=" + elapsed);
+        assertFalse(runtime.termination().toCompletableFuture().isDone());
+        assertEquals(Set.of(ShutdownMode.IMMEDIATE), runtime.handles().stream()
+                .map(PipelineHandle::snapshot).map(PipelineSnapshot::shutdownMode).collect(
+                        java.util.stream.Collectors.toSet()));
+        Set<String> deadlines = runtime.handles().stream()
+                .map(PipelineHandle::snapshot)
+                .map(PipelineSnapshot::failure)
+                .map(Throwable::getMessage)
+                .map(DisruptorRuntimeTest::deadlineFrom)
+                .collect(java.util.stream.Collectors.toSet());
+        assertEquals(1, deadlines.size(), "所有 child 必须冻结同一个绝对 deadline");
+
+        releaseHandlers.countDown();
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.handles().stream()
+                .map(PipelineHandle::snapshot).map(PipelineSnapshot::lifecycle).collect(
+                        java.util.stream.Collectors.toSet()));
+    }
+
     private static void awaitCondition(BooleanSupplier condition, Duration timeout) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!condition.getAsBoolean()) {
@@ -608,6 +728,27 @@ class DisruptorRuntimeTest {
             }
             LockSupport.parkNanos(100_000L);
         }
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static String deadlineFrom(String message) {
+        int start = message.indexOf("deadlineNanos=");
+        int end = message.indexOf('，', start);
+        return message.substring(start, end);
     }
 
     private static PipelineSpec<TestEvent> shutdownSignalling(String name, CountDownLatch allShutdown) {
@@ -660,6 +801,7 @@ class DisruptorRuntimeTest {
         @Override
         public void halt() {
             haltCalls.incrementAndGet();
+            running.set(false);
             throw new IllegalStateException("halt failed");
         }
 
@@ -671,6 +813,9 @@ class DisruptorRuntimeTest {
         @Override
         public void run() {
             running.set(true);
+            while (running.get()) {
+                LockSupport.parkNanos(100_000L);
+            }
         }
     }
 }

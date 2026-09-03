@@ -10,7 +10,7 @@ import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
- * 一条已构建管道的发布入口。生命周期由 {@link DisruptorRuntime} 独占管理。
+ * 一条已构建管道的发布与观察入口，不拥有生命周期。
  *
  * @param <E> 事件类型
  */
@@ -19,6 +19,9 @@ public interface PipelineHandle<E> {
     String name();
 
     Class<E> eventType();
+
+    /** 返回所属管道当前的统一事实快照。 */
+    PipelineSnapshot snapshot();
 
     /**
      * 受管阻塞发布。关闭开始后拒绝新事件，已经进入的发布会被本次优雅关闭纳入排空边界。

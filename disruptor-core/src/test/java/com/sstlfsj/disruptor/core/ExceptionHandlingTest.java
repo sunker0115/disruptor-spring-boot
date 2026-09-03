@@ -52,7 +52,8 @@ class ExceptionHandlingTest {
             runtime.require("strict", TestEvent.class).publishEvent(TRANSLATOR, 1L);
             assertFalse(downstream.await(300, TimeUnit.MILLISECONDS), "失败槽位不得流向依赖它的下游");
         } finally {
-            runtime.halt();
+            assertThrows(DisruptorShutdownException.class, runtime::halt,
+                    "默认 HALT 的 consumer 故障必须进入 Runtime 聚合结果");
         }
     }
 

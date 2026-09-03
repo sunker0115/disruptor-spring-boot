@@ -8,30 +8,45 @@ import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.LockSupport;
 
-/** 单条管道的受管发布、排空和线程终止边界。 */
-final class ManagedPipeline<E> implements PipelineHandle<E> {
-
-    private static final long PARK_NANOS = 100_000L;
+/** LMAX Disruptor 与统一受监督生命周期之间的单管道适配。 */
+final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
     private final String name;
     private final Class<E> eventType;
     private final Disruptor<E> disruptor;
     private final RingBuffer<E> ringBuffer;
-    private final TrackingThreadFactory threadFactory;
+    private final SupervisingThreadFactory threadFactory;
+    private final WorkerSupervisor supervisor;
+    private final PipelineHandle<E> handle = new Handle();
     private final boolean singleProducer;
     private final AtomicInteger activePublishers;
-    private volatile boolean acceptingPublications;
-    private volatile boolean singlePublisherActive;
+    private final AtomicBoolean acceptingPublications = new AtomicBoolean();
+    private final CompletableFuture<Void> started = new CompletableFuture<>();
+    private final CompletionStage<Void> startedView = started.minimalCompletionStage();
+    private final CompletableFuture<PipelineSnapshot> terminated = new CompletableFuture<>();
+    private final CompletionStage<PipelineSnapshot> terminatedView = terminated.minimalCompletionStage();
 
-    private ManagedPipeline(String name, Class<E> eventType, Disruptor<E> disruptor,
-                            TrackingThreadFactory threadFactory, ProducerType producerType) {
+    private boolean startRequested;
+    private volatile boolean singlePublisherActive;
+    private Long drainCursor;
+
+    private ManagedPipeline(
+            String name,
+            Class<E> eventType,
+            Disruptor<E> disruptor,
+            SupervisingThreadFactory threadFactory,
+            ProducerType producerType,
+            Duration shutdownTimeout) {
         this.name = name;
         this.eventType = eventType;
         this.disruptor = disruptor;
@@ -39,10 +54,29 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         this.threadFactory = threadFactory;
         this.singleProducer = producerType == ProducerType.SINGLE;
         this.activePublishers = singleProducer ? null : new AtomicInteger();
+        this.supervisor = WorkerSupervisor.builder()
+                .name(name)
+                .shutdownTimeout(shutdownTimeout)
+                .shutdownBackend(new LmaxShutdownBackend())
+                .build();
+        threadFactory.bind(supervisor, acceptingPublications);
+        supervisor.termination().whenComplete((workerSnapshot, failure) -> {
+            if (failure != null) {
+                terminated.completeExceptionally(unwrap(failure));
+            } else {
+                terminated.complete(snapshot(workerSnapshot));
+            }
+        });
     }
 
-    static <E> ManagedPipeline<E> build(PipelineSpec<E> spec, ResolvedPipelineSettings<E> settings) {
-        TrackingThreadFactory threadFactory = new TrackingThreadFactory(settings.threadFactory());
+    static <E> ManagedPipeline<E> build(
+            PipelineSpec<E> spec,
+            ResolvedPipelineSettings<E> settings,
+            Duration shutdownTimeout) {
+        Objects.requireNonNull(spec, "spec 不能为空");
+        Objects.requireNonNull(settings, "settings 不能为空");
+        Objects.requireNonNull(shutdownTimeout, "shutdownTimeout 不能为空");
+        SupervisingThreadFactory threadFactory = new SupervisingThreadFactory(settings.threadFactory());
         Disruptor<E> disruptor = new Disruptor<>(
                 spec.eventFactory(),
                 settings.bufferSize(),
@@ -61,241 +95,131 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         if (disruptor.hasStarted()) {
             disruptor.halt();
             throw new IllegalStateException("管道 '" + spec.name()
-                    + "' 的 topology 不得调用 start()，生命周期必须由 DisruptorRuntime 托管");
+                    + "' 的 topology 不得调用 start()，生命周期必须由 DisruptorPipeline 托管");
         }
         return new ManagedPipeline<>(spec.name(), spec.eventType(), disruptor, threadFactory,
-                settings.producerType());
+                settings.producerType(), shutdownTimeout);
     }
 
     @Override
-    public String name() {
-        return name;
+    public PipelineHandle<E> handle() {
+        return handle;
     }
 
     @Override
-    public Class<E> eventType() {
-        return eventType;
+    public PipelineSnapshot snapshot() {
+        return snapshot(supervisor.snapshot());
     }
 
     @Override
-    public void publishEvent(EventTranslator<E> translator) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        enterPublisherOrThrow();
+    public synchronized CompletionStage<Void> start() {
+        if (startRequested) {
+            return startedView;
+        }
+        startRequested = true;
+        supervisor.markStarting();
+        threadFactory.enable();
         try {
-            ringBuffer.publishEvent(translator);
+            disruptor.start();
+        } catch (Throwable failure) {
+            acceptingPublications.set(false);
+            supervisor.fail(failure);
         } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public boolean tryPublishEvent(EventTranslator<E> translator) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        if (!enterPublisher()) {
-            return false;
-        }
-        try {
-            return ringBuffer.tryPublishEvent(translator);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A> void publishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        enterPublisherOrThrow();
-        try {
-            ringBuffer.publishEvent(translator, arg0);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A> boolean tryPublishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        if (!enterPublisher()) {
-            return false;
-        }
-        try {
-            return ringBuffer.tryPublishEvent(translator, arg0);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A, B> void publishEvent(EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        enterPublisherOrThrow();
-        try {
-            ringBuffer.publishEvent(translator, arg0, arg1);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A, B> boolean tryPublishEvent(EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        if (!enterPublisher()) {
-            return false;
-        }
-        try {
-            return ringBuffer.tryPublishEvent(translator, arg0, arg1);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A, B, C> void publishEvent(EventTranslatorThreeArg<E, A, B, C> translator,
-                                       A arg0, B arg1, C arg2) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        enterPublisherOrThrow();
-        try {
-            ringBuffer.publishEvent(translator, arg0, arg1, arg2);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public <A, B, C> boolean tryPublishEvent(EventTranslatorThreeArg<E, A, B, C> translator,
-                                            A arg0, B arg1, C arg2) {
-        Objects.requireNonNull(translator, "translator 不能为空");
-        if (!enterPublisher()) {
-            return false;
-        }
-        try {
-            return ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2);
-        } finally {
-            exitPublisher();
-        }
-    }
-
-    @Override
-    public RingBuffer<E> unsafeRingBuffer() {
-        return ringBuffer;
-    }
-
-    void start() {
-        disruptor.start();
-        acceptingPublications = true;
-    }
-
-    void quiesce() {
-        acceptingPublications = false;
-    }
-
-    StopResult shutdown(long deadlineNanos) {
-        quiesce();
-        if (!awaitPublishers(deadlineNanos)) {
-            return forceStop(deadlineNanos, "等待在途发布结束超时");
-        }
-
-        long targetSequence = ringBuffer.getCursor();
-        if (!awaitSequence(targetSequence, deadlineNanos)) {
-            return forceStop(deadlineNanos,
-                    "等待事件排空超时，目标序列=" + targetSequence
-                            + "，最小消费序列=" + ringBuffer.getMinimumGatingSequence());
-        }
-
-        Throwable haltFailure = haltProcessors();
-        boolean terminated = threadFactory.awaitTermination(deadlineNanos);
-        if (!terminated) {
-            threadFactory.interruptAlive();
-        }
-        if (haltFailure != null) {
-            return StopResult.failed("停止消费者失败", haltFailure);
-        }
-        if (!terminated) {
-            return StopResult.failed("等待消费线程退出超时", null);
-        }
-        return StopResult.completed();
-    }
-
-    StopResult haltNow(long deadlineNanos) {
-        quiesce();
-        return forceStop(deadlineNanos, null);
-    }
-
-    private StopResult forceStop(long deadlineNanos, String reason) {
-        Throwable haltFailure = haltProcessors();
-        threadFactory.interruptAlive();
-        boolean terminated = threadFactory.awaitTermination(deadlineNanos);
-        if (haltFailure != null) {
-            return StopResult.failed(reason == null ? "强制停止消费者失败" : reason, haltFailure);
-        }
-        if (!terminated) {
-            return StopResult.failed(reason == null ? "等待消费线程退出超时" : reason, null);
-        }
-        return reason == null ? StopResult.forced() : StopResult.failed(reason, null);
-    }
-
-    private Throwable haltProcessors() {
-        try {
-            disruptor.halt();
-            return null;
-        } catch (RuntimeException | Error failure) {
-            return failure;
-        }
-    }
-
-    private boolean awaitPublishers(long deadlineNanos) {
-        while (hasActivePublishers()) {
-            if (!parkUntil(deadlineNanos)) {
-                return false;
+            try {
+                supervisor.sealWorkers();
+            } catch (Throwable sealFailure) {
+                acceptingPublications.set(false);
+                supervisor.fail(sealFailure);
             }
         }
-        return true;
+        supervisor.workersStarted().whenComplete((ignored, failure) -> completeStart(failure));
+        return startedView;
     }
 
-    private boolean awaitSequence(long targetSequence, long deadlineNanos) {
-        while (ringBuffer.getMinimumGatingSequence() < targetSequence) {
-            if (!parkUntil(deadlineNanos)) {
-                return false;
+    @Override
+    public void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline) {
+        Objects.requireNonNull(mode, "mode 不能为空");
+        Objects.requireNonNull(deadline, "deadline 不能为空");
+        acceptingPublications.set(false);
+        supervisor.requestShutdown(mode, deadline);
+    }
+
+    @Override
+    public CompletionStage<PipelineSnapshot> termination() {
+        return terminatedView;
+    }
+
+    private void completeStart(Throwable startupFailure) {
+        if (startupFailure != null) {
+            started.completeExceptionally(unwrap(startupFailure));
+            return;
+        }
+        try {
+            supervisor.markRunning();
+            acceptingPublications.set(true);
+            WorkerSnapshot current = supervisor.snapshot();
+            if (current.lifecycle() != PipelineLifecycle.RUNNING) {
+                acceptingPublications.set(false);
+                throw current.failure() == null
+                        ? new IllegalStateException("管道 '" + name + "' 未能保持 RUNNING")
+                        : current.failure();
             }
+            started.complete(null);
+        } catch (Throwable failure) {
+            acceptingPublications.set(false);
+            supervisor.fail(failure);
+            Throwable firstFailure = supervisor.snapshot().failure();
+            started.completeExceptionally(firstFailure == null ? failure : firstFailure);
         }
-        return true;
     }
 
-    private static boolean parkUntil(long deadlineNanos) {
-        long remaining = deadlineNanos - System.nanoTime();
-        if (remaining <= 0L || Thread.currentThread().isInterrupted()) {
-            return false;
-        }
-        LockSupport.parkNanos(Math.min(PARK_NANOS, remaining));
-        return !Thread.currentThread().isInterrupted();
-    }
-
-    private void enterPublisherOrThrow() {
-        if (!enterPublisher()) {
-            throw new IllegalStateException("管道 '" + name + "' 当前不接受发布");
-        }
+    private PipelineSnapshot snapshot(WorkerSnapshot worker) {
+        long cursor = ringBuffer.getCursor();
+        long minimumGating = ringBuffer.getMinimumGatingSequence();
+        return PipelineSnapshot.builder()
+                .name(name)
+                .lifecycle(worker.lifecycle())
+                .acceptingPublications(acceptingPublications.get()
+                        && worker.lifecycle() == PipelineLifecycle.RUNNING)
+                .registrationSealed(worker.registrationSealed())
+                .expectedConsumers(worker.expectedWorkers())
+                .createdConsumers(worker.registeredWorkers())
+                .startedConsumers(worker.startedWorkers())
+                .aliveConsumers(worker.aliveWorkers())
+                .bufferSize(ringBuffer.getBufferSize())
+                .backlog(Math.max(0L, cursor - minimumGating))
+                .failure(worker.failure())
+                .shutdownMode(worker.shutdownMode())
+                .reachedRunning(worker.reachedRunning())
+                .drainCommitted(worker.drainCommitted())
+                .gracefulStopApplied(worker.gracefulStopApplied())
+                .build();
     }
 
     private boolean enterPublisher() {
-        if (!acceptingPublications) {
+        if (!acceptingPublications.get()) {
             return false;
         }
         if (singleProducer) {
-            // SINGLE 保证至多一个发布者；两次 volatile 读取与 active 写入形成关闭握手，
-            // 避免发布者通过首次检查后，shutdown 在其真正发布前捕获到过早的游标。
             singlePublisherActive = true;
-            if (acceptingPublications) {
+            if (acceptingPublications.get()) {
                 return true;
             }
             singlePublisherActive = false;
             return false;
         }
         activePublishers.incrementAndGet();
-        if (acceptingPublications) {
+        if (acceptingPublications.get()) {
             return true;
         }
         activePublishers.decrementAndGet();
         return false;
+    }
+
+    private void enterPublisherOrThrow() {
+        if (!enterPublisher()) {
+            throw new IllegalStateException("管道 '" + name + "' 当前不接受发布");
+        }
     }
 
     private void exitPublisher() {
@@ -310,89 +234,240 @@ final class ManagedPipeline<E> implements PipelineHandle<E> {
         return singleProducer ? singlePublisherActive : activePublishers.get() != 0;
     }
 
-    record StopResult(StopStatus status, String message, Throwable cause) {
+    private static Throwable unwrap(Throwable failure) {
+        Throwable current = failure;
+        while ((current instanceof CompletionException || current instanceof ExecutionException)
+                && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
+    }
 
-        boolean isGraceful() {
-            return status == StopStatus.GRACEFUL;
+    private final class LmaxShutdownBackend implements ShutdownBackend {
+
+        @Override
+        public void beginQuiesce() {
+            acceptingPublications.set(false);
         }
 
-        boolean isSuccessful() {
-            return status != StopStatus.FAILED;
+        @Override
+        public boolean isDrained() {
+            if (hasActivePublishers()) {
+                return false;
+            }
+            if (drainCursor == null) {
+                drainCursor = ringBuffer.getCursor();
+            }
+            // LMAX DSL 会在追加下游时移除上游 gating sequence；公开 API 返回的最小值
+            // 因而覆盖全部真实叶子，达到固定 cursor 等价于每个叶子都已排空。
+            return ringBuffer.getMinimumGatingSequence() >= drainCursor;
         }
 
-        private static StopResult completed() {
-            return new StopResult(StopStatus.GRACEFUL, null, null);
-        }
-
-        private static StopResult forced() {
-            return new StopResult(StopStatus.FORCED, null, null);
-        }
-
-        private static StopResult failed(String message, Throwable cause) {
-            return new StopResult(StopStatus.FAILED, message, cause);
+        @Override
+        public void stop(ShutdownMode mode) {
+            disruptor.halt();
         }
     }
 
-    private enum StopStatus {
-        GRACEFUL,
-        FORCED,
-        FAILED
+    private final class Handle implements PipelineHandle<E> {
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public Class<E> eventType() {
+            return eventType;
+        }
+
+        @Override
+        public PipelineSnapshot snapshot() {
+            return ManagedPipeline.this.snapshot();
+        }
+
+        @Override
+        public void publishEvent(EventTranslator<E> translator) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            enterPublisherOrThrow();
+            try {
+                ringBuffer.publishEvent(translator);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public boolean tryPublishEvent(EventTranslator<E> translator) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            if (!enterPublisher()) {
+                return false;
+            }
+            try {
+                return ringBuffer.tryPublishEvent(translator);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A> void publishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            enterPublisherOrThrow();
+            try {
+                ringBuffer.publishEvent(translator, arg0);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A> boolean tryPublishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            if (!enterPublisher()) {
+                return false;
+            }
+            try {
+                return ringBuffer.tryPublishEvent(translator, arg0);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A, B> void publishEvent(
+                EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            enterPublisherOrThrow();
+            try {
+                ringBuffer.publishEvent(translator, arg0, arg1);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A, B> boolean tryPublishEvent(
+                EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            if (!enterPublisher()) {
+                return false;
+            }
+            try {
+                return ringBuffer.tryPublishEvent(translator, arg0, arg1);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A, B, C> void publishEvent(
+                EventTranslatorThreeArg<E, A, B, C> translator, A arg0, B arg1, C arg2) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            enterPublisherOrThrow();
+            try {
+                ringBuffer.publishEvent(translator, arg0, arg1, arg2);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A, B, C> boolean tryPublishEvent(
+                EventTranslatorThreeArg<E, A, B, C> translator, A arg0, B arg1, C arg2) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            if (!enterPublisher()) {
+                return false;
+            }
+            try {
+                return ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2);
+            } finally {
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public RingBuffer<E> unsafeRingBuffer() {
+            return ringBuffer;
+        }
     }
 
-    private static final class TrackingThreadFactory implements ThreadFactory {
+    private static final class SupervisingThreadFactory implements ThreadFactory {
 
         private final ThreadFactory delegate;
-        private final List<Thread> threads = new ArrayList<>();
+        private WorkerSupervisor supervisor;
+        private AtomicBoolean acceptingPublications;
+        private boolean enabled;
 
-        private TrackingThreadFactory(ThreadFactory delegate) {
+        private SupervisingThreadFactory(ThreadFactory delegate) {
             this.delegate = Objects.requireNonNull(delegate, "threadFactory 不能为空");
+        }
+
+        private synchronized void bind(
+                WorkerSupervisor supervisor,
+                AtomicBoolean acceptingPublications) {
+            if (this.supervisor != null) {
+                throw new IllegalStateException("supervisor 已绑定");
+            }
+            this.supervisor = Objects.requireNonNull(supervisor, "supervisor 不能为空");
+            this.acceptingPublications = Objects.requireNonNull(
+                    acceptingPublications, "acceptingPublications 不能为空");
+        }
+
+        private synchronized void enable() {
+            enabled = true;
         }
 
         @Override
         public Thread newThread(Runnable runnable) {
-            Thread thread = Objects.requireNonNull(delegate.newThread(runnable),
-                    "threadFactory 不能返回 null");
-            synchronized (threads) {
-                threads.add(thread);
+            WorkerSupervisor currentSupervisor;
+            AtomicBoolean currentAcceptance;
+            synchronized (this) {
+                if (!enabled || supervisor == null) {
+                    throw new IllegalStateException("线程只能由 DisruptorPipeline.start() 创建");
+                }
+                currentSupervisor = supervisor;
+                currentAcceptance = acceptingPublications;
             }
+            Runnable monitoredWorker = () -> {
+                try {
+                    runnable.run();
+                } catch (Throwable failure) {
+                    WorkerSnapshot snapshot = currentSupervisor.snapshot();
+                    if (!isControlledInterruption(failure, snapshot)) {
+                        sneakyThrow(failure);
+                    }
+                } finally {
+                    currentAcceptance.set(false);
+                }
+            };
+            Thread thread = Objects.requireNonNull(
+                    delegate.newThread(currentSupervisor.supervise(monitoredWorker)),
+                    "threadFactory 不能返回 null");
+            currentSupervisor.register(thread);
             return thread;
         }
 
-        private void interruptAlive() {
-            for (Thread thread : snapshot()) {
-                if (thread.isAlive() && thread != Thread.currentThread()) {
-                    thread.interrupt();
-                }
+        private static boolean isControlledInterruption(
+                Throwable failure,
+                WorkerSnapshot snapshot) {
+            if (snapshot.lifecycle() != PipelineLifecycle.STOPPING
+                    || snapshot.shutdownMode() != ShutdownMode.IMMEDIATE) {
+                return false;
             }
+            Throwable current = failure;
+            while (current != null) {
+                if (current instanceof InterruptedException) {
+                    return true;
+                }
+                current = current.getCause();
+            }
+            return false;
         }
+    }
 
-        private boolean awaitTermination(long deadlineNanos) {
-            for (Thread thread : snapshot()) {
-                if (thread == Thread.currentThread()) {
-                    return false;
-                }
-                while (thread.isAlive()) {
-                    long remaining = deadlineNanos - System.nanoTime();
-                    if (remaining <= 0L) {
-                        return false;
-                    }
-                    try {
-                        long millis = remaining / 1_000_000L;
-                        int nanos = (int) (remaining % 1_000_000L);
-                        thread.join(millis, nanos);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        private List<Thread> snapshot() {
-            synchronized (threads) {
-                return List.copyOf(threads);
-            }
-        }
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> void sneakyThrow(Throwable failure) throws T {
+        throw (T) failure;
     }
 }
