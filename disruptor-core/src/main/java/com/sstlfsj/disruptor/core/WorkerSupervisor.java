@@ -13,7 +13,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
-/** 统一监督动态 worker 集的启动、关闭、故障和真实线程终止。 */
+/**
+ * 统一监督动态 worker 集的启动、关闭、故障和真实线程终止。
+ *
+ * <p>{@link ShutdownBackend} 是队列实现接入 supervisor 的内部 SPI，不是任意用户回调。
+ * supervisor 只会从自己的命名虚拟控制线程串行调用它。</p>
+ */
 public final class WorkerSupervisor {
 
     private static final long CONTROL_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
@@ -31,6 +36,7 @@ public final class WorkerSupervisor {
     private final CompletionStage<WorkerSnapshot> terminationView = termination.minimalCompletionStage();
 
     private PipelineLifecycle lifecycle = PipelineLifecycle.NEW;
+    private boolean startupInitiated;
     private boolean registrationSealed;
     private int expectedWorkers;
     private int startedWorkers;
@@ -55,6 +61,11 @@ public final class WorkerSupervisor {
         this.shutdownBackend = Objects.requireNonNull(shutdownBackend, "shutdownBackend 不能为空");
     }
 
+    /**
+     * 构造 supervisor 的内部接入点。
+     *
+     * @param shutdownBackend 满足 {@link ShutdownBackend} 非阻塞阶段契约的队列后端 SPI
+     */
     @Builder(builderMethodName = "builder")
     private static WorkerSupervisor buildSupervisor(
             String name,
@@ -68,10 +79,20 @@ public final class WorkerSupervisor {
         return () -> runSupervised(worker);
     }
 
+    /**
+     * 登记尚未启动的 worker。允许预构造 worker 在 {@link PipelineLifecycle#NEW} 登记；
+     * 启动协议已进入 {@link PipelineLifecycle#STARTING} 后也可动态登记。若并发关闭先把生命周期
+     * 推进到 {@link PipelineLifecycle#STOPPING}，尚未结束的启动协议仍可继续登记，直至封口。
+     */
     public void register(Thread thread) {
         Objects.requireNonNull(thread, "thread 不能为空");
         synchronized (stateLock) {
-            if (lifecycle != PipelineLifecycle.NEW && lifecycle != PipelineLifecycle.STARTING) {
+            boolean startupFinishingWhileStopping = lifecycle == PipelineLifecycle.STOPPING
+                    && startupInitiated
+                    && !registrationSealed;
+            if (lifecycle != PipelineLifecycle.NEW
+                    && lifecycle != PipelineLifecycle.STARTING
+                    && !startupFinishingWhileStopping) {
                 throw new IllegalStateException("不能在 " + lifecycle + " 状态登记 worker");
             }
             if (registrationSealed) {
@@ -91,22 +112,31 @@ public final class WorkerSupervisor {
             if (lifecycle != PipelineLifecycle.NEW) {
                 throw new IllegalStateException("只有 NEW 状态可以进入 STARTING，当前状态=" + lifecycle);
             }
+            startupInitiated = true;
             lifecycle = PipelineLifecycle.STARTING;
             stateLock.notifyAll();
         }
     }
 
+    /**
+     * 封口当前启动协议的 worker 集。
+     *
+     * <p>调用方只能在 {@link #markStarting()} 之后调用，并且必须保证全部线程创建以及所有
+     * {@link Thread#start()} 调用都已返回，之后不会再尝试启动或登记 worker。并发关闭可能已把
+     * 生命周期推进到 {@link PipelineLifecycle#STOPPING}，启动方仍必须在自己的 finally 路径封口。</p>
+     */
     public void sealWorkers() {
         boolean completeStarted;
         synchronized (stateLock) {
-            if (lifecycle != PipelineLifecycle.NEW && lifecycle != PipelineLifecycle.STARTING) {
+            if (!startupInitiated
+                    || (lifecycle != PipelineLifecycle.STARTING
+                    && lifecycle != PipelineLifecycle.STOPPING)) {
                 throw new IllegalStateException("不能在 " + lifecycle + " 状态封口 worker 登记");
             }
             if (registrationSealed) {
                 throw new IllegalStateException("worker 登记已经封口");
             }
-            registrationSealed = true;
-            expectedWorkers = workers.size();
+            sealRegistrationLocked();
             completeStarted = startedWorkers == expectedWorkers;
             stateLock.notifyAll();
         }
@@ -166,6 +196,9 @@ public final class WorkerSupervisor {
             freezeDeadlineLocked(deadline);
             boolean abortStartup = lifecycle == PipelineLifecycle.NEW
                     || lifecycle == PipelineLifecycle.STARTING;
+            if (lifecycle == PipelineLifecycle.NEW) {
+                sealRegistrationLocked();
+            }
             boolean firstRequest = shutdownMode == null;
             if (firstRequest) {
                 shutdownMode = mode;
@@ -270,7 +303,8 @@ public final class WorkerSupervisor {
             ShutdownSignals signals = ShutdownSignals.NONE;
             if (lifecycle == PipelineLifecycle.STARTING
                     || lifecycle == PipelineLifecycle.RUNNING
-                    || lifecycle == PipelineLifecycle.QUIESCING) {
+                    || lifecycle == PipelineLifecycle.QUIESCING
+                    || (lifecycle == PipelineLifecycle.STOPPING && workerFailure != null)) {
                 Throwable exitFailure = workerFailure != null
                         ? workerFailure
                         : new UnexpectedWorkerExitException(name, worker.getName(), lifecycle);
@@ -291,6 +325,9 @@ public final class WorkerSupervisor {
         freezeDeadlineLocked(deadline);
         boolean abortStartup = lifecycle == PipelineLifecycle.NEW
                 || lifecycle == PipelineLifecycle.STARTING;
+        if (lifecycle == PipelineLifecycle.NEW) {
+            sealRegistrationLocked();
+        }
         shutdownMode = ShutdownMode.IMMEDIATE;
         lifecycle = PipelineLifecycle.STOPPING;
         Thread toStart = ensureControlThreadLocked();
@@ -381,7 +418,10 @@ public final class WorkerSupervisor {
                 }
             }
         } else {
-            awaitStateChange(DRAIN_PROBE_INTERVAL_NANOS);
+            long remainingNanos = shutdownDeadline.remainingNanos();
+            if (remainingNanos > 0L) {
+                awaitStateChange(Math.min(DRAIN_PROBE_INTERVAL_NANOS, remainingNanos));
+            }
         }
     }
 
@@ -454,6 +494,9 @@ public final class WorkerSupervisor {
     }
 
     private void awaitStateChange(long waitNanos) {
+        if (waitNanos <= 0L) {
+            return;
+        }
         ShutdownSignals signals = ShutdownSignals.NONE;
         synchronized (stateLock) {
             try {
@@ -468,7 +511,7 @@ public final class WorkerSupervisor {
     }
 
     private boolean canTerminateLocked() {
-        if (lifecycle != PipelineLifecycle.STOPPING) {
+        if (lifecycle != PipelineLifecycle.STOPPING || !registrationSealed) {
             return false;
         }
         boolean stopFinished = shutdownMode == ShutdownMode.GRACEFUL
@@ -477,14 +520,14 @@ public final class WorkerSupervisor {
         return stopFinished && workers.entrySet().stream().allMatch(entry ->
                 joinedWorkers.contains(entry.getKey())
                         || (entry.getValue() == WorkerState.REGISTERED
-                        && entry.getKey().getState() == Thread.State.NEW));
+                        && !entry.getKey().isAlive()));
     }
 
     private Thread nextUnjoinedWorker() {
         synchronized (stateLock) {
             return workers.entrySet().stream()
                     .filter(entry -> entry.getValue() != WorkerState.REGISTERED
-                            || entry.getKey().getState() != Thread.State.NEW)
+                            || entry.getKey().isAlive())
                     .map(Map.Entry::getKey)
                     .filter(worker -> !joinedWorkers.contains(worker))
                     .findFirst()
@@ -496,7 +539,7 @@ public final class WorkerSupervisor {
         synchronized (stateLock) {
             return workers.entrySet().stream()
                     .filter(entry -> entry.getValue() != WorkerState.REGISTERED
-                            || entry.getKey().getState() != Thread.State.NEW)
+                            || entry.getKey().isAlive())
                     .map(Map.Entry::getKey)
                     .toList();
         }
@@ -548,6 +591,11 @@ public final class WorkerSupervisor {
         if (shutdownDeadline == null) {
             shutdownDeadline = deadline;
         }
+    }
+
+    private void sealRegistrationLocked() {
+        registrationSealed = true;
+        expectedWorkers = workers.size();
     }
 
     private Throwable startupAbortedFailureLocked() {

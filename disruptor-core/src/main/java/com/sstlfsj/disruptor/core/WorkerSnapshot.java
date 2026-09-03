@@ -96,8 +96,9 @@ public record WorkerSnapshot(
                 && shutdownMode == null) {
             throw new IllegalArgumentException("停止阶段必须包含 shutdownMode");
         }
-        if (lifecycle == PipelineLifecycle.TERMINATED && aliveWorkers != 0) {
-            throw new IllegalArgumentException("TERMINATED 状态不能仍有存活 worker");
+        if (lifecycle == PipelineLifecycle.TERMINATED
+                && (!registrationSealed || aliveWorkers != 0)) {
+            throw new IllegalArgumentException("TERMINATED 状态必须已封口且没有存活 worker");
         }
         if (drainCommitted && !reachedRunning) {
             throw new IllegalArgumentException("提交排空前必须曾进入 RUNNING");

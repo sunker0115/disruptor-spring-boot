@@ -80,6 +80,14 @@ class PipelineSnapshotTest {
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
                 .lifecycle(PipelineLifecycle.TERMINATED).aliveConsumers(1).build());
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .acceptingPublications(false)
+                .registrationSealed(false)
+                .expectedConsumers(0)
+                .aliveConsumers(0)
+                .shutdownMode(ShutdownMode.IMMEDIATE)
+                .build());
+        assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
                 .drainCommitted(true).build());
         assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
                 .reachedRunning(false).drainCommitted(true).build());

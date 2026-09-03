@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,23 +27,32 @@ class WorkerSupervisorTest {
     @Test
     void dynamicallySealsRegistrationAndWaitsForEveryWorkerToEnter() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch secondThreadStarted = new CountDownLatch(1);
+        CountDownLatch allowSecondAdmission = new CountDownLatch(1);
         RecordingBackend backend = new RecordingBackend();
         backend.drained = true;
         backend.onGracefulStop = release::countDown;
         WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
         Thread first = worker(supervisor, () -> await(release), "first-worker");
-        Thread second = worker(supervisor, () -> await(release), "second-worker");
+        Runnable secondSupervised = supervisor.supervise(() -> await(release));
+        Thread second = Thread.ofPlatform().name("second-worker").unstarted(() -> {
+            secondThreadStarted.countDown();
+            await(allowSecondAdmission);
+            secondSupervised.run();
+        });
 
         supervisor.register(first);
         supervisor.markStarting();
         supervisor.register(second);
         first.start();
         awaitCondition(() -> supervisor.snapshot().startedWorkers() == 1);
+        second.start();
+        assertTrue(secondThreadStarted.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
         supervisor.sealWorkers();
 
         assertFalse(supervisor.workersStarted().toCompletableFuture().isDone());
         assertThrows(IllegalStateException.class, supervisor::markRunning);
-        second.start();
+        allowSecondAdmission.countDown();
         supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         supervisor.markRunning();
 
@@ -246,6 +256,38 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void workerFailureAfterGracefulStopStillFailsThePipelineAndReachesUncaughtHandler() throws Exception {
+        RuntimeException original = new RuntimeException("worker failed while stopping");
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        RecordingBackend backend = new RecordingBackend();
+        backend.drained = true;
+        backend.onGracefulStop = releaseWorker::countDown;
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        Thread worker = worker(supervisor, () -> {
+            await(releaseWorker);
+            throw original;
+        }, "failing-stopping-worker");
+        worker.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        supervisor.sealWorkers();
+        supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        supervisor.markRunning();
+
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL);
+        WorkerSnapshot terminated = terminate(supervisor);
+
+        assertSame(original, terminated.failure());
+        assertSame(original, uncaught.get());
+        assertEquals(ShutdownMode.IMMEDIATE, terminated.shutdownMode());
+        assertFalse(terminated.gracefulTermination());
+        assertEquals(List.of(
+                "beginQuiesce", "isDrained", "stop:GRACEFUL", "stop:IMMEDIATE"), backend.actions);
+    }
+
+    @Test
     void firstDeadlineIsFrozenAndTimeoutNeverPretendsAWorkerTerminated() throws Exception {
         CountDownLatch workerEntered = new CountDownLatch(1);
         CountDownLatch releaseWorker = new CountDownLatch(1);
@@ -279,6 +321,27 @@ class WorkerSupervisorTest {
         assertEquals(1, actionCount(backend, "stop:IMMEDIATE"));
         releaseWorker.countDown();
         assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+    }
+
+    @Test
+    void expiredDeadlineAfterPendingDrainDoesNotWaitIndefinitely() throws Exception {
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        RecordingBackend backend = new RecordingBackend();
+        backend.onImmediateStop = releaseWorker::countDown;
+        WorkerSupervisor supervisor = runningSupervisor(backend, () -> awaitIgnoringInterrupts(releaseWorker));
+        ShutdownDeadline deadline = ShutdownDeadline.after(Duration.ofMillis(5));
+        backend.onDrainResult = () -> {
+            while (!deadline.isExpired()) {
+                Thread.onSpinWait();
+            }
+        };
+
+        supervisor.requestShutdown(ShutdownMode.GRACEFUL, deadline);
+
+        assertTrue(backend.immediateStopped.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        WorkerSnapshot terminated = terminate(supervisor);
+        assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, terminated.failure());
+        assertEquals(ShutdownMode.IMMEDIATE, terminated.shutdownMode());
     }
 
     @Test
@@ -360,63 +423,68 @@ class WorkerSupervisorTest {
     }
 
     @Test
-    void terminationWaitsForAStartedThreadThatHasNotEnteredItsWrapper() throws Exception {
-        CountDownLatch threadStarted = new CountDownLatch(1);
-        CountDownLatch allowAdmission = new CountDownLatch(1);
-        CountDownLatch interruptedBeforeAdmission = new CountDownLatch(1);
+    void shutdownWaitsForInFlightStartToFinishAndRegistrationToBeSealed() throws Exception {
+        CountDownLatch startEntered = new CountDownLatch(1);
+        CountDownLatch allowStart = new CountDownLatch(1);
         AtomicBoolean taskRan = new AtomicBoolean();
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
         WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
-        Runnable supervised = supervisor.supervise(() -> taskRan.set(true));
-        Thread worker = Thread.ofPlatform().name("pre-admission-worker").unstarted(() -> {
-            threadStarted.countDown();
-            while (allowAdmission.getCount() != 0) {
-                try {
-                    allowAdmission.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                } catch (InterruptedException ignored) {
-                    interruptedBeforeAdmission.countDown();
-                }
+        Thread worker = new PausingStartThread(
+                supervisor.supervise(() -> taskRan.set(true)), startEntered, allowStart);
+        worker.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+        Thread starter = Thread.ofVirtual().name("worker-starter").unstarted(() -> {
+            try {
+                worker.start();
+            } catch (Throwable failure) {
+                startFailure.set(failure);
             }
-            supervised.run();
         });
-        worker.setUncaughtExceptionHandler((thread, failure) -> { });
         supervisor.markStarting();
         supervisor.register(worker);
-        supervisor.sealWorkers();
-        worker.start();
-        assertTrue(threadStarted.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        starter.start();
+        assertTrue(startEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
 
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
         assertFalse(supervisor.termination().toCompletableFuture().isDone());
-        assertTrue(interruptedBeforeAdmission.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
-        allowAdmission.countDown();
+        allowStart.countDown();
+        starter.join(TEST_TIMEOUT.toMillis());
+        assertNull(startFailure.get());
+        supervisor.sealWorkers();
 
         WorkerSnapshot terminated = terminate(supervisor);
         assertFalse(taskRan.get());
         assertFalse(worker.isAlive());
+        assertInstanceOf(IllegalStateException.class, uncaught.get());
+        assertTrue(terminated.registrationSealed());
         assertEquals(1, terminated.startedWorkers());
         assertEquals(0, terminated.aliveWorkers());
     }
 
     @Test
-    void workerStartingAfterTerminationIsRejectedWithoutChangingTerminalSnapshot() throws Exception {
-        AtomicBoolean taskRan = new AtomicBoolean();
-        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+    void startupMayFinishRegistrationAndSealAfterConcurrentShutdown() {
         WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
-        Thread lateWorker = worker(supervisor, () -> taskRan.set(true), "late-worker");
-        lateWorker.setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
         supervisor.markStarting();
-        supervisor.register(lateWorker);
-        supervisor.sealWorkers();
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        assertFalse(supervisor.termination().toCompletableFuture().isDone());
+
+        supervisor.register(worker(supervisor, () -> { }, "never-started"));
+        supervisor.sealWorkers();
+
         WorkerSnapshot terminated = terminate(supervisor);
-
-        lateWorker.start();
-        lateWorker.join(TEST_TIMEOUT.toMillis());
-
-        assertFalse(taskRan.get());
-        assertInstanceOf(IllegalStateException.class, uncaught.get());
-        assertEquals(terminated, supervisor.snapshot());
+        assertTrue(terminated.registrationSealed());
+        assertEquals(1, terminated.registeredWorkers());
         assertEquals(0, terminated.startedWorkers());
+    }
+
+    @Test
+    void sealingRequiresAnActiveStartupProtocol() {
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
+
+        assertThrows(IllegalStateException.class, supervisor::sealWorkers);
+
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        assertTrue(terminate(supervisor).registrationSealed());
     }
 
     @Test
@@ -461,6 +529,13 @@ class WorkerSupervisorTest {
                 .lifecycle(PipelineLifecycle.RUNNING).aliveWorkers(0).build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
                 .lifecycle(PipelineLifecycle.TERMINATED).aliveWorkers(1).build());
+        assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .registrationSealed(false)
+                .expectedWorkers(0)
+                .aliveWorkers(0)
+                .shutdownMode(ShutdownMode.IMMEDIATE)
+                .build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
                 .drainCommitted(true).build());
 
@@ -612,6 +687,28 @@ class WorkerSupervisorTest {
 
     private static int actionCount(RecordingBackend backend, String action) {
         return (int) backend.actions.stream().filter(action::equals).count();
+    }
+
+    private static final class PausingStartThread extends Thread {
+
+        private final CountDownLatch startEntered;
+        private final CountDownLatch allowStart;
+
+        private PausingStartThread(
+                Runnable target,
+                CountDownLatch startEntered,
+                CountDownLatch allowStart) {
+            super(target, "pausing-start-worker");
+            this.startEntered = startEntered;
+            this.allowStart = allowStart;
+        }
+
+        @Override
+        public synchronized void start() {
+            startEntered.countDown();
+            await(allowStart);
+            super.start();
+        }
     }
 
     private static void awaitCondition(BooleanSupplier condition) {
