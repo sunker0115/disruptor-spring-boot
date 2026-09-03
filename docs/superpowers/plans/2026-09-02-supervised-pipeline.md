@@ -191,11 +191,11 @@ supervisor builder 保留默认 `shutdownTimeout`，只用于独立关闭和自�
 控制循环必须满足：
 
 - RUNNING graceful：`QUIESCING → drain committed → STOPPING → stop(GRACEFUL)`；
-- immediate、失败或超时：从任意非终止状态进入 `STOPPING → stop(IMMEDIATE)`；
+- immediate、失败或超时：请求线程只提交 `STOPPING` 并唤醒控制线程，控制线程执行 `stop(IMMEDIATE) → interrupt workers`；stop 抛错也必须在 `finally` 中继续中断；
 - graceful stop 后 worker 超时仍可串行升级一次 immediate stop；
 - drain probe 返回 true 后在状态锁内重新确认仍为 `GRACEFUL + QUIESCING`，并发 immediate、故障或 deadline 必须胜出；
 - drain probe 和 worker 等待均使用原始绝对 deadline；
-- deadline 到期只记录首因、升级和中断，worker 存活时不完成 termination；
+- deadline 到期只记录首因和升级，由控制线程先 stop 再中断；worker 存活时不完成 termination；
 - worker 完成 `finally` 且控制线程 `join` 确认真实死亡后才提交 `TERMINATED`。
 
 - [ ] **Step 5: 补齐架构级状态机测试**
@@ -263,6 +263,8 @@ public interface DisruptorPipeline<E> {
 
 `ManagedPipeline` 实现接口并用 supervisor 包装 ThreadFactory。启动按 `markStarting → Disruptor.start → sealWorkers → workersStarted → markRunning` 执行。删除阻塞的 `shutdown/haltNow/StopResult`；后端只实现：
 
+启动完成、关闭和发布准入必须由同一个 lifecycle lock 线性化，发布 gate 单调执行 `NEW → OPEN → CLOSED`。关闭一旦提交就不能被迟到的 `completeStart` 重新打开；启动前关闭必须显式 `markStarting + sealWorkers` 封口零 worker、异常完成同一个启动 stage，并允许直接走到真实 termination。
+
 - `beginQuiesce` 唤醒受管发布等待者；
 - `isDrained` 等在途 publisher 归零后捕获一次 cursor，再检查叶子 gating；
 - `stop` 调用非阻塞 `disruptor.halt()`，不 join、不等待 backlog。
@@ -271,7 +273,7 @@ public interface DisruptorPipeline<E> {
 
 - [ ] **Step 4: 重写 Runtime 为共享 deadline 聚合器**
 
-Runtime 一次关闭只创建一个 `ShutdownDeadline`，先向全部管道广播同一个 graceful 请求，再并行聚合 termination。到 deadline 时，对未终止 child 使用原 deadline 升级 immediate 并返回/抛出聚合结果；后台继续等待真实终止。Runtime 只有在全部 child 的 termination 完成后才能提交自身终止状态。
+Runtime 一次关闭只创建一个 `ShutdownDeadline`，在关闭 API 返回 stage 前同步向全部管道广播同一个请求，再由虚拟协调线程聚合 termination。并发 graceful/immediate 请求只能单调升级，且每个调用返回前自身模式已完成广播。到 deadline 时，对未终止 child 使用原 deadline 升级 immediate 并返回/抛出聚合结果；后台继续等待真实终止。Runtime 只有在全部 child 的 termination 完成后才能提交自身终止状态。
 
 启动失败回滚同样向全部已尝试管道广播同一个 immediate deadline；保留按名称和事件类型查找，不恢复另一套管道状态判断。
 

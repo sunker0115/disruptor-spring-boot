@@ -6,7 +6,6 @@ import com.lmax.disruptor.EventTranslatorThreeArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
-import com.lmax.disruptor.dsl.ProducerType;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -15,8 +14,6 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /** LMAX Disruptor 与统一受监督生命周期之间的单管道适配。 */
 final class ManagedPipeline<E> implements DisruptorPipeline<E> {
@@ -28,16 +25,15 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     private final SupervisingThreadFactory threadFactory;
     private final WorkerSupervisor supervisor;
     private final PipelineHandle<E> handle = new Handle();
-    private final boolean singleProducer;
-    private final AtomicInteger activePublishers;
-    private final AtomicBoolean acceptingPublications = new AtomicBoolean();
+    private final Object lifecycleLock = new Object();
     private final CompletableFuture<Void> started = new CompletableFuture<>();
     private final CompletionStage<Void> startedView = started.minimalCompletionStage();
     private final CompletableFuture<PipelineSnapshot> terminated = new CompletableFuture<>();
     private final CompletionStage<PipelineSnapshot> terminatedView = terminated.minimalCompletionStage();
 
+    private PublicationGate publicationGate = PublicationGate.NEW;
     private boolean startRequested;
-    private volatile boolean singlePublisherActive;
+    private int activePublishers;
     private Long drainCursor;
 
     private ManagedPipeline(
@@ -45,21 +41,18 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             Class<E> eventType,
             Disruptor<E> disruptor,
             SupervisingThreadFactory threadFactory,
-            ProducerType producerType,
             Duration shutdownTimeout) {
         this.name = name;
         this.eventType = eventType;
         this.disruptor = disruptor;
         this.ringBuffer = disruptor.getRingBuffer();
         this.threadFactory = threadFactory;
-        this.singleProducer = producerType == ProducerType.SINGLE;
-        this.activePublishers = singleProducer ? null : new AtomicInteger();
         this.supervisor = WorkerSupervisor.builder()
                 .name(name)
                 .shutdownTimeout(shutdownTimeout)
                 .shutdownBackend(new LmaxShutdownBackend())
                 .build();
-        threadFactory.bind(supervisor, acceptingPublications);
+        threadFactory.bind(supervisor, this::closePublicationGate);
         supervisor.termination().whenComplete((workerSnapshot, failure) -> {
             if (failure != null) {
                 terminated.completeExceptionally(unwrap(failure));
@@ -98,7 +91,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     + "' 的 topology 不得调用 start()，生命周期必须由 DisruptorPipeline 托管");
         }
         return new ManagedPipeline<>(spec.name(), spec.eventType(), disruptor, threadFactory,
-                settings.producerType(), shutdownTimeout);
+                shutdownTimeout);
     }
 
     @Override
@@ -112,23 +105,25 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     }
 
     @Override
-    public synchronized CompletionStage<Void> start() {
-        if (startRequested) {
-            return startedView;
+    public CompletionStage<Void> start() {
+        synchronized (lifecycleLock) {
+            if (startRequested) {
+                return startedView;
+            }
+            startRequested = true;
+            supervisor.markStarting();
+            threadFactory.enable();
         }
-        startRequested = true;
-        supervisor.markStarting();
-        threadFactory.enable();
         try {
             disruptor.start();
         } catch (Throwable failure) {
-            acceptingPublications.set(false);
+            closePublicationGate();
             supervisor.fail(failure);
         } finally {
             try {
                 supervisor.sealWorkers();
             } catch (Throwable sealFailure) {
-                acceptingPublications.set(false);
+                closePublicationGate();
                 supervisor.fail(sealFailure);
             }
         }
@@ -140,8 +135,20 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     public void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline) {
         Objects.requireNonNull(mode, "mode 不能为空");
         Objects.requireNonNull(deadline, "deadline 不能为空");
-        acceptingPublications.set(false);
+        Throwable preStartFailure = null;
+        synchronized (lifecycleLock) {
+            publicationGate = PublicationGate.CLOSED;
+            if (!startRequested) {
+                startRequested = true;
+                supervisor.markStarting();
+                supervisor.sealWorkers();
+                preStartFailure = new PipelineStartAbortedException(name);
+            }
+        }
         supervisor.requestShutdown(mode, deadline);
+        if (preStartFailure != null) {
+            started.completeExceptionally(preStartFailure);
+        }
     }
 
     @Override
@@ -150,36 +157,52 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     }
 
     private void completeStart(Throwable startupFailure) {
+        Throwable completionFailure = null;
+        boolean failSupervisor = false;
         if (startupFailure != null) {
-            started.completeExceptionally(unwrap(startupFailure));
+            completionFailure = unwrap(startupFailure);
+            closePublicationGate();
+        } else {
+            synchronized (lifecycleLock) {
+                if (publicationGate == PublicationGate.CLOSED) {
+                    completionFailure = startupFailureFromSupervisor();
+                } else {
+                    try {
+                        supervisor.markRunning();
+                        publicationGate = PublicationGate.OPEN;
+                    } catch (Throwable failure) {
+                        publicationGate = PublicationGate.CLOSED;
+                        WorkerSnapshot current = supervisor.snapshot();
+                        completionFailure = current.failure() == null
+                                ? failure
+                                : current.failure();
+                        failSupervisor = current.failure() == null
+                                && current.shutdownMode() == null;
+                    }
+                }
+            }
+        }
+        if (completionFailure == null) {
+            started.complete(null);
             return;
         }
-        try {
-            supervisor.markRunning();
-            acceptingPublications.set(true);
-            WorkerSnapshot current = supervisor.snapshot();
-            if (current.lifecycle() != PipelineLifecycle.RUNNING) {
-                acceptingPublications.set(false);
-                throw current.failure() == null
-                        ? new IllegalStateException("管道 '" + name + "' 未能保持 RUNNING")
-                        : current.failure();
-            }
-            started.complete(null);
-        } catch (Throwable failure) {
-            acceptingPublications.set(false);
-            supervisor.fail(failure);
-            Throwable firstFailure = supervisor.snapshot().failure();
-            started.completeExceptionally(firstFailure == null ? failure : firstFailure);
+        if (failSupervisor) {
+            supervisor.fail(completionFailure);
         }
+        started.completeExceptionally(completionFailure);
     }
 
     private PipelineSnapshot snapshot(WorkerSnapshot worker) {
         long cursor = ringBuffer.getCursor();
         long minimumGating = ringBuffer.getMinimumGatingSequence();
+        boolean acceptingPublications;
+        synchronized (lifecycleLock) {
+            acceptingPublications = publicationGate == PublicationGate.OPEN;
+        }
         return PipelineSnapshot.builder()
                 .name(name)
                 .lifecycle(worker.lifecycle())
-                .acceptingPublications(acceptingPublications.get()
+                .acceptingPublications(acceptingPublications
                         && worker.lifecycle() == PipelineLifecycle.RUNNING)
                 .registrationSealed(worker.registrationSealed())
                 .expectedConsumers(worker.expectedWorkers())
@@ -197,23 +220,13 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     }
 
     private boolean enterPublisher() {
-        if (!acceptingPublications.get()) {
-            return false;
-        }
-        if (singleProducer) {
-            singlePublisherActive = true;
-            if (acceptingPublications.get()) {
-                return true;
+        synchronized (lifecycleLock) {
+            if (publicationGate != PublicationGate.OPEN) {
+                return false;
             }
-            singlePublisherActive = false;
-            return false;
-        }
-        activePublishers.incrementAndGet();
-        if (acceptingPublications.get()) {
+            activePublishers++;
             return true;
         }
-        activePublishers.decrementAndGet();
-        return false;
     }
 
     private void enterPublisherOrThrow() {
@@ -223,15 +236,28 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     }
 
     private void exitPublisher() {
-        if (singleProducer) {
-            singlePublisherActive = false;
-        } else {
-            activePublishers.decrementAndGet();
+        synchronized (lifecycleLock) {
+            activePublishers--;
+            lifecycleLock.notifyAll();
         }
     }
 
     private boolean hasActivePublishers() {
-        return singleProducer ? singlePublisherActive : activePublishers.get() != 0;
+        synchronized (lifecycleLock) {
+            return activePublishers != 0;
+        }
+    }
+
+    private void closePublicationGate() {
+        synchronized (lifecycleLock) {
+            publicationGate = PublicationGate.CLOSED;
+            lifecycleLock.notifyAll();
+        }
+    }
+
+    private Throwable startupFailureFromSupervisor() {
+        Throwable failure = supervisor.snapshot().failure();
+        return failure == null ? new PipelineStartAbortedException(name) : failure;
     }
 
     private static Throwable unwrap(Throwable failure) {
@@ -247,7 +273,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
         @Override
         public void beginQuiesce() {
-            acceptingPublications.set(false);
+            closePublicationGate();
         }
 
         @Override
@@ -396,7 +422,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
         private final ThreadFactory delegate;
         private WorkerSupervisor supervisor;
-        private AtomicBoolean acceptingPublications;
+        private Runnable closePublicationGate;
         private boolean enabled;
 
         private SupervisingThreadFactory(ThreadFactory delegate) {
@@ -405,13 +431,13 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
         private synchronized void bind(
                 WorkerSupervisor supervisor,
-                AtomicBoolean acceptingPublications) {
+                Runnable closePublicationGate) {
             if (this.supervisor != null) {
                 throw new IllegalStateException("supervisor 已绑定");
             }
             this.supervisor = Objects.requireNonNull(supervisor, "supervisor 不能为空");
-            this.acceptingPublications = Objects.requireNonNull(
-                    acceptingPublications, "acceptingPublications 不能为空");
+            this.closePublicationGate = Objects.requireNonNull(
+                    closePublicationGate, "closePublicationGate 不能为空");
         }
 
         private synchronized void enable() {
@@ -421,53 +447,39 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         @Override
         public Thread newThread(Runnable runnable) {
             WorkerSupervisor currentSupervisor;
-            AtomicBoolean currentAcceptance;
+            Runnable currentClosePublicationGate;
             synchronized (this) {
                 if (!enabled || supervisor == null) {
                     throw new IllegalStateException("线程只能由 DisruptorPipeline.start() 创建");
                 }
                 currentSupervisor = supervisor;
-                currentAcceptance = acceptingPublications;
+                currentClosePublicationGate = closePublicationGate;
             }
+            Runnable supervisedWorker = currentSupervisor.supervise(runnable);
             Runnable monitoredWorker = () -> {
                 try {
-                    runnable.run();
-                } catch (Throwable failure) {
-                    WorkerSnapshot snapshot = currentSupervisor.snapshot();
-                    if (!isControlledInterruption(failure, snapshot)) {
-                        sneakyThrow(failure);
-                    }
+                    supervisedWorker.run();
                 } finally {
-                    currentAcceptance.set(false);
+                    currentClosePublicationGate.run();
                 }
             };
             Thread thread = Objects.requireNonNull(
-                    delegate.newThread(currentSupervisor.supervise(monitoredWorker)),
+                    delegate.newThread(monitoredWorker),
                     "threadFactory 不能返回 null");
             currentSupervisor.register(thread);
             return thread;
         }
-
-        private static boolean isControlledInterruption(
-                Throwable failure,
-                WorkerSnapshot snapshot) {
-            if (snapshot.lifecycle() != PipelineLifecycle.STOPPING
-                    || snapshot.shutdownMode() != ShutdownMode.IMMEDIATE) {
-                return false;
-            }
-            Throwable current = failure;
-            while (current != null) {
-                if (current instanceof InterruptedException) {
-                    return true;
-                }
-                current = current.getCause();
-            }
-            return false;
-        }
     }
 
-    @SuppressWarnings("unchecked")
-    private static <T extends Throwable> void sneakyThrow(Throwable failure) throws T {
-        throw (T) failure;
+    private enum PublicationGate {
+        NEW,
+        OPEN,
+        CLOSED
+    }
+
+    private static final class PipelineStartAbortedException extends IllegalStateException {
+        private PipelineStartAbortedException(String pipelineName) {
+            super("管道在启动前已被关闭：pipeline=" + pipelineName);
+        }
     }
 }

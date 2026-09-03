@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,6 +29,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -148,6 +150,112 @@ class DisruptorRuntimeTest {
     }
 
     @Test
+    void shutdownBeforeRuntimeStartTerminatesEveryPipeline() throws Exception {
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .add(spec("never-started-first"))
+                .add(spec("never-started-second"))
+                .build();
+
+        runtime.shutdown();
+
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.pipelines().stream()
+                .map(DisruptorPipeline::snapshot)
+                .map(PipelineSnapshot::lifecycle)
+                .collect(java.util.stream.Collectors.toSet()));
+        assertThrows(IllegalStateException.class, runtime::start);
+    }
+
+    @Test
+    void shutdownBeforeStartAlsoTerminatesAnEmptyRuntime() throws Exception {
+        DisruptorRuntime runtime = DisruptorRuntime.builder().build();
+
+        runtime.shutdown();
+
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertThrows(IllegalStateException.class, runtime::start);
+    }
+
+    @Test
+    void shutdownAndImmediateUpgradeAreBroadcastBeforeTheirApiCallsReturn() throws Exception {
+        CountDownLatch handlerEntered = new CountDownLatch(1);
+        CountDownLatch releaseHandler = new CountDownLatch(1);
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(Duration.ofSeconds(2))
+                .add(PipelineSpec.builder("api-boundary", TestEvent.class,
+                                () -> new TestEvent("slot"))
+                        .topology(disruptor -> disruptor.handleEventsWith(
+                                (event, sequence, endOfBatch) -> {
+                                    handlerEntered.countDown();
+                                    awaitUninterruptibly(releaseHandler);
+                                }))
+                        .build())
+                .build();
+        runtime.start();
+        runtime.require("api-boundary", TestEvent.class)
+                .publishEvent(TRANSLATOR, "blocked", 1L);
+        assertTrue(handlerEntered.await(2, TimeUnit.SECONDS));
+        Object pipelineLock = lifecycleLock(runtime.requirePipeline("api-boundary", TestEvent.class));
+        AtomicReference<CompletionStage<Void>> gracefulResult = new AtomicReference<>();
+        AtomicBoolean gracefulReturned = new AtomicBoolean();
+        Thread gracefulCaller;
+        synchronized (pipelineLock) {
+            gracefulCaller = Thread.ofPlatform().start(() -> {
+                gracefulResult.set(runtime.shutdownAsync());
+                gracefulReturned.set(true);
+            });
+            awaitCondition(() -> gracefulCaller.getState() == Thread.State.BLOCKED,
+                    Duration.ofSeconds(2));
+            assertFalse(gracefulReturned.get(),
+                    "shutdownAsync 返回前必须同步广播 GRACEFUL");
+        }
+        gracefulCaller.join(2_000);
+        assertTrue(gracefulReturned.get());
+        assertEquals(ShutdownMode.GRACEFUL,
+                runtime.requirePipeline("api-boundary", TestEvent.class).snapshot().shutdownMode());
+
+        AtomicReference<CompletionStage<Void>> repeatedGracefulResult = new AtomicReference<>();
+        AtomicBoolean repeatedGracefulReturned = new AtomicBoolean();
+        Thread repeatedGracefulCaller;
+        synchronized (pipelineLock) {
+            repeatedGracefulCaller = Thread.ofPlatform().start(() -> {
+                repeatedGracefulResult.set(runtime.shutdownAsync());
+                repeatedGracefulReturned.set(true);
+            });
+            awaitCondition(() -> repeatedGracefulCaller.getState() == Thread.State.BLOCKED,
+                    Duration.ofSeconds(2));
+            assertFalse(repeatedGracefulReturned.get(),
+                    "重复 shutdownAsync 返回前也必须同步广播 GRACEFUL");
+        }
+        repeatedGracefulCaller.join(2_000);
+        assertTrue(repeatedGracefulReturned.get());
+        assertSame(gracefulResult.get(), repeatedGracefulResult.get());
+
+        AtomicReference<CompletionStage<Void>> immediateResult = new AtomicReference<>();
+        AtomicBoolean immediateReturned = new AtomicBoolean();
+        Thread immediateCaller;
+        synchronized (pipelineLock) {
+            immediateCaller = Thread.ofPlatform().start(() -> {
+                immediateResult.set(runtime.haltAsync());
+                immediateReturned.set(true);
+            });
+            awaitCondition(() -> immediateCaller.getState() == Thread.State.BLOCKED,
+                    Duration.ofSeconds(2));
+            assertFalse(immediateReturned.get(),
+                    "haltAsync 返回前必须同步广播 IMMEDIATE 升级");
+        }
+        immediateCaller.join(2_000);
+        assertTrue(immediateReturned.get());
+        assertEquals(ShutdownMode.IMMEDIATE,
+                runtime.requirePipeline("api-boundary", TestEvent.class).snapshot().shutdownMode());
+        assertSame(gracefulResult.get(), immediateResult.get());
+
+        releaseHandler.countDown();
+        gracefulResult.get().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
     void haltsStartedPipelinesWhenAStartupFails() throws Exception {
         CountDownLatch firstStarted = new CountDownLatch(1);
         CountDownLatch firstHalted = new CountDownLatch(1);
@@ -227,8 +335,8 @@ class DisruptorRuntimeTest {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(partiallyStarted).build();
 
         assertThrows(IllegalStateException.class, runtime::start);
-        assertEquals(1L, started.getCount(), "失败竞态中未入场 worker 不得执行 LMAX 用户 runnable");
-        assertEquals(1L, stopped.getCount(), "未执行 onStart 的 worker 不应伪造 onShutdown 回调");
+        assertEquals(started.getCount(), stopped.getCount(),
+                "worker 若进入 LMAX runnable，onStart/onShutdown 必须成对；未入场则二者都不执行");
         Thread thread = startedThread.get();
         assertNotNull(thread);
         thread.join(2_000);
@@ -749,6 +857,16 @@ class DisruptorRuntimeTest {
         int start = message.indexOf("deadlineNanos=");
         int end = message.indexOf('，', start);
         return message.substring(start, end);
+    }
+
+    private static Object lifecycleLock(DisruptorPipeline<?> pipeline) {
+        try {
+            var field = pipeline.getClass().getDeclaredField("lifecycleLock");
+            field.setAccessible(true);
+            return field.get(pipeline);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("无法读取 ManagedPipeline 生命周期锁", failure);
+        }
     }
 
     private static PipelineSpec<TestEvent> shutdownSignalling(String name, CountDownLatch allShutdown) {

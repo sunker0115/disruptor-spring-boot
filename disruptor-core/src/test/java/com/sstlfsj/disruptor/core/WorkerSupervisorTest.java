@@ -290,6 +290,72 @@ class WorkerSupervisorTest {
     }
 
     @Test
+    void immediateStopRunsBackendBeforeInterruptingWorkers() throws Exception {
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        AtomicReference<Thread> workerReference = new AtomicReference<>();
+        AtomicBoolean interruptedAtStop = new AtomicBoolean();
+        RecordingBackend backend = new RecordingBackend();
+        backend.onImmediateStop = () -> interruptedAtStop.set(
+                workerReference.get().isInterrupted());
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        Thread worker = worker(supervisor, () -> {
+            workerEntered.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException expected) {
+                Thread.currentThread().interrupt();
+            }
+        }, "stop-before-interrupt-worker");
+        workerReference.set(worker);
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        supervisor.sealWorkers();
+        supervisor.workersStarted().toCompletableFuture()
+                .get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        supervisor.markRunning();
+        assertTrue(workerEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        WorkerSnapshot terminated = terminate(supervisor);
+
+        assertFalse(interruptedAtStop.get(), "backend stop 返回前不得先中断 worker");
+        assertNull(terminated.failure());
+    }
+
+    @Test
+    void immediateStopFailureStillInterruptsWorkers() throws Exception {
+        RuntimeException original = new RuntimeException("immediate stop failed");
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        AtomicBoolean workerInterrupted = new AtomicBoolean();
+        RecordingBackend backend = new RecordingBackend();
+        backend.immediateFailure = original;
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, backend);
+        Thread worker = worker(supervisor, () -> {
+            workerEntered.countDown();
+            try {
+                new CountDownLatch(1).await();
+            } catch (InterruptedException expected) {
+                workerInterrupted.set(true);
+            }
+        }, "failed-stop-interrupt-worker");
+        supervisor.markStarting();
+        supervisor.register(worker);
+        worker.start();
+        supervisor.sealWorkers();
+        supervisor.workersStarted().toCompletableFuture()
+                .get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        supervisor.markRunning();
+        assertTrue(workerEntered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
+        WorkerSnapshot terminated = terminate(supervisor);
+
+        assertTrue(workerInterrupted.get(), "stop(IMMEDIATE) 抛错后仍必须中断 worker");
+        assertSame(original, terminated.failure());
+    }
+
+    @Test
     void repeatedGracefulRequestDoesNotSkipDrainOrRepeatBackendPhases() throws Exception {
         CountDownLatch releaseWorker = new CountDownLatch(1);
         RecordingBackend backend = new RecordingBackend();

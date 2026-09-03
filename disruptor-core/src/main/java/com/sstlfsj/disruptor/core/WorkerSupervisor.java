@@ -221,7 +221,6 @@ public final class WorkerSupervisor {
             stateLock.notifyAll();
             signals = new ShutdownSignals(
                     toStart,
-                    shutdownMode == ShutdownMode.IMMEDIATE,
                     abortStartup ? commitStartupFailureLocked() : null);
         }
         apply(signals);
@@ -297,7 +296,7 @@ public final class WorkerSupervisor {
             StartupNotification startupNotification = commitStartupSuccessIfReadyLocked();
             stateLock.notifyAll();
             return new WorkerAdmission(null,
-                    new ShutdownSignals(null, false, startupNotification));
+                    new ShutdownSignals(null, startupNotification));
         }
     }
 
@@ -340,7 +339,7 @@ public final class WorkerSupervisor {
         lifecycle = PipelineLifecycle.STOPPING;
         Thread toStart = ensureControlThreadLocked();
         stateLock.notifyAll();
-        return new ShutdownSignals(toStart, true,
+        return new ShutdownSignals(toStart,
                 abortStartup ? commitStartupFailureLocked() : null);
     }
 
@@ -445,6 +444,9 @@ public final class WorkerSupervisor {
         } catch (Throwable failure) {
             backendFailure = failure;
         } finally {
+            if (backendFailure != null) {
+                applyBackendFailure(backendFailure);
+            }
             synchronized (stateLock) {
                 if (mode == ShutdownMode.GRACEFUL) {
                     gracefulStopFinished = true;
@@ -453,9 +455,9 @@ public final class WorkerSupervisor {
                 }
                 stateLock.notifyAll();
             }
-        }
-        if (backendFailure != null) {
-            applyBackendFailure(backendFailure);
+            if (mode == ShutdownMode.IMMEDIATE) {
+                interruptWorkers();
+            }
         }
     }
 
@@ -559,9 +561,6 @@ public final class WorkerSupervisor {
 
     private void apply(ShutdownSignals signals) {
         publishStartupOutcome(signals.startupNotification());
-        if (signals.interruptWorkers()) {
-            interruptWorkers();
-        }
         if (signals.controlThreadToStart() != null) {
             signals.controlThreadToStart().start();
         }
@@ -756,8 +755,7 @@ public final class WorkerSupervisor {
 
     private record ShutdownSignals(
             Thread controlThreadToStart,
-            boolean interruptWorkers,
             StartupNotification startupNotification) {
-        private static final ShutdownSignals NONE = new ShutdownSignals(null, false, null);
+        private static final ShutdownSignals NONE = new ShutdownSignals(null, null);
     }
 }

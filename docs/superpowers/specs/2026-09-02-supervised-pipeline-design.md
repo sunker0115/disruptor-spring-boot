@@ -64,7 +64,7 @@ public interface ShutdownBackend {
 - 后端动作抛出的首个异常进入 supervisor 首因，随后单调升级为 `IMMEDIATE`。
 - `isDrained()` 返回 true 后必须回到状态锁重新确认仍为同一次 `GRACEFUL + QUIESCING`，才能提交 drain 和 `STOPPING`；并发 immediate、故障或 deadline 永远优先。
 
-supervisor 配置一个默认 `shutdownTimeout`，只用于没有上层协调者的独立关闭或自主故障。`requestShutdown(mode, deadline)` 只在线性化点关闭准入、推进状态、冻结首次 deadline，并启动或唤醒控制线程；它不执行排空、后端 stop 或线程等待。worker 自主故障使用默认 timeout 生成 deadline；Runtime/Group 在 child 尚未开始关闭时传入共享 deadline。并发请求以状态锁内第一个线性化的 deadline 为准，后续不得覆盖或延长。消费线程发起关闭时不会等待自身。
+supervisor 配置一个默认 `shutdownTimeout`，只用于没有上层协调者的独立关闭或自主故障。`requestShutdown(mode, deadline)` 只在线性化点关闭准入、推进状态、冻结首次 deadline，并启动或唤醒控制线程；它不执行排空、后端 stop、worker 中断或线程等待。worker 自主故障使用默认 timeout 生成 deadline；Runtime/Group 在 child 尚未开始关闭时传入共享 deadline。并发请求以状态锁内第一个线性化的 deadline 为准，后续不得覆盖或延长。消费线程发起关闭时不会等待自身。
 
 ### 状态、健康与 worker 入场
 
@@ -110,7 +110,9 @@ LMAX 管道的启动顺序是：
 2. 调用 `Disruptor.start()`，由托管 ThreadFactory 动态登记并启动全部 processor 线程；
 3. `Disruptor.start()` 返回后封口 worker 登记；
 4. 等待全部 worker 实际入场，再提交 `RUNNING` 和启动完成信号；
-5. 任一步失败都锁存原始首因并使用同一 lifecycle 进入 `IMMEDIATE` 回滚。
+5. `ManagedPipeline` 用同一个 lifecycle lock 线性化启动完成、关闭和发布准入；发布 gate 只允许 `NEW → OPEN → CLOSED`，关闭一旦胜出就永不重新打开；
+6. 启动前关闭通过 `markStarting + sealWorkers` 显式封口零 worker，启动 stage 异常完成，后续重复 `start()` 返回同一个失败 stage；
+7. 任一步失败都锁存原始首因并使用同一 lifecycle 进入 `IMMEDIATE` 回滚。
 
 这样支持 LMAX 任意原生 topology，不依赖反射读取 ConsumerRepository，也不把线程已创建误认为线程已运行。
 
@@ -136,7 +138,7 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 - `beginQuiesce()`：唤醒受管发布等待者；生命周期状态已经拒绝新发布。
 - `isDrained()`：先等待已获准 publisher 数归零，只在归零后捕获一次固定 cursor；所有叶子 gating sequence 到达目标后返回 true。
 - `stop(GRACEFUL)`：排空提交后调用非阻塞 `disruptor.halt()`。
-- `stop(IMMEDIATE)`：直接调用 `disruptor.halt()`；supervisor 同时中断仍存活 worker。
+- `stop(IMMEDIATE)`：直接调用 `disruptor.halt()`；控制线程等待 halt/alert 返回后再中断仍存活 worker。
 
 优雅关闭固定经过：关闭准入 → 等在途发布 → 捕获 cursor → 等叶子 sequence → `STOPPING` → halt → join。故障或立即停止不等待 gating sequence。
 
@@ -144,9 +146,9 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 
 `ShutdownDeadline.after(Duration)` 使用饱和加法生成绝对 `deadlineNanos`。第一次关闭请求或自主故障冻结 deadline，重复请求和 `IMMEDIATE` 升级不得延长。独立管道/EventLoop 使用自己的默认 shutdown timeout；Runtime/Group 在首次请求前创建一个共享 deadline 并传给全部 child。
 
-控制线程只做非阻塞 drain probe 和有界等待，因此 deadline 不会被后端排空回调卡住。外部 `IMMEDIATE` 请求在线性化点直接把 `QUIESCING` 升级为 `STOPPING`、中断 worker 并唤醒控制线程；控制线程随后串行执行 immediate stop。
+控制线程只做非阻塞 drain probe 和有界等待，因此 deadline 不会被后端排空回调卡住。外部 `IMMEDIATE` 请求在线性化点直接关闭准入、把 `QUIESCING` 升级为 `STOPPING` 并唤醒控制线程；控制线程随后先串行执行 immediate stop，再中断仍存活 worker。即使 stop 抛错，中断也在其 `finally` 路径执行。这样 LMAX 会先通过 halt/alert 结束正常等待，不会把监督器主动中断误报为消费故障。
 
-deadline 到期只做三件事：若尚无首因则记录 `WorkerTerminationTimeoutException`、把模式升级为 `IMMEDIATE`、中断并强制停止后端。它不是终止捷径。抗中断 worker 仍存活时生命周期保持 `STOPPING`，`termination()` 不完成；控制线程继续等待实际线程死亡。只有后端停止动作已经执行、所有实际启动的 worker 完成 `join`，才能在状态锁内提交 `TERMINATED` 和终止快照。
+deadline 到期只做三件事：若尚无首因则记录 `WorkerTerminationTimeoutException`、把模式升级为 `IMMEDIATE`、由控制线程先强制停止后端再中断 worker。它不是终止捷径。抗中断 worker 仍存活时生命周期保持 `STOPPING`，`termination()` 不完成；控制线程继续等待实际线程死亡。只有后端停止动作已经执行、所有实际启动的 worker 完成 `join`，才能在状态锁内提交 `TERMINATED` 和终止快照。
 
 worker 退出前的引用清理、Future 终态化和模块 stop 属于 worker 自己的 `finally`。因此线程真实退出自然蕴含后端 cleanup 已完成，supervisor 不另设会阻塞的 cleanup 回调。
 
@@ -154,7 +156,7 @@ worker 退出前的引用清理、Future 终态化和模块 stop 属于 worker �
 
 ### Runtime 聚合
 
-Runtime 为一次关闭创建一个 `ShutdownDeadline`，先向所有管道广播相同 deadline 的关闭请求，再聚合等待；不能为每条管道重新计算 timeout。到共同 deadline 时，对尚未终止的管道使用原 deadline 升级 `IMMEDIATE` 并返回或抛出聚合结果，后台继续等待 child 的真实 termination。
+Runtime 为一次关闭创建一个 `ShutdownDeadline`，在 `shutdown/halt` 及其异步变体返回 stage 前同步向所有管道广播相同 deadline 的关闭请求，再由协调线程聚合等待；不能为每条管道重新计算 timeout。并发 `GRACEFUL/IMMEDIATE` 请求单调升级，每个调用返回前都已广播自身要求的模式。到共同 deadline 时，对尚未终止的管道使用原 deadline 升级 `IMMEDIATE` 并返回或抛出聚合结果，后台继续等待 child 的真实 termination。
 
 Runtime 自身只有在所有 child 真正终止后才能提交终止状态。启动失败回滚也使用同一个绝对 deadline；不得在仍有 child 处于 `STOPPING` 时把 Runtime 标记为已终止。
 

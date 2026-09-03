@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -207,6 +208,135 @@ class DisruptorPipelineTest {
         assertEquals(ShutdownMode.IMMEDIATE, terminated.shutdownMode());
         assertNull(terminated.failure(), "受控中断不能被误报成 consumer 故障");
         assertFalse(terminated.gracefulTermination());
+    }
+
+    @Test
+    void completedStartWinningBeforeShutdownClosesTheGateWithoutFailure() throws Exception {
+        DisruptorPipeline<TestEvent> pipeline = pipeline(PipelineSpec.builder(
+                        "start-wins-close", TestEvent.class, TestEvent::new)
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> { }))
+                .build());
+        pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertTrue(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+
+        pipeline.requestShutdown(ShutdownMode.GRACEFUL,
+                ShutdownDeadline.after(Duration.ofSeconds(2)));
+
+        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+        assertNull(terminated.failure());
+        assertTrue(terminated.gracefulTermination());
+    }
+
+    @Test
+    void shutdownBeforeStartTerminatesAndEveryStartReturnsTheSameFailedStage() throws Exception {
+        DisruptorPipeline<TestEvent> pipeline = pipeline(PipelineSpec.builder(
+                        "never-started", TestEvent.class, TestEvent::new)
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> { }))
+                .build());
+
+        pipeline.requestShutdown(ShutdownMode.GRACEFUL,
+                ShutdownDeadline.after(Duration.ofSeconds(2)));
+        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+        CompletionStage<Void> firstStart = pipeline.start();
+        CompletionStage<Void> repeatedStart = pipeline.start();
+
+        assertEquals(PipelineLifecycle.TERMINATED, terminated.lifecycle());
+        assertSame(firstStart, repeatedStart);
+        assertTrue(firstStart.toCompletableFuture().isCompletedExceptionally());
+        assertThrows(CompletionException.class, () -> firstStart.toCompletableFuture().join());
+        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+    }
+
+    @Test
+    void gracefulShutdownWinningDuringStartPermanentlyClosesPublicationGate() throws Exception {
+        CountDownLatch threadCreated = new CountDownLatch(1);
+        CountDownLatch allowEntry = new CountDownLatch(1);
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "close-wins-start", TestEvent.class, TestEvent::new)
+                .threadFactory(runnable -> new Thread(() -> {
+                    threadCreated.countDown();
+                    awaitUninterruptibly(allowEntry);
+                    runnable.run();
+                }, "close-wins-worker"))
+                .topology(disruptor -> disruptor.handleEventsWith(
+                        (event, sequence, endOfBatch) -> { }))
+                .build();
+        DisruptorPipeline<TestEvent> pipeline = pipeline(spec);
+        var start = pipeline.start().toCompletableFuture();
+        assertTrue(threadCreated.await(2, TimeUnit.SECONDS));
+
+        pipeline.requestShutdown(ShutdownMode.GRACEFUL,
+                ShutdownDeadline.after(Duration.ofSeconds(2)));
+        assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
+        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        allowEntry.countDown();
+
+        assertThrows(Exception.class, () -> start.get(2, TimeUnit.SECONDS));
+        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+        assertNull(terminated.failure(), "正常并发关闭不能伪造基础设施故障");
+        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+    }
+
+    @Test
+    void genuineThrowableWithInterruptedCauseIsNotSwallowedDuringImmediateStop() throws Exception {
+        RuntimeException original = new RuntimeException(
+                "genuine consumer failure", new InterruptedException("business cause"));
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch releaseWorker = new CountDownLatch(1);
+        AtomicReference<Throwable> uncaught = new AtomicReference<>();
+        EventProcessor processor = new EventProcessor() {
+            private final Sequence sequence = new Sequence();
+            private final AtomicBoolean running = new AtomicBoolean();
+
+            @Override
+            public Sequence getSequence() {
+                return sequence;
+            }
+
+            @Override
+            public void halt() {
+                releaseWorker.countDown();
+            }
+
+            @Override
+            public boolean isRunning() {
+                return running.get();
+            }
+
+            @Override
+            public void run() {
+                running.set(true);
+                workerEntered.countDown();
+                awaitUninterruptibly(releaseWorker);
+                throw original;
+            }
+        };
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "preserve-throwable", TestEvent.class, TestEvent::new)
+                .threadFactory(runnable -> {
+                    Thread thread = new Thread(runnable, "preserve-throwable-worker");
+                    thread.setUncaughtExceptionHandler((ignored, failure) -> uncaught.set(failure));
+                    return thread;
+                })
+                .topology(disruptor -> disruptor.handleEventsWith(processor))
+                .build();
+        DisruptorPipeline<TestEvent> pipeline = pipeline(spec);
+        pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertTrue(workerEntered.await(2, TimeUnit.SECONDS));
+
+        pipeline.requestShutdown(ShutdownMode.IMMEDIATE,
+                ShutdownDeadline.after(Duration.ofSeconds(2)));
+        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+
+        assertSame(original, terminated.failure());
+        assertSame(original, uncaught.get());
     }
 
     private static DisruptorPipeline<TestEvent> pipeline(PipelineSpec<TestEvent> spec) {

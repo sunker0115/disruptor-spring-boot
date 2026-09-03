@@ -211,7 +211,7 @@ public final class DisruptorRuntime {
     private CompletionStage<Void> requestStop(ShutdownMode requestedMode) {
         ShutdownDeadline deadline;
         boolean startCoordinator = false;
-        boolean upgrade;
+        ShutdownMode modeToBroadcast;
         synchronized (lifecycleLock) {
             if (state == State.TERMINATED) {
                 return shutdownOutcomeView == null
@@ -227,31 +227,29 @@ public final class DisruptorRuntime {
                 startTerminationAggregationLocked();
                 startCoordinator = true;
             }
-            upgrade = requestedMode == ShutdownMode.IMMEDIATE
+            boolean upgrade = requestedMode == ShutdownMode.IMMEDIATE
                     && shutdownMode != ShutdownMode.IMMEDIATE;
             if (upgrade) {
                 shutdownMode = ShutdownMode.IMMEDIATE;
             }
             deadline = shutdownDeadline;
+            modeToBroadcast = shutdownMode;
         }
-        if (upgrade) {
-            requestEveryPipeline(ShutdownMode.IMMEDIATE, deadline);
-        }
+        requestEveryPipeline(modeToBroadcast, deadline);
         if (startCoordinator) {
             ShutdownMode initialMode = requestedMode;
             Thread.ofVirtual().name("disruptor-runtime-shutdown")
-                    .start(() -> stopPipelines(initialMode, deadline));
+                    .start(() -> awaitPipelineStop(initialMode, deadline));
         }
         return shutdownOutcomeView;
     }
 
-    private void stopPipelines(ShutdownMode initialMode, ShutdownDeadline deadline) {
-        requestEveryPipeline(initialMode, deadline);
+    private void awaitPipelineStop(ShutdownMode initialMode, ShutdownDeadline deadline) {
         if (awaitChildren(deadline)) {
             completeShutdownFromChildren(initialMode);
             return;
         }
-        requestEveryPipeline(ShutdownMode.IMMEDIATE, deadline);
+        requestUnterminatedPipelines(ShutdownMode.IMMEDIATE, deadline);
         shutdownOutcome.completeExceptionally(
                 aggregateFailure("DisruptorRuntime 超过共享关闭预算 " + shutdownTimeout));
     }
@@ -271,11 +269,26 @@ public final class DisruptorRuntime {
 
     private void requestEveryPipeline(ShutdownMode mode, ShutdownDeadline deadline) {
         for (DisruptorPipeline<?> pipeline : pipelines) {
-            try {
-                pipeline.requestShutdown(mode, deadline);
-            } catch (Throwable failure) {
-                log.warn("请求停止 Disruptor 管道 [{}] 失败", pipeline.handle().name(), failure);
+            requestPipeline(pipeline, mode, deadline);
+        }
+    }
+
+    private void requestUnterminatedPipelines(ShutdownMode mode, ShutdownDeadline deadline) {
+        for (DisruptorPipeline<?> pipeline : pipelines) {
+            if (!pipeline.termination().toCompletableFuture().isDone()) {
+                requestPipeline(pipeline, mode, deadline);
             }
+        }
+    }
+
+    private void requestPipeline(
+            DisruptorPipeline<?> pipeline,
+            ShutdownMode mode,
+            ShutdownDeadline deadline) {
+        try {
+            pipeline.requestShutdown(mode, deadline);
+        } catch (Throwable failure) {
+            log.warn("请求停止 Disruptor 管道 [{}] 失败", pipeline.handle().name(), failure);
         }
     }
 
@@ -300,20 +313,29 @@ public final class DisruptorRuntime {
             return;
         }
         terminationAggregationStarted = true;
+        Thread.ofVirtual().name("disruptor-runtime-termination")
+                .start(this::awaitTerminationAggregation);
+    }
+
+    private void awaitTerminationAggregation() {
         CompletableFuture<?>[] childTerminations = pipelines.stream()
                 .map(DisruptorPipeline::termination)
                 .map(CompletionStage::toCompletableFuture)
                 .toArray(CompletableFuture[]::new);
-        CompletableFuture.allOf(childTerminations).whenComplete((ignored, failure) -> {
-            synchronized (lifecycleLock) {
-                state = State.TERMINATED;
-            }
-            if (failure == null) {
-                termination.complete(null);
-            } else {
-                termination.completeExceptionally(unwrap(failure));
-            }
-        });
+        Throwable failure = null;
+        try {
+            CompletableFuture.allOf(childTerminations).join();
+        } catch (Throwable aggregateFailure) {
+            failure = unwrap(aggregateFailure);
+        }
+        synchronized (lifecycleLock) {
+            state = State.TERMINATED;
+        }
+        if (failure == null) {
+            termination.complete(null);
+        } else {
+            termination.completeExceptionally(failure);
+        }
     }
 
     private DisruptorShutdownException aggregateFailure(String message) {
