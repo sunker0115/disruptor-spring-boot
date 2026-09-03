@@ -197,9 +197,7 @@ public final class DisruptorRuntime {
             request.session().startupFailures.add(startupFailure);
             request.session().startupPending = false;
         }
-        if (request.broadcast()) {
-            requestEveryPipeline(request.session(), ShutdownMode.IMMEDIATE);
-        }
+        performBroadcast(request);
         startShutdownCoordinator(request);
         boolean allTerminated = awaitChildren(request.session().deadline);
         IllegalStateException result = new IllegalStateException(
@@ -219,7 +217,7 @@ public final class DisruptorRuntime {
             }
             request = beginShutdownLocked(requestedMode);
         }
-        requestEveryPipeline(request.session(), request.modeToBroadcast());
+        performBroadcast(request);
         startShutdownCoordinator(request);
         return request.session().outcomeView;
     }
@@ -231,18 +229,21 @@ public final class DisruptorRuntime {
                     requestedMode,
                     state == State.STARTING);
         }
-        shutdownSession.upgrade(requestedMode);
-        boolean startCoordinator = !shutdownSession.coordinationStarted;
-        shutdownSession.coordinationStarted = true;
-        boolean broadcast = state != State.TERMINATED;
-        if (broadcast) {
-            state = State.STOPPING;
+        if (!shutdownSession.acceptsBroadcast()) {
+            return new ShutdownRequest(
+                    shutdownSession,
+                    shutdownSession.highestMode,
+                    false,
+                    false);
         }
+        shutdownSession.beginBroadcast(requestedMode);
+        boolean startCoordinator = shutdownSession.beginCoordination();
+        state = State.STOPPING;
         return new ShutdownRequest(
                 shutdownSession,
                 shutdownSession.highestMode,
                 startCoordinator,
-                broadcast);
+                true);
     }
 
     private void startShutdownCoordinator(ShutdownRequest request) {
@@ -253,13 +254,12 @@ public final class DisruptorRuntime {
     }
 
     private void coordinateShutdown(RuntimeShutdownSession session) {
-        if (!awaitShutdownOutcomeReady(session)) {
-            synchronized (lifecycleLock) {
-                session.upgrade(ShutdownMode.IMMEDIATE);
+        if (!awaitAndCommitNormalOutcome(session)) {
+            performDeadlineUpgradeBroadcast(session);
+            if (commitOutcomeAfterBroadcasts(session)) {
+                session.outcome.completeExceptionally(aggregateFailure(
+                        session, "DisruptorRuntime 超过共享关闭预算 " + shutdownTimeout));
             }
-            requestUnterminatedPipelines(session, ShutdownMode.IMMEDIATE);
-            session.outcome.completeExceptionally(aggregateFailure(
-                    session, "DisruptorRuntime 超过共享关闭预算 " + shutdownTimeout));
         }
         awaitEveryChildTermination();
         List<Throwable> terminationFailures = collectChildTerminationFailures();
@@ -273,18 +273,63 @@ public final class DisruptorRuntime {
         completeRuntimeTermination(terminationFailures);
     }
 
-    private void requestEveryPipeline(RuntimeShutdownSession session, ShutdownMode mode) {
+    private void performBroadcast(ShutdownRequest request) {
+        if (!request.broadcast()) {
+            return;
+        }
+        List<Throwable> failures = new ArrayList<>();
+        try {
+            requestEveryPipeline(
+                    request.session(), request.modeToBroadcast(), failures);
+        } finally {
+            finishBroadcast(request.session(), failures);
+        }
+    }
+
+    private void performDeadlineUpgradeBroadcast(RuntimeShutdownSession session) {
+        boolean broadcast;
+        synchronized (lifecycleLock) {
+            broadcast = session.acceptsBroadcast();
+            if (broadcast) {
+                session.beginBroadcast(ShutdownMode.IMMEDIATE);
+            }
+        }
+        if (!broadcast) {
+            return;
+        }
+        List<Throwable> failures = new ArrayList<>();
+        try {
+            requestUnterminatedPipelines(session, ShutdownMode.IMMEDIATE, failures);
+        } finally {
+            finishBroadcast(session, failures);
+        }
+    }
+
+    private void finishBroadcast(
+            RuntimeShutdownSession session,
+            Collection<? extends Throwable> failures) {
+        synchronized (lifecycleLock) {
+            session.endBroadcast(failures);
+            lifecycleLock.notifyAll();
+        }
+    }
+
+    private void requestEveryPipeline(
+            RuntimeShutdownSession session,
+            ShutdownMode mode,
+            Collection<Throwable> failures) {
         for (DisruptorPipeline<?> pipeline : pipelines) {
-            requestPipeline(session, pipeline, mode);
+            requestPipeline(session, pipeline, mode, failures);
         }
     }
 
     private void requestUnterminatedPipelines(
             RuntimeShutdownSession session,
-            ShutdownMode mode) {
+            ShutdownMode mode,
+            Collection<Throwable> failures) {
         for (DisruptorPipeline<?> pipeline : pipelines) {
             if (!pipeline.termination().toCompletableFuture().isDone()) {
-                requestPipeline(session, pipeline, mode);
+                requestPipeline(session, pipeline, mode, failures);
             }
         }
     }
@@ -292,31 +337,43 @@ public final class DisruptorRuntime {
     private void requestPipeline(
             RuntimeShutdownSession session,
             DisruptorPipeline<?> pipeline,
-            ShutdownMode mode) {
+            ShutdownMode mode,
+            Collection<Throwable> failures) {
         try {
             pipeline.requestShutdown(mode, session.deadline);
         } catch (Throwable failure) {
-            synchronized (lifecycleLock) {
-                session.requestFailures.add(failure);
-            }
+            failures.add(failure);
             log.warn("请求停止 Disruptor 管道 [{}] 失败", pipeline.handle().name(), failure);
         }
     }
 
-    private boolean awaitShutdownOutcomeReady(RuntimeShutdownSession session) {
+    private boolean awaitAndCommitNormalOutcome(RuntimeShutdownSession session) {
         while (true) {
-            boolean startupPending;
+            boolean childrenTerminated = allChildrenTerminated();
             synchronized (lifecycleLock) {
-                startupPending = session.startupPending;
-            }
-            if (!startupPending && allChildrenTerminated()) {
-                return true;
+                if (session.commitNormalOutcome(childrenTerminated)) {
+                    return true;
+                }
             }
             long remaining = session.deadline.remainingNanos();
             if (remaining == 0L) {
                 return false;
             }
             LockSupport.parkNanos(Math.min(WAIT_NANOS, remaining));
+        }
+    }
+
+    private boolean commitOutcomeAfterBroadcasts(RuntimeShutdownSession session) {
+        while (true) {
+            synchronized (lifecycleLock) {
+                if (!session.acceptsBroadcast()) {
+                    return false;
+                }
+                if (session.commitDeadlineOutcome()) {
+                    return true;
+                }
+            }
+            LockSupport.parkNanos(WAIT_NANOS);
         }
     }
 
@@ -494,6 +551,8 @@ public final class DisruptorRuntime {
         private ShutdownMode highestMode;
         private boolean coordinationStarted;
         private boolean startupPending;
+        private boolean outcomeCommitted;
+        private int broadcastsInFlight;
 
         private RuntimeShutdownSession(
                 ShutdownDeadline deadline,
@@ -502,6 +561,53 @@ public final class DisruptorRuntime {
             this.deadline = deadline;
             this.highestMode = initialMode;
             this.startupPending = startupPending;
+        }
+
+        private boolean acceptsBroadcast() {
+            return !outcomeCommitted;
+        }
+
+        private void beginBroadcast(ShutdownMode requestedMode) {
+            if (outcomeCommitted) {
+                throw new IllegalStateException("shutdown outcome 已提交，不能再开始广播");
+            }
+            upgrade(requestedMode);
+            broadcastsInFlight++;
+        }
+
+        private void endBroadcast(Collection<? extends Throwable> failures) {
+            requestFailures.addAll(failures);
+            if (broadcastsInFlight <= 0) {
+                throw new IllegalStateException("没有可结束的 shutdown 广播");
+            }
+            broadcastsInFlight--;
+        }
+
+        private boolean beginCoordination() {
+            if (coordinationStarted) {
+                return false;
+            }
+            coordinationStarted = true;
+            return true;
+        }
+
+        private boolean commitNormalOutcome(boolean childrenTerminated) {
+            if (outcomeCommitted
+                    || startupPending
+                    || !childrenTerminated
+                    || broadcastsInFlight != 0) {
+                return false;
+            }
+            outcomeCommitted = true;
+            return true;
+        }
+
+        private boolean commitDeadlineOutcome() {
+            if (outcomeCommitted || startupPending || broadcastsInFlight != 0) {
+                return false;
+            }
+            outcomeCommitted = true;
+            return true;
         }
 
         private void upgrade(ShutdownMode requestedMode) {

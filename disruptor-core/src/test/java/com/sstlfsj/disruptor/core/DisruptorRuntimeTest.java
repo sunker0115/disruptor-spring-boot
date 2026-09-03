@@ -263,6 +263,47 @@ class DisruptorRuntimeTest {
     }
 
     @Test
+    void shutdownOutcomeWaitsForEveryConcurrentBroadcastToFinish() throws Exception {
+        IllegalStateException requestFailure = new IllegalStateException("late request failed");
+        CountDownLatch secondRequestEntered = new CountDownLatch(1);
+        CountDownLatch releaseSecondRequest = new CountDownLatch(1);
+        StubPipeline pipeline = new StubPipeline("in-flight-broadcast")
+                .blockAndFailRequest(
+                        2, secondRequestEntered, releaseSecondRequest, requestFailure);
+        DisruptorRuntime runtime = new DisruptorRuntime(
+                List.of(pipeline), Duration.ofSeconds(2));
+        CompletionStage<Void> outcome = runtime.shutdownAsync();
+        CountDownLatch outcomeCompleted = new CountDownLatch(1);
+        outcome.whenComplete((ignored, failure) -> outcomeCompleted.countDown());
+        AtomicReference<CompletionStage<Void>> repeatedOutcome = new AtomicReference<>();
+        Thread haltCaller = Thread.ofPlatform().start(
+                () -> repeatedOutcome.set(runtime.haltAsync()));
+        try {
+            assertTrue(secondRequestEntered.await(2, TimeUnit.SECONDS));
+            pipeline.completeTermination(ShutdownMode.IMMEDIATE, null);
+
+            assertFalse(outcome.toCompletableFuture().isDone());
+            assertFalse(outcomeCompleted.await(100, TimeUnit.MILLISECONDS),
+                    "仍有同步广播在途时不能定稿 shutdown outcome");
+            assertFalse(runtime.termination().toCompletableFuture().isDone());
+        } finally {
+            releaseSecondRequest.countDown();
+            haltCaller.join(2_000);
+        }
+
+        assertFalse(haltCaller.isAlive());
+        assertSame(outcome, repeatedOutcome.get());
+        CompletionException failure = assertThrows(CompletionException.class,
+                () -> outcome.toCompletableFuture().join());
+        assertSuppressedIdentity(failure.getCause(), requestFailure);
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        assertSame(outcome, runtime.shutdownAsync());
+        assertSame(outcome, runtime.haltAsync());
+        assertEquals(2, pipeline.requestCount,
+                "outcome 承诺定稿后不能再接受新的 shutdown 广播");
+    }
+
+    @Test
     void shutdownAndImmediateUpgradeAreBroadcastBeforeTheirApiCallsReturn() throws Exception {
         CountDownLatch handlerEntered = new CountDownLatch(1);
         CountDownLatch releaseHandler = new CountDownLatch(1);
@@ -1020,6 +1061,10 @@ class DisruptorRuntimeTest {
         private final List<ShutdownDeadline> deadlines = new CopyOnWriteArrayList<>();
         private Throwable startFailure;
         private Throwable requestFailure;
+        private int blockedRequestNumber;
+        private int requestCount;
+        private CountDownLatch blockedRequestEntered;
+        private CountDownLatch releaseBlockedRequest;
         private boolean completeOnRequest;
         private volatile PipelineSnapshot snapshot;
 
@@ -1042,6 +1087,18 @@ class DisruptorRuntimeTest {
 
         private StubPipeline terminateOnRequest() {
             completeOnRequest = true;
+            return this;
+        }
+
+        private StubPipeline blockAndFailRequest(
+                int requestNumber,
+                CountDownLatch entered,
+                CountDownLatch release,
+                Throwable failure) {
+            blockedRequestNumber = requestNumber;
+            blockedRequestEntered = entered;
+            releaseBlockedRequest = release;
+            requestFailure = failure;
             return this;
         }
 
@@ -1078,10 +1135,16 @@ class DisruptorRuntimeTest {
                 ShutdownMode mode,
                 ShutdownDeadline deadline) {
             deadlines.add(deadline);
+            requestCount++;
             if (completeOnRequest && !terminationOutcome.isDone()) {
                 completeTermination(mode, startFailure);
             }
-            if (requestFailure != null) {
+            if (requestCount == blockedRequestNumber) {
+                blockedRequestEntered.countDown();
+                awaitUninterruptibly(releaseBlockedRequest);
+            }
+            if (requestFailure != null
+                    && (blockedRequestNumber == 0 || requestCount == blockedRequestNumber)) {
                 sneakyThrow(requestFailure);
             }
         }
