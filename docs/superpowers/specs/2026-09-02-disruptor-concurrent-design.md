@@ -74,6 +74,7 @@ Builder 配置：名称、bufferSize、maxBatchSize、shutdownTimeout、ThreadFa
 - 单 child 内有序，跨 child 明确无序；
 - 任一 child 发生基础设施故障，Group 锁存首因并 fail-stop，不能静默重映射 affinity key；
 - Group 关闭创建一个 `ShutdownDeadline`，先向全部 child 传递相同绝对 deadline 并同时请求停止，再聚合真实终止；任一 child 未真实退出时 Group 不能提交 terminated。
+- Group 应复用 core Runtime 的单会话不变量与协调模式；但在 child 故障 fail-stop、Executor 关闭结果和 Runtime 启动回滚的失败传播完全同构前，不直接复用 Runtime 私有会话类型。
 
 ### 高级任务语义
 

@@ -158,6 +158,10 @@ worker 退出前的引用清理、Future 终态化和模块 stop 属于 worker �
 
 Runtime 为一次关闭创建一个 `ShutdownDeadline`，在 `shutdown/halt` 及其异步变体返回 stage 前同步向所有管道广播相同 deadline 的关闭请求，再由协调线程聚合等待；不能为每条管道重新计算 timeout。并发 `GRACEFUL/IMMEDIATE` 请求单调升级，每个调用返回前都已广播自身要求的模式。到共同 deadline 时，对尚未终止的管道使用原 deadline 升级 `IMMEDIATE` 并返回或抛出聚合结果，后台继续等待 child 的真实 termination。
 
+Runtime 用单个私有 `RuntimeShutdownSession` 同时持有首次冻结的 deadline、最高 shutdown mode、唯一 outcome、协调线程启动事实，以及按 Throwable identity 去重的启动、请求和 child termination 失败。启动回滚与随后到达的 `shutdown/halt` 必须复用同一会话；不能用 outcome 是否为空推断 deadline 或协调状态。广播某个 child 抛错时继续请求其余 child，并把原始异常纳入最终 outcome。全部 child 的 termination stage 已完成后，先逐一收集 stage 异常和 snapshot 首因，再决定 outcome，禁止先成功完成 outcome 后才发现 Runtime termination 失败。
+
+该会话当前保持 Runtime 私有。未来 `EventLoopGroup` 复用相同的不变量和协调模式，但 Group 还承担 child 故障 fail-stop，Runtime 还承担启动回滚 stage；在两者状态与失败传播完全同构前不提取共享实现类型。
+
 Runtime 自身只有在所有 child 真正终止后才能提交终止状态。启动失败回滚也使用同一个绝对 deadline；不得在仍有 child 处于 `STOPPING` 时把 Runtime 标记为已终止。
 
 ### Spring 可观测性

@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,7 +27,7 @@ public final class DisruptorRuntime {
     private static final Logger log = LoggerFactory.getLogger(DisruptorRuntime.class);
     private static final long WAIT_NANOS = 100_000L;
 
-    private final Map<String, ManagedPipeline<?>> pipelinesByName;
+    private final Map<String, DisruptorPipeline<?>> pipelinesByName;
     private final List<DisruptorPipeline<?>> pipelines;
     private final List<PipelineHandle<?>> handles;
     private final Duration shutdownTimeout;
@@ -37,26 +38,28 @@ public final class DisruptorRuntime {
     private final CompletionStage<Void> terminationView = termination.minimalCompletionStage();
 
     private State state = State.NEW;
-    private CompletableFuture<Void> shutdownOutcome;
-    private CompletionStage<Void> shutdownOutcomeView;
-    private ShutdownDeadline shutdownDeadline;
-    private ShutdownMode shutdownMode;
-    private boolean terminationAggregationStarted;
+    private RuntimeShutdownSession shutdownSession;
 
     private DisruptorRuntime(
             Collection<PipelineSpec<?>> specs,
             Function<String, PipelineSettings> settingsResolver,
             Duration shutdownTimeout) {
+        this(buildPipelines(specs, settingsResolver, shutdownTimeout), shutdownTimeout);
+    }
+
+    DisruptorRuntime(
+            Collection<? extends DisruptorPipeline<?>> pipelines,
+            Duration shutdownTimeout) {
         validateShutdownTimeout(shutdownTimeout);
-        Map<String, ManagedPipeline<?>> built = new LinkedHashMap<>();
-        for (PipelineSpec<?> spec : specs) {
-            Objects.requireNonNull(spec, "PipelineSpec 不能为空");
-            if (built.containsKey(spec.name())) {
-                throw new IllegalArgumentException("管道名重复：" + spec.name());
+        Map<String, DisruptorPipeline<?>> built = new LinkedHashMap<>();
+        for (DisruptorPipeline<?> pipeline : Objects.requireNonNull(
+                pipelines, "pipelines 不能为空")) {
+            Objects.requireNonNull(pipeline, "DisruptorPipeline 不能为空");
+            PipelineHandle<?> handle = Objects.requireNonNull(
+                    pipeline.handle(), "pipeline.handle() 不能返回 null");
+            if (built.putIfAbsent(handle.name(), pipeline) != null) {
+                throw new IllegalArgumentException("管道名重复：" + handle.name());
             }
-            PipelineSettings settings = Objects.requireNonNull(settingsResolver.apply(spec.name()),
-                    "settingsResolver 不能为管道 " + spec.name() + " 返回 null");
-            built.put(spec.name(), buildPipeline(spec, settings, shutdownTimeout));
         }
         this.pipelinesByName = Collections.unmodifiableMap(built);
         this.pipelines = List.copyOf(built.values());
@@ -89,7 +92,7 @@ public final class DisruptorRuntime {
     public <E> DisruptorPipeline<E> requirePipeline(String name, Class<E> eventType) {
         PipelineSettings.requireName(name);
         Objects.requireNonNull(eventType, "eventType 不能为空");
-        ManagedPipeline<?> pipeline = pipelinesByName.get(name);
+        DisruptorPipeline<?> pipeline = pipelinesByName.get(name);
         if (pipeline == null) {
             throw new IllegalArgumentException("不存在名为 '" + name + "' 的管道");
         }
@@ -102,7 +105,7 @@ public final class DisruptorRuntime {
 
     public <E> DisruptorPipeline<E> uniquePipeline(Class<E> eventType) {
         Objects.requireNonNull(eventType, "eventType 不能为空");
-        List<ManagedPipeline<?>> matches = pipelinesByName.values().stream()
+        List<DisruptorPipeline<?>> matches = pipelinesByName.values().stream()
                 .filter(pipeline -> pipeline.handle().eventType().equals(eventType))
                 .toList();
         if (matches.isEmpty()) {
@@ -168,7 +171,7 @@ public final class DisruptorRuntime {
 
     private void startPipelines() {
         try {
-            for (ManagedPipeline<?> pipeline : pipelinesByName.values()) {
+            for (DisruptorPipeline<?> pipeline : pipelinesByName.values()) {
                 pipeline.start().toCompletableFuture().join();
                 PipelineHandle<?> handle = pipeline.handle();
                 log.info("已启动 Disruptor 管道 [{}]，事件类型={}，bufferSize={}",
@@ -188,107 +191,132 @@ public final class DisruptorRuntime {
     }
 
     private void rollbackStartup(Throwable startupFailure) {
-        ShutdownDeadline deadline;
+        ShutdownRequest request;
         synchronized (lifecycleLock) {
-            state = State.STOPPING;
-            if (shutdownDeadline == null) {
-                shutdownDeadline = ShutdownDeadline.after(shutdownTimeout);
-            }
-            deadline = shutdownDeadline;
-            shutdownMode = ShutdownMode.IMMEDIATE;
-            startTerminationAggregationLocked();
+            request = beginShutdownLocked(ShutdownMode.IMMEDIATE);
+            request.session().startupFailures.add(startupFailure);
+            request.session().startupPending = false;
         }
-        requestEveryPipeline(ShutdownMode.IMMEDIATE, deadline);
-        boolean allTerminated = awaitChildren(deadline);
+        if (request.broadcast()) {
+            requestEveryPipeline(request.session(), ShutdownMode.IMMEDIATE);
+        }
+        startShutdownCoordinator(request);
+        boolean allTerminated = awaitChildren(request.session().deadline);
         IllegalStateException result = new IllegalStateException(
                 "启动 Disruptor 管道失败，已请求回滚全部管道", startupFailure);
         if (!allTerminated) {
-            result.addSuppressed(aggregateFailure("启动失败回滚超过共享关闭预算"));
+            result.addSuppressed(aggregateFailure(
+                    request.session(), "启动失败回滚超过共享关闭预算"));
         }
         started.completeExceptionally(result);
     }
 
     private CompletionStage<Void> requestStop(ShutdownMode requestedMode) {
-        ShutdownDeadline deadline;
-        boolean startCoordinator = false;
-        ShutdownMode modeToBroadcast;
+        ShutdownRequest request;
         synchronized (lifecycleLock) {
             if (state == State.TERMINATED) {
-                return shutdownOutcomeView == null
-                        ? CompletableFuture.completedStage(null)
-                        : shutdownOutcomeView;
+                return shutdownSession.outcomeView;
             }
-            if (shutdownOutcome == null) {
-                shutdownOutcome = new CompletableFuture<>();
-                shutdownOutcomeView = shutdownOutcome.minimalCompletionStage();
-                shutdownDeadline = ShutdownDeadline.after(shutdownTimeout);
-                shutdownMode = requestedMode;
-                state = State.STOPPING;
-                startTerminationAggregationLocked();
-                startCoordinator = true;
-            }
-            boolean upgrade = requestedMode == ShutdownMode.IMMEDIATE
-                    && shutdownMode != ShutdownMode.IMMEDIATE;
-            if (upgrade) {
-                shutdownMode = ShutdownMode.IMMEDIATE;
-            }
-            deadline = shutdownDeadline;
-            modeToBroadcast = shutdownMode;
+            request = beginShutdownLocked(requestedMode);
         }
-        requestEveryPipeline(modeToBroadcast, deadline);
-        if (startCoordinator) {
-            ShutdownMode initialMode = requestedMode;
+        requestEveryPipeline(request.session(), request.modeToBroadcast());
+        startShutdownCoordinator(request);
+        return request.session().outcomeView;
+    }
+
+    private ShutdownRequest beginShutdownLocked(ShutdownMode requestedMode) {
+        if (shutdownSession == null) {
+            shutdownSession = new RuntimeShutdownSession(
+                    ShutdownDeadline.after(shutdownTimeout),
+                    requestedMode,
+                    state == State.STARTING);
+        }
+        shutdownSession.upgrade(requestedMode);
+        boolean startCoordinator = !shutdownSession.coordinationStarted;
+        shutdownSession.coordinationStarted = true;
+        boolean broadcast = state != State.TERMINATED;
+        if (broadcast) {
+            state = State.STOPPING;
+        }
+        return new ShutdownRequest(
+                shutdownSession,
+                shutdownSession.highestMode,
+                startCoordinator,
+                broadcast);
+    }
+
+    private void startShutdownCoordinator(ShutdownRequest request) {
+        if (request.startCoordinator()) {
             Thread.ofVirtual().name("disruptor-runtime-shutdown")
-                    .start(() -> awaitPipelineStop(initialMode, deadline));
+                    .start(() -> coordinateShutdown(request.session()));
         }
-        return shutdownOutcomeView;
     }
 
-    private void awaitPipelineStop(ShutdownMode initialMode, ShutdownDeadline deadline) {
-        if (awaitChildren(deadline)) {
-            completeShutdownFromChildren(initialMode);
-            return;
+    private void coordinateShutdown(RuntimeShutdownSession session) {
+        if (!awaitShutdownOutcomeReady(session)) {
+            synchronized (lifecycleLock) {
+                session.upgrade(ShutdownMode.IMMEDIATE);
+            }
+            requestUnterminatedPipelines(session, ShutdownMode.IMMEDIATE);
+            session.outcome.completeExceptionally(aggregateFailure(
+                    session, "DisruptorRuntime 超过共享关闭预算 " + shutdownTimeout));
         }
-        requestUnterminatedPipelines(ShutdownMode.IMMEDIATE, deadline);
-        shutdownOutcome.completeExceptionally(
-                aggregateFailure("DisruptorRuntime 超过共享关闭预算 " + shutdownTimeout));
+        awaitEveryChildTermination();
+        List<Throwable> terminationFailures = collectChildTerminationFailures();
+        synchronized (lifecycleLock) {
+            session.childTerminationFailures.addAll(terminationFailures);
+            state = State.TERMINATED;
+        }
+        if (!session.outcome.isDone()) {
+            completeShutdownFromChildren(session);
+        }
+        completeRuntimeTermination(terminationFailures);
     }
 
-    private void completeShutdownFromChildren(ShutdownMode initialMode) {
-        List<PipelineSnapshot> failed = pipelines.stream()
-                .map(DisruptorPipeline::snapshot)
-                .filter(snapshot -> snapshot.failure() != null)
-                .toList();
-        if (failed.isEmpty()) {
-            shutdownOutcome.complete(null);
-            return;
-        }
-        String action = initialMode == ShutdownMode.GRACEFUL ? "优雅关闭" : "立即停止";
-        shutdownOutcome.completeExceptionally(aggregateFailure("DisruptorRuntime " + action + "失败"));
-    }
-
-    private void requestEveryPipeline(ShutdownMode mode, ShutdownDeadline deadline) {
+    private void requestEveryPipeline(RuntimeShutdownSession session, ShutdownMode mode) {
         for (DisruptorPipeline<?> pipeline : pipelines) {
-            requestPipeline(pipeline, mode, deadline);
+            requestPipeline(session, pipeline, mode);
         }
     }
 
-    private void requestUnterminatedPipelines(ShutdownMode mode, ShutdownDeadline deadline) {
+    private void requestUnterminatedPipelines(
+            RuntimeShutdownSession session,
+            ShutdownMode mode) {
         for (DisruptorPipeline<?> pipeline : pipelines) {
             if (!pipeline.termination().toCompletableFuture().isDone()) {
-                requestPipeline(pipeline, mode, deadline);
+                requestPipeline(session, pipeline, mode);
             }
         }
     }
 
     private void requestPipeline(
+            RuntimeShutdownSession session,
             DisruptorPipeline<?> pipeline,
-            ShutdownMode mode,
-            ShutdownDeadline deadline) {
+            ShutdownMode mode) {
         try {
-            pipeline.requestShutdown(mode, deadline);
+            pipeline.requestShutdown(mode, session.deadline);
         } catch (Throwable failure) {
+            synchronized (lifecycleLock) {
+                session.requestFailures.add(failure);
+            }
             log.warn("请求停止 Disruptor 管道 [{}] 失败", pipeline.handle().name(), failure);
+        }
+    }
+
+    private boolean awaitShutdownOutcomeReady(RuntimeShutdownSession session) {
+        while (true) {
+            boolean startupPending;
+            synchronized (lifecycleLock) {
+                startupPending = session.startupPending;
+            }
+            if (!startupPending && allChildrenTerminated()) {
+                return true;
+            }
+            long remaining = session.deadline.remainingNanos();
+            if (remaining == 0L) {
+                return false;
+            }
+            LockSupport.parkNanos(Math.min(WAIT_NANOS, remaining));
         }
     }
 
@@ -308,44 +336,76 @@ public final class DisruptorRuntime {
                 pipeline.termination().toCompletableFuture().isDone());
     }
 
-    private void startTerminationAggregationLocked() {
-        if (terminationAggregationStarted) {
+    private void awaitEveryChildTermination() {
+        while (!allChildrenTerminated()) {
+            LockSupport.parkNanos(WAIT_NANOS);
+        }
+    }
+
+    private List<Throwable> collectChildTerminationFailures() {
+        List<Throwable> failures = new ArrayList<>();
+        for (DisruptorPipeline<?> pipeline : pipelines) {
+            try {
+                pipeline.termination().toCompletableFuture().join();
+            } catch (Throwable failure) {
+                failures.add(unwrap(failure));
+            }
+        }
+        return failures;
+    }
+
+    private void completeShutdownFromChildren(RuntimeShutdownSession session) {
+        List<Throwable> failures = shutdownFailures(session);
+        if (failures.isEmpty()) {
+            session.outcome.complete(null);
             return;
         }
-        terminationAggregationStarted = true;
-        Thread.ofVirtual().name("disruptor-runtime-termination")
-                .start(this::awaitTerminationAggregation);
+        ShutdownMode mode;
+        synchronized (lifecycleLock) {
+            mode = session.highestMode;
+        }
+        String action = mode == ShutdownMode.GRACEFUL ? "优雅关闭" : "立即停止";
+        session.outcome.completeExceptionally(aggregateFailure(
+                "DisruptorRuntime " + action + "失败", failures));
     }
 
-    private void awaitTerminationAggregation() {
-        CompletableFuture<?>[] childTerminations = pipelines.stream()
-                .map(DisruptorPipeline::termination)
-                .map(CompletionStage::toCompletableFuture)
-                .toArray(CompletableFuture[]::new);
-        Throwable failure = null;
-        try {
-            CompletableFuture.allOf(childTerminations).join();
-        } catch (Throwable aggregateFailure) {
-            failure = unwrap(aggregateFailure);
-        }
-        synchronized (lifecycleLock) {
-            state = State.TERMINATED;
-        }
-        if (failure == null) {
+    private void completeRuntimeTermination(List<Throwable> terminationFailures) {
+        if (terminationFailures.isEmpty()) {
             termination.complete(null);
         } else {
-            termination.completeExceptionally(failure);
+            termination.completeExceptionally(aggregateFailure(
+                    "DisruptorRuntime child 真实终止失败", terminationFailures));
         }
     }
 
-    private DisruptorShutdownException aggregateFailure(String message) {
-        DisruptorShutdownException aggregate = new DisruptorShutdownException(message);
+    private DisruptorShutdownException aggregateFailure(
+            RuntimeShutdownSession session,
+            String message) {
+        return aggregateFailure(message, shutdownFailures(session));
+    }
+
+    private List<Throwable> shutdownFailures(RuntimeShutdownSession session) {
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        synchronized (lifecycleLock) {
+            seen.addAll(session.startupFailures);
+            seen.addAll(session.requestFailures);
+            seen.addAll(session.childTerminationFailures);
+        }
         for (DisruptorPipeline<?> pipeline : pipelines) {
             Throwable failure = pipeline.snapshot().failure();
-            if (failure != null && seen.add(failure)) {
-                aggregate.addSuppressed(failure);
+            if (failure != null) {
+                seen.add(failure);
             }
+        }
+        return List.copyOf(seen);
+    }
+
+    private static DisruptorShutdownException aggregateFailure(
+            String message,
+            Collection<? extends Throwable> failures) {
+        DisruptorShutdownException aggregate = new DisruptorShutdownException(message);
+        for (Throwable failure : failures) {
+            aggregate.addSuppressed(failure);
         }
         return aggregate;
     }
@@ -389,9 +449,66 @@ public final class DisruptorRuntime {
         return ManagedPipeline.build(spec, spec.resolve(settings), shutdownTimeout);
     }
 
+    private static List<DisruptorPipeline<?>> buildPipelines(
+            Collection<PipelineSpec<?>> specs,
+            Function<String, PipelineSettings> settingsResolver,
+            Duration shutdownTimeout) {
+        List<DisruptorPipeline<?>> pipelines = new ArrayList<>();
+        Set<String> names = new HashSet<>();
+        for (PipelineSpec<?> spec : Objects.requireNonNull(specs, "specs 不能为空")) {
+            Objects.requireNonNull(spec, "PipelineSpec 不能为空");
+            if (!names.add(spec.name())) {
+                throw new IllegalArgumentException("管道名重复：" + spec.name());
+            }
+            PipelineSettings settings = Objects.requireNonNull(settingsResolver.apply(spec.name()),
+                    "settingsResolver 不能为管道 " + spec.name() + " 返回 null");
+            pipelines.add(buildPipeline(spec, settings, shutdownTimeout));
+        }
+        return pipelines;
+    }
+
     @SuppressWarnings("unchecked")
-    private static <E> DisruptorPipeline<E> castPipeline(ManagedPipeline<?> pipeline) {
+    private static <E> DisruptorPipeline<E> castPipeline(DisruptorPipeline<?> pipeline) {
         return (DisruptorPipeline<E>) pipeline;
+    }
+
+    private record ShutdownRequest(
+            RuntimeShutdownSession session,
+            ShutdownMode modeToBroadcast,
+            boolean startCoordinator,
+            boolean broadcast) {
+    }
+
+    private static final class RuntimeShutdownSession {
+
+        private final ShutdownDeadline deadline;
+        private final CompletableFuture<Void> outcome = new CompletableFuture<>();
+        private final CompletionStage<Void> outcomeView = outcome.minimalCompletionStage();
+        private final Set<Throwable> startupFailures =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private final Set<Throwable> requestFailures =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private final Set<Throwable> childTerminationFailures =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+
+        private ShutdownMode highestMode;
+        private boolean coordinationStarted;
+        private boolean startupPending;
+
+        private RuntimeShutdownSession(
+                ShutdownDeadline deadline,
+                ShutdownMode initialMode,
+                boolean startupPending) {
+            this.deadline = deadline;
+            this.highestMode = initialMode;
+            this.startupPending = startupPending;
+        }
+
+        private void upgrade(ShutdownMode requestedMode) {
+            if (requestedMode == ShutdownMode.IMMEDIATE) {
+                highestMode = ShutdownMode.IMMEDIATE;
+            }
+        }
     }
 
     private enum State {

@@ -6,6 +6,7 @@ import com.lmax.disruptor.EventTranslator;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.EventTranslatorThreeArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
+import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.Sequence;
 import com.lmax.disruptor.dsl.ProducerType;
 import org.junit.jupiter.api.RepeatedTest;
@@ -17,7 +18,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -177,6 +181,88 @@ class DisruptorRuntimeTest {
     }
 
     @Test
+    void startupRollbackAndLaterStopCallsReuseOneShutdownSessionDeadline() throws Exception {
+        IllegalStateException startupFailure = new IllegalStateException("second start failed");
+        StubPipeline first = new StubPipeline("rollback-blocked");
+        StubPipeline second = new StubPipeline("rollback-failed")
+                .failStart(startupFailure)
+                .terminateOnRequest();
+        DisruptorRuntime runtime = new DisruptorRuntime(
+                List.of(first, second), Duration.ofSeconds(2));
+        CompletionStage<Void> start = runtime.startAsync();
+        awaitCondition(() -> first.deadlines.size() == 1 && second.deadlines.size() == 1,
+                Duration.ofSeconds(2));
+        ShutdownDeadline rollbackDeadline = first.deadlines.get(0);
+
+        CompletionStage<Void> halt = runtime.haltAsync();
+        CompletionStage<Void> repeated = runtime.shutdownAsync();
+
+        assertSame(halt, repeated);
+        assertEquals(3, first.deadlines.size());
+        assertEquals(3, second.deadlines.size());
+        assertTrue(first.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
+        assertTrue(second.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
+        assertEquals(rollbackDeadline.deadlineNanos(),
+                second.deadlines.get(0).deadlineNanos());
+
+        first.completeTermination(ShutdownMode.IMMEDIATE, null);
+        assertThrows(CompletionException.class, () -> start.toCompletableFuture().join());
+        assertThrows(CompletionException.class, () -> halt.toCompletableFuture().join());
+        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void everyChildTerminationAndSnapshotFailureReachesTheShutdownOutcome() {
+        IllegalStateException firstTerminationFailure =
+                new IllegalStateException("first termination failed");
+        IllegalStateException secondTerminationFailure =
+                new IllegalStateException("second termination failed");
+        IllegalStateException snapshotFailure = new IllegalStateException("pipeline failed");
+        StubPipeline first = new StubPipeline("first-termination-failure");
+        first.failTermination(firstTerminationFailure, null, ShutdownMode.GRACEFUL);
+        StubPipeline second = new StubPipeline("second-termination-failure");
+        second.failTermination(
+                secondTerminationFailure, snapshotFailure, ShutdownMode.GRACEFUL);
+        DisruptorRuntime runtime = new DisruptorRuntime(
+                List.of(first, second), Duration.ofSeconds(2));
+
+        CompletionException shutdownFailure = assertThrows(CompletionException.class,
+                () -> runtime.shutdownAsync().toCompletableFuture().join());
+        CompletionException runtimeTerminationFailure = assertThrows(CompletionException.class,
+                () -> runtime.termination().toCompletableFuture().join());
+
+        assertSuppressedIdentity(shutdownFailure.getCause(), firstTerminationFailure);
+        assertSuppressedIdentity(shutdownFailure.getCause(), secondTerminationFailure);
+        assertSuppressedIdentity(shutdownFailure.getCause(), snapshotFailure);
+        assertSuppressedIdentity(runtimeTerminationFailure.getCause(), firstTerminationFailure);
+        assertSuppressedIdentity(runtimeTerminationFailure.getCause(), secondTerminationFailure);
+    }
+
+    @Test
+    void requestFailureIsAggregatedWithoutSkippingRemainingPipelines() {
+        IllegalStateException requestFailure = new IllegalStateException("request failed");
+        StubPipeline failing = new StubPipeline("request-failure")
+                .failRequest(requestFailure);
+        failing.completeTermination(ShutdownMode.GRACEFUL, null);
+        StubPipeline healthy = new StubPipeline("request-healthy");
+        DisruptorRuntime runtime = new DisruptorRuntime(
+                List.of(failing, healthy), Duration.ofSeconds(2));
+
+        CompletionStage<Void> firstOutcome = runtime.shutdownAsync();
+        CompletionStage<Void> repeatedOutcome = runtime.shutdownAsync();
+        healthy.completeTermination(ShutdownMode.GRACEFUL, null);
+        CompletionException shutdownFailure = assertThrows(CompletionException.class,
+                () -> firstOutcome.toCompletableFuture().join());
+
+        assertSame(firstOutcome, repeatedOutcome);
+        assertEquals(2, healthy.deadlines.size(), "单个 child 请求失败不能跳过后续 child");
+        assertSuppressedIdentity(shutdownFailure.getCause(), requestFailure);
+        assertEquals(1L, java.util.Arrays.stream(shutdownFailure.getCause().getSuppressed())
+                .filter(failure -> failure == requestFailure)
+                .count(), "重复广播的同一异常对象只能聚合一次");
+    }
+
+    @Test
     void shutdownAndImmediateUpgradeAreBroadcastBeforeTheirApiCallsReturn() throws Exception {
         CountDownLatch handlerEntered = new CountDownLatch(1);
         CountDownLatch releaseHandler = new CountDownLatch(1);
@@ -192,67 +278,76 @@ class DisruptorRuntimeTest {
                         .build())
                 .build();
         runtime.start();
-        runtime.require("api-boundary", TestEvent.class)
-                .publishEvent(TRANSLATOR, "blocked", 1L);
-        assertTrue(handlerEntered.await(2, TimeUnit.SECONDS));
-        Object pipelineLock = lifecycleLock(runtime.requirePipeline("api-boundary", TestEvent.class));
-        AtomicReference<CompletionStage<Void>> gracefulResult = new AtomicReference<>();
-        AtomicBoolean gracefulReturned = new AtomicBoolean();
-        Thread gracefulCaller;
-        synchronized (pipelineLock) {
-            gracefulCaller = Thread.ofPlatform().start(() -> {
-                gracefulResult.set(runtime.shutdownAsync());
-                gracefulReturned.set(true);
-            });
-            awaitCondition(() -> gracefulCaller.getState() == Thread.State.BLOCKED,
-                    Duration.ofSeconds(2));
-            assertFalse(gracefulReturned.get(),
-                    "shutdownAsync 返回前必须同步广播 GRACEFUL");
-        }
-        gracefulCaller.join(2_000);
-        assertTrue(gracefulReturned.get());
-        assertEquals(ShutdownMode.GRACEFUL,
-                runtime.requirePipeline("api-boundary", TestEvent.class).snapshot().shutdownMode());
+        try {
+            runtime.require("api-boundary", TestEvent.class)
+                    .publishEvent(TRANSLATOR, "blocked", 1L);
+            assertTrue(handlerEntered.await(2, TimeUnit.SECONDS));
+            Object pipelineLock = lifecycleLock(
+                    runtime.requirePipeline("api-boundary", TestEvent.class));
+            AtomicReference<CompletionStage<Void>> gracefulResult = new AtomicReference<>();
+            AtomicBoolean gracefulReturned = new AtomicBoolean();
+            Thread gracefulCaller;
+            synchronized (pipelineLock) {
+                gracefulCaller = Thread.ofPlatform().start(() -> {
+                    gracefulResult.set(runtime.shutdownAsync());
+                    gracefulReturned.set(true);
+                });
+                awaitCondition(() -> gracefulCaller.getState() == Thread.State.BLOCKED,
+                        Duration.ofSeconds(2));
+                assertFalse(gracefulReturned.get(),
+                        "shutdownAsync 返回前必须同步广播 GRACEFUL");
+            }
+            gracefulCaller.join(2_000);
+            assertTrue(gracefulReturned.get());
+            assertEquals(ShutdownMode.GRACEFUL,
+                    runtime.requirePipeline(
+                            "api-boundary", TestEvent.class).snapshot().shutdownMode());
 
-        AtomicReference<CompletionStage<Void>> repeatedGracefulResult = new AtomicReference<>();
-        AtomicBoolean repeatedGracefulReturned = new AtomicBoolean();
-        Thread repeatedGracefulCaller;
-        synchronized (pipelineLock) {
-            repeatedGracefulCaller = Thread.ofPlatform().start(() -> {
-                repeatedGracefulResult.set(runtime.shutdownAsync());
-                repeatedGracefulReturned.set(true);
-            });
-            awaitCondition(() -> repeatedGracefulCaller.getState() == Thread.State.BLOCKED,
-                    Duration.ofSeconds(2));
-            assertFalse(repeatedGracefulReturned.get(),
-                    "重复 shutdownAsync 返回前也必须同步广播 GRACEFUL");
-        }
-        repeatedGracefulCaller.join(2_000);
-        assertTrue(repeatedGracefulReturned.get());
-        assertSame(gracefulResult.get(), repeatedGracefulResult.get());
+            AtomicReference<CompletionStage<Void>> repeatedGracefulResult = new AtomicReference<>();
+            AtomicBoolean repeatedGracefulReturned = new AtomicBoolean();
+            Thread repeatedGracefulCaller;
+            synchronized (pipelineLock) {
+                repeatedGracefulCaller = Thread.ofPlatform().start(() -> {
+                    repeatedGracefulResult.set(runtime.shutdownAsync());
+                    repeatedGracefulReturned.set(true);
+                });
+                awaitCondition(() -> repeatedGracefulCaller.getState() == Thread.State.BLOCKED,
+                        Duration.ofSeconds(2));
+                assertFalse(repeatedGracefulReturned.get(),
+                        "重复 shutdownAsync 返回前也必须同步广播 GRACEFUL");
+            }
+            repeatedGracefulCaller.join(2_000);
+            assertTrue(repeatedGracefulReturned.get());
+            assertSame(gracefulResult.get(), repeatedGracefulResult.get());
 
-        AtomicReference<CompletionStage<Void>> immediateResult = new AtomicReference<>();
-        AtomicBoolean immediateReturned = new AtomicBoolean();
-        Thread immediateCaller;
-        synchronized (pipelineLock) {
-            immediateCaller = Thread.ofPlatform().start(() -> {
-                immediateResult.set(runtime.haltAsync());
-                immediateReturned.set(true);
-            });
-            awaitCondition(() -> immediateCaller.getState() == Thread.State.BLOCKED,
-                    Duration.ofSeconds(2));
-            assertFalse(immediateReturned.get(),
-                    "haltAsync 返回前必须同步广播 IMMEDIATE 升级");
-        }
-        immediateCaller.join(2_000);
-        assertTrue(immediateReturned.get());
-        assertEquals(ShutdownMode.IMMEDIATE,
-                runtime.requirePipeline("api-boundary", TestEvent.class).snapshot().shutdownMode());
-        assertSame(gracefulResult.get(), immediateResult.get());
+            AtomicReference<CompletionStage<Void>> immediateResult = new AtomicReference<>();
+            AtomicBoolean immediateReturned = new AtomicBoolean();
+            Thread immediateCaller;
+            synchronized (pipelineLock) {
+                immediateCaller = Thread.ofPlatform().start(() -> {
+                    immediateResult.set(runtime.haltAsync());
+                    immediateReturned.set(true);
+                });
+                awaitCondition(() -> immediateCaller.getState() == Thread.State.BLOCKED,
+                        Duration.ofSeconds(2));
+                assertFalse(immediateReturned.get(),
+                        "haltAsync 返回前必须同步广播 IMMEDIATE 升级");
+            }
+            immediateCaller.join(2_000);
+            assertTrue(immediateReturned.get());
+            assertEquals(ShutdownMode.IMMEDIATE,
+                    runtime.requirePipeline(
+                            "api-boundary", TestEvent.class).snapshot().shutdownMode());
+            assertSame(gracefulResult.get(), immediateResult.get());
 
-        releaseHandler.countDown();
-        gracefulResult.get().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            releaseHandler.countDown();
+            gracefulResult.get().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        } finally {
+            releaseHandler.countDown();
+            runtime.haltAsync();
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -796,36 +891,42 @@ class DisruptorRuntimeTest {
         }
         DisruptorRuntime runtime = builder.build();
         runtime.start();
-        for (PipelineHandle<?> rawHandle : runtime.handles()) {
-            @SuppressWarnings("unchecked")
-            PipelineHandle<TestEvent> handle = (PipelineHandle<TestEvent>) rawHandle;
-            handle.publishEvent(TRANSLATOR, "blocked", 1L);
+        try {
+            for (PipelineHandle<?> rawHandle : runtime.handles()) {
+                @SuppressWarnings("unchecked")
+                PipelineHandle<TestEvent> handle = (PipelineHandle<TestEvent>) rawHandle;
+                handle.publishEvent(TRANSLATOR, "blocked", 1L);
+            }
+            assertTrue(handlersEntered.await(2, TimeUnit.SECONDS));
+
+            long startedAt = System.nanoTime();
+            assertThrows(DisruptorShutdownException.class, runtime::shutdown);
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
+
+            assertTrue(elapsed.compareTo(Duration.ofMillis(500)) < 0,
+                    "关闭预算必须是全局一次性的，不能按 child 线性叠加，实际=" + elapsed);
+            assertFalse(runtime.termination().toCompletableFuture().isDone());
+            assertEquals(Set.of(ShutdownMode.IMMEDIATE), runtime.handles().stream()
+                    .map(PipelineHandle::snapshot).map(PipelineSnapshot::shutdownMode).collect(
+                            java.util.stream.Collectors.toSet()));
+            Set<String> deadlines = runtime.handles().stream()
+                    .map(PipelineHandle::snapshot)
+                    .map(PipelineSnapshot::failure)
+                    .map(Throwable::getMessage)
+                    .map(DisruptorRuntimeTest::deadlineFrom)
+                    .collect(java.util.stream.Collectors.toSet());
+            assertEquals(1, deadlines.size(), "所有 child 必须冻结同一个绝对 deadline");
+
+            releaseHandlers.countDown();
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.handles().stream()
+                    .map(PipelineHandle::snapshot).map(PipelineSnapshot::lifecycle).collect(
+                            java.util.stream.Collectors.toSet()));
+        } finally {
+            releaseHandlers.countDown();
+            runtime.haltAsync();
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
         }
-        assertTrue(handlersEntered.await(2, TimeUnit.SECONDS));
-
-        long startedAt = System.nanoTime();
-        assertThrows(DisruptorShutdownException.class, runtime::shutdown);
-        Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
-
-        assertTrue(elapsed.compareTo(Duration.ofMillis(500)) < 0,
-                "关闭预算必须是全局一次性的，不能按 child 线性叠加，实际=" + elapsed);
-        assertFalse(runtime.termination().toCompletableFuture().isDone());
-        assertEquals(Set.of(ShutdownMode.IMMEDIATE), runtime.handles().stream()
-                .map(PipelineHandle::snapshot).map(PipelineSnapshot::shutdownMode).collect(
-                        java.util.stream.Collectors.toSet()));
-        Set<String> deadlines = runtime.handles().stream()
-                .map(PipelineHandle::snapshot)
-                .map(PipelineSnapshot::failure)
-                .map(Throwable::getMessage)
-                .map(DisruptorRuntimeTest::deadlineFrom)
-                .collect(java.util.stream.Collectors.toSet());
-        assertEquals(1, deadlines.size(), "所有 child 必须冻结同一个绝对 deadline");
-
-        releaseHandlers.countDown();
-        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.handles().stream()
-                .map(PipelineHandle::snapshot).map(PipelineSnapshot::lifecycle).collect(
-                        java.util.stream.Collectors.toSet()));
     }
 
     private static void awaitCondition(BooleanSupplier condition, Duration timeout) {
@@ -869,6 +970,11 @@ class DisruptorRuntimeTest {
         }
     }
 
+    private static void assertSuppressedIdentity(Throwable aggregate, Throwable expected) {
+        assertTrue(java.util.Arrays.stream(aggregate.getSuppressed())
+                .anyMatch(failure -> failure == expected));
+    }
+
     private static PipelineSpec<TestEvent> shutdownSignalling(String name, CountDownLatch allShutdown) {
         EventHandler<TestEvent> handler = new EventHandler<>() {
             @Override
@@ -899,6 +1005,193 @@ class DisruptorRuntimeTest {
 
         private TestEvent(String marker) {
             this.marker = marker;
+        }
+    }
+
+    private static final class StubPipeline
+            implements DisruptorPipeline<TestEvent>, PipelineHandle<TestEvent> {
+
+        private final String name;
+        private final RingBuffer<TestEvent> ringBuffer = RingBuffer.createSingleProducer(
+                () -> new TestEvent("stub"), 2);
+        private final CompletableFuture<Void> startOutcome = new CompletableFuture<>();
+        private final CompletableFuture<PipelineSnapshot> terminationOutcome =
+                new CompletableFuture<>();
+        private final List<ShutdownDeadline> deadlines = new CopyOnWriteArrayList<>();
+        private Throwable startFailure;
+        private Throwable requestFailure;
+        private boolean completeOnRequest;
+        private volatile PipelineSnapshot snapshot;
+
+        private StubPipeline(String name) {
+            this.name = name;
+            this.snapshot = snapshot(name, PipelineLifecycle.NEW, null, null);
+            startOutcome.complete(null);
+        }
+
+        private StubPipeline failStart(Throwable failure) {
+            startFailure = failure;
+            startOutcome.obtrudeException(failure);
+            return this;
+        }
+
+        private StubPipeline failRequest(Throwable failure) {
+            requestFailure = failure;
+            return this;
+        }
+
+        private StubPipeline terminateOnRequest() {
+            completeOnRequest = true;
+            return this;
+        }
+
+        private void failTermination(
+                Throwable terminationFailure,
+                Throwable snapshotFailure,
+                ShutdownMode mode) {
+            snapshot = snapshot(name, PipelineLifecycle.TERMINATED, snapshotFailure, mode);
+            terminationOutcome.completeExceptionally(terminationFailure);
+        }
+
+        private void completeTermination(ShutdownMode mode, Throwable failure) {
+            snapshot = snapshot(name, PipelineLifecycle.TERMINATED, failure, mode);
+            terminationOutcome.complete(snapshot);
+        }
+
+        @Override
+        public PipelineHandle<TestEvent> handle() {
+            return this;
+        }
+
+        @Override
+        public PipelineSnapshot snapshot() {
+            return snapshot;
+        }
+
+        @Override
+        public CompletionStage<Void> start() {
+            return startOutcome;
+        }
+
+        @Override
+        public synchronized void requestShutdown(
+                ShutdownMode mode,
+                ShutdownDeadline deadline) {
+            deadlines.add(deadline);
+            if (completeOnRequest && !terminationOutcome.isDone()) {
+                completeTermination(mode, startFailure);
+            }
+            if (requestFailure != null) {
+                sneakyThrow(requestFailure);
+            }
+        }
+
+        @Override
+        public CompletionStage<PipelineSnapshot> termination() {
+            return terminationOutcome;
+        }
+
+        @Override
+        public String name() {
+            return name;
+        }
+
+        @Override
+        public Class<TestEvent> eventType() {
+            return TestEvent.class;
+        }
+
+        @Override
+        public void publishEvent(EventTranslator<TestEvent> translator) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean tryPublishEvent(EventTranslator<TestEvent> translator) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A> void publishEvent(
+                EventTranslatorOneArg<TestEvent, A> translator,
+                A arg0) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A> boolean tryPublishEvent(
+                EventTranslatorOneArg<TestEvent, A> translator,
+                A arg0) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A, B> void publishEvent(
+                EventTranslatorTwoArg<TestEvent, A, B> translator,
+                A arg0,
+                B arg1) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A, B> boolean tryPublishEvent(
+                EventTranslatorTwoArg<TestEvent, A, B> translator,
+                A arg0,
+                B arg1) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A, B, C> void publishEvent(
+                EventTranslatorThreeArg<TestEvent, A, B, C> translator,
+                A arg0,
+                B arg1,
+                C arg2) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <A, B, C> boolean tryPublishEvent(
+                EventTranslatorThreeArg<TestEvent, A, B, C> translator,
+                A arg0,
+                B arg1,
+                C arg2) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public RingBuffer<TestEvent> unsafeRingBuffer() {
+            return ringBuffer;
+        }
+
+        @SuppressWarnings("unchecked")
+        private static <T extends Throwable> void sneakyThrow(Throwable failure) throws T {
+            throw (T) failure;
+        }
+
+        private static PipelineSnapshot snapshot(
+                String name,
+                PipelineLifecycle lifecycle,
+                Throwable failure,
+                ShutdownMode mode) {
+            boolean terminated = lifecycle == PipelineLifecycle.TERMINATED;
+            return PipelineSnapshot.builder()
+                    .name(name)
+                    .lifecycle(lifecycle)
+                    .acceptingPublications(false)
+                    .registrationSealed(terminated)
+                    .expectedConsumers(0)
+                    .createdConsumers(0)
+                    .startedConsumers(0)
+                    .aliveConsumers(0)
+                    .bufferSize(0)
+                    .backlog(0L)
+                    .failure(failure)
+                    .shutdownMode(mode)
+                    .reachedRunning(false)
+                    .drainCommitted(false)
+                    .gracefulStopApplied(false)
+                    .build();
         }
     }
 
