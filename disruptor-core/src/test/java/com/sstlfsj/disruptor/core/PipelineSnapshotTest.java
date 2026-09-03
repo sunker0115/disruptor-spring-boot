@@ -6,7 +6,6 @@ import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,129 +25,79 @@ class PipelineSnapshotTest {
     }
 
     @Test
-    void derivesHealthForEveryLifecycle() {
-        assertHealth(PipelineLifecycle.NEW, null, 0, 0, 0, PipelineHealth.STARTING);
-        assertHealth(PipelineLifecycle.STARTING, null, 0, 0, 0, PipelineHealth.STARTING);
-        assertHealth(PipelineLifecycle.RUNNING, null, 2, 2, 2, PipelineHealth.HEALTHY);
-        assertHealth(PipelineLifecycle.RUNNING, new IllegalStateException("failed"), 2, 2, 2,
-                PipelineHealth.UNHEALTHY);
-        assertHealth(PipelineLifecycle.RUNNING, null, 0, 0, 0, PipelineHealth.UNHEALTHY);
-        assertHealth(PipelineLifecycle.RUNNING, null, 2, 1, 1, PipelineHealth.UNHEALTHY);
-        assertHealth(PipelineLifecycle.RUNNING, null, 2, 2, 1, PipelineHealth.UNHEALTHY);
-        assertHealth(PipelineLifecycle.QUIESCING, new IllegalStateException("failed"), 2, 2, 2,
-                PipelineHealth.OUT_OF_SERVICE);
-        assertHealth(PipelineLifecycle.STOPPING, new IllegalStateException("failed"), 2, 2, 2,
-                PipelineHealth.OUT_OF_SERVICE);
-        assertHealth(PipelineLifecycle.TERMINATED, new IllegalStateException("failed"), 2, 2, 0,
-                PipelineHealth.TERMINATED);
+    void derivesHealthFromSealedStartedAndAliveFacts() {
+        PipelineSnapshot running = runningSnapshotBuilder().build();
+        assertEquals(PipelineHealth.HEALTHY, running.health());
+
+        PipelineSnapshot stopping = runningSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.STOPPING)
+                .acceptingPublications(false)
+                .shutdownMode(ShutdownMode.IMMEDIATE)
+                .aliveConsumers(1)
+                .build();
+        assertEquals(PipelineHealth.OUT_OF_SERVICE, stopping.health());
+
+        PipelineSnapshot terminated = stopping.toBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .aliveConsumers(0)
+                .build();
+        assertEquals(PipelineHealth.TERMINATED, terminated.health());
     }
 
     @Test
-    void preservesSnapshotFields() {
+    void preservesFailureIdentityAndDerivesGracefulTerminationFromHistory() {
         IllegalStateException failure = new IllegalStateException("boom");
+        PipelineSnapshot failed = runningSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.STOPPING)
+                .acceptingPublications(false)
+                .shutdownMode(ShutdownMode.IMMEDIATE)
+                .failure(failure)
+                .build();
+        assertSame(failure, failed.failure());
+        assertFalse(failed.gracefulTermination());
 
-        PipelineSnapshot snapshot = PipelineSnapshot.builder()
+        PipelineSnapshot graceful = runningSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED)
+                .acceptingPublications(false)
+                .aliveConsumers(0)
+                .shutdownMode(ShutdownMode.GRACEFUL)
+                .drainCommitted(true)
+                .gracefulStopApplied(true)
+                .build();
+        assertTrue(graceful.gracefulTermination());
+    }
+
+    @Test
+    void rejectsCountLifecycleAndGracefulHistoryContradictions() {
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .createdConsumers(1).startedConsumers(2).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .createdConsumers(1).startedConsumers(1).aliveConsumers(2).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .registrationSealed(true).expectedConsumers(2).createdConsumers(1).build());
+        assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
+                .startedConsumers(1).aliveConsumers(1).build());
+        assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
+                .lifecycle(PipelineLifecycle.TERMINATED).aliveConsumers(1).build());
+        assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
+                .drainCommitted(true).build());
+        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
+                .reachedRunning(false).drainCommitted(true).build());
+    }
+
+    private static PipelineSnapshot.PipelineSnapshotBuilder runningSnapshotBuilder() {
+        return PipelineSnapshot.builder()
                 .name("orders")
                 .lifecycle(PipelineLifecycle.RUNNING)
                 .acceptingPublications(true)
-                .expectedConsumers(3)
-                .createdConsumers(3)
-                .aliveConsumers(3)
-                .bufferSize(1024)
-                .backlog(12)
-                .failure(failure)
-                .gracefulTermination(false)
-                .build();
-
-        assertEquals("orders", snapshot.name());
-        assertEquals(PipelineLifecycle.RUNNING, snapshot.lifecycle());
-        assertEquals(PipelineHealth.UNHEALTHY, snapshot.health());
-        assertTrue(snapshot.acceptingPublications());
-        assertEquals(3, snapshot.expectedConsumers());
-        assertEquals(3, snapshot.createdConsumers());
-        assertEquals(3, snapshot.aliveConsumers());
-        assertEquals(1024, snapshot.bufferSize());
-        assertEquals(12, snapshot.backlog());
-        assertSame(failure, snapshot.failure());
-        assertFalse(snapshot.gracefulTermination());
-
-        assertNull(PipelineSnapshot.builder()
-                .name("orders")
-                .lifecycle(PipelineLifecycle.NEW)
-                .acceptingPublications(false)
-                .expectedConsumers(0)
-                .createdConsumers(0)
-                .aliveConsumers(0)
-                .bufferSize(0)
+                .registrationSealed(true)
+                .expectedConsumers(2)
+                .createdConsumers(2)
+                .startedConsumers(2)
+                .aliveConsumers(2)
+                .bufferSize(16)
                 .backlog(0)
-                .gracefulTermination(false)
-                .build()
-                .failure());
-    }
-
-    @Test
-    void rejectsInvalidSnapshotArguments() {
-        assertThrows(NullPointerException.class, () -> newSnapshotBuilder().name(null).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().name(" ").build());
-        assertThrows(NullPointerException.class, () -> newSnapshotBuilder().lifecycle(null).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().expectedConsumers(-1).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .expectedConsumers(1).createdConsumers(-1).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .expectedConsumers(1).createdConsumers(1).aliveConsumers(-1).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().bufferSize(-1).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder().backlog(-1).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .expectedConsumers(1).createdConsumers(2).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .expectedConsumers(1).createdConsumers(1).aliveConsumers(2).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.STARTING).acceptingPublications(true).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.STOPPING).gracefulTermination(true).build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
-                .expectedConsumers(1)
-                .createdConsumers(1)
-                .aliveConsumers(1)
-                .build());
-        assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
-                .failure(new IllegalStateException("failed"))
-                .gracefulTermination(true)
-                .build());
-    }
-
-    @Test
-    void canonicalConstructorRejectsInvalidHealth() {
-        assertThrows(NullPointerException.class, () -> new PipelineSnapshot(
-                "orders", PipelineLifecycle.NEW, null, false, 0, 0, 0, 0, 0, null, false));
-        assertThrows(IllegalArgumentException.class, () -> new PipelineSnapshot(
-                "orders", PipelineLifecycle.NEW, PipelineHealth.HEALTHY,
-                false, 0, 0, 0, 0, 0, null, false));
-    }
-
-    private static void assertHealth(
-            PipelineLifecycle lifecycle,
-            Throwable failure,
-            int expectedConsumers,
-            int createdConsumers,
-            int aliveConsumers,
-            PipelineHealth expectedHealth) {
-        PipelineSnapshot snapshot = PipelineSnapshot.builder()
-                .name("orders")
-                .lifecycle(lifecycle)
-                .acceptingPublications(false)
-                .expectedConsumers(expectedConsumers)
-                .createdConsumers(createdConsumers)
-                .aliveConsumers(aliveConsumers)
-                .bufferSize(1024)
-                .backlog(0)
-                .failure(failure)
-                .gracefulTermination(lifecycle == PipelineLifecycle.TERMINATED && failure == null)
-                .build();
-
-        assertEquals(expectedHealth, snapshot.health());
+                .reachedRunning(true);
     }
 
     private static PipelineSnapshot.PipelineSnapshotBuilder newSnapshotBuilder() {
@@ -158,9 +107,9 @@ class PipelineSnapshotTest {
                 .acceptingPublications(false)
                 .expectedConsumers(0)
                 .createdConsumers(0)
+                .startedConsumers(0)
                 .aliveConsumers(0)
                 .bufferSize(0)
-                .backlog(0)
-                .gracefulTermination(false);
+                .backlog(0);
     }
 }
