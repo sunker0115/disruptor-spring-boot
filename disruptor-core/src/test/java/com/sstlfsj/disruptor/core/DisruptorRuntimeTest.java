@@ -22,6 +22,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -209,6 +210,58 @@ class DisruptorRuntimeTest {
         assertThrows(CompletionException.class, () -> start.toCompletableFuture().join());
         assertThrows(CompletionException.class, () -> halt.toCompletableFuture().join());
         runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void deadlineOutcomeDoesNotWaitForAStuckStartupRollback() throws Exception {
+        Duration shutdownBudget = Duration.ofMillis(150);
+        CountDownLatch threadFactoryEntered = new CountDownLatch(1);
+        CountDownLatch releaseThreadFactory = new CountDownLatch(1);
+        DisruptorRuntime runtime = DisruptorRuntime.builder()
+                .shutdownTimeout(shutdownBudget)
+                .add(PipelineSpec.builder("stuck-startup", TestEvent.class,
+                                () -> new TestEvent("slot"))
+                        .threadFactory(runnable -> {
+                            threadFactoryEntered.countDown();
+                            awaitUninterruptibly(releaseThreadFactory);
+                            return new Thread(runnable, "stuck-startup-worker");
+                        })
+                        .topology(disruptor -> disruptor.handleEventsWith(
+                                (event, sequence, endOfBatch) -> {
+                                }))
+                        .build())
+                .build();
+        CompletionStage<Void> start = runtime.startAsync();
+        try {
+            assertTrue(threadFactoryEntered.await(2, TimeUnit.SECONDS));
+            long requestedAt = System.nanoTime();
+            CompletionStage<Void> outcome = runtime.shutdownAsync();
+
+            ExecutionException timeout = assertThrows(ExecutionException.class,
+                    () -> outcome.toCompletableFuture().get(1, TimeUnit.SECONDS));
+            long elapsedNanos = System.nanoTime() - requestedAt;
+            assertTrue(elapsedNanos >= shutdownBudget.minusMillis(30).toNanos(),
+                    "shutdown outcome 不应在共享预算前定稿");
+            assertTrue(elapsedNanos < Duration.ofSeconds(1).toNanos(),
+                    "startup rollback 卡住时也必须在共享预算附近返回");
+            assertTrue(timeout.getCause() instanceof DisruptorShutdownException);
+            assertTrue(timeout.getCause().getMessage().contains("超过共享关闭预算"));
+            assertFalse(runtime.termination().toCompletableFuture().isDone(),
+                    "超时 outcome 不能伪造 child 已真实终止");
+
+            releaseThreadFactory.countDown();
+            assertThrows(ExecutionException.class,
+                    () -> start.toCompletableFuture().get(2, TimeUnit.SECONDS));
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            ExecutionException afterRollback = assertThrows(ExecutionException.class,
+                    () -> runtime.haltAsync().toCompletableFuture().get(2, TimeUnit.SECONDS));
+            assertSame(timeout.getCause(), afterRollback.getCause(),
+                    "迟到的 startup rollback 不能替换既有超时结果");
+        } finally {
+            releaseThreadFactory.countDown();
+            runtime.haltAsync();
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
     }
 
     @Test

@@ -158,7 +158,7 @@ worker 退出前的引用清理、Future 终态化和模块 stop 属于 worker �
 
 Runtime 为一次关闭创建一个 `ShutdownDeadline`，在 `shutdown/halt` 及其异步变体返回 stage 前同步向所有管道广播相同 deadline 的关闭请求，再由协调线程聚合等待；不能为每条管道重新计算 timeout。并发 `GRACEFUL/IMMEDIATE` 请求单调升级，每个调用返回前都已广播自身要求的模式。到共同 deadline 时，对尚未终止的管道使用原 deadline 升级 `IMMEDIATE` 并返回或抛出聚合结果，后台继续等待 child 的真实 termination。
 
-Runtime 用单个私有 `RuntimeShutdownSession` 同时持有首次冻结的 deadline、最高 shutdown mode、唯一 outcome、协调线程启动事实、在途广播计数，以及按 Throwable identity 去重的启动、请求和 child termination 失败。启动回滚与随后到达的 `shutdown/halt` 必须复用同一会话；不能用 outcome 是否为空推断 deadline 或协调状态。每次离锁同步广播前必须在会话内登记，在 `finally` 回锁后原子归集失败并注销；正常完成 outcome 还必须满足启动回滚已落定、全部 child termination stage 已完成且没有在途广播。deadline 升级广播也遵守相同协议，先结束自身广播再判断 outcome，避免等待自己的 token。outcome 一旦在锁内承诺定稿，后续调用只返回同一 stage，不再发起无法计入结果的新广播。广播某个 child 抛错时继续请求其余 child，并把原始异常纳入最终 outcome。全部 child 的 termination stage 已完成后，先逐一收集 stage 异常和 snapshot 首因，再决定 outcome，禁止先成功完成 outcome 后才发现 Runtime termination 失败。
+Runtime 用单个私有 `RuntimeShutdownSession` 同时持有首次冻结的 deadline、最高 shutdown mode、唯一 outcome、协调线程启动事实、在途广播计数，以及按 Throwable identity 去重的启动、请求和 child termination 失败。启动回滚与随后到达的 `shutdown/halt` 必须复用同一会话；不能用 outcome 是否为空推断 deadline 或协调状态。每次离锁同步广播前必须在会话内登记，在 `finally` 回锁后原子归集失败并注销；正常完成 outcome 还必须满足启动回滚已落定、全部 child termination stage 已完成且没有在途广播。deadline 升级广播也遵守相同协议，先结束自身广播再判断 outcome，避免等待自己的 token；deadline 失败 outcome 只等待全部已接受广播归还 token，不等待启动回滚或 child 真实终止，后两者继续在后台收敛。outcome 一旦在锁内承诺定稿，后续调用只返回同一 stage，不再发起无法计入结果的新广播。广播某个 child 抛错时继续请求其余 child，并把原始异常纳入最终 outcome。全部 child 的 termination stage 已完成后，先逐一收集 stage 异常和 snapshot 首因，再决定成功 outcome，禁止先成功完成 outcome 后才发现 Runtime termination 失败。
 
 该会话当前保持 Runtime 私有。未来 `EventLoopGroup` 复用相同的不变量和协调模式，但 Group 还承担 child 故障 fail-stop，Runtime 还承担启动回滚 stage；在两者状态与失败传播完全同构前不提取共享实现类型。
 

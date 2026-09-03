@@ -603,7 +603,7 @@ public final class DisruptorRuntime {
         }
 
         private boolean commitDeadlineOutcome() {
-            if (outcomeCommitted || startupPending || broadcastsInFlight != 0) {
+            if (outcomeCommitted || broadcastsInFlight != 0) {
                 return false;
             }
             outcomeCommitted = true;

@@ -273,7 +273,7 @@ public interface DisruptorPipeline<E> {
 
 - [ ] **Step 4: 重写 Runtime 为共享 deadline 聚合器**
 
-Runtime 一次关闭只创建一个私有 `RuntimeShutdownSession`，集中持有首次冻结的 `ShutdownDeadline`、最高 mode、唯一 outcome、一次协调事实、在途广播计数，以及按 identity 去重的启动、请求和 child termination 失败。启动回滚与后续关闭 API 必须复用该会话；每次 API 返回 stage 前同步向全部管道广播同一个请求，再由唯一虚拟协调线程聚合 termination。每次离锁广播必须先在锁内登记 token，并在 `finally` 回锁后原子归集失败和注销；启动仍待回滚、child termination 尚未全部完成或仍有广播在途时，不能正常定稿 outcome。deadline 升级先完成自己的 immediate 广播再参与定稿，outcome 一旦承诺定稿便关闭新的广播入口。单个 child 请求抛错不能阻断其余广播，原始异常必须进入 outcome。并发 graceful/immediate 请求只能单调升级，且每个调用返回前自身模式已完成广播。到 deadline 时，对未终止 child 使用原 deadline 升级 immediate 并返回/抛出聚合结果；后台继续等待真实终止。全部 child stage 完成后同时聚合 termination 异常和 snapshot 首因，Runtime 只有在全部 child 的 termination 完成后才能提交自身终止状态。
+Runtime 一次关闭只创建一个私有 `RuntimeShutdownSession`，集中持有首次冻结的 `ShutdownDeadline`、最高 mode、唯一 outcome、一次协调事实、在途广播计数，以及按 identity 去重的启动、请求和 child termination 失败。启动回滚与后续关闭 API 必须复用该会话；每次 API 返回 stage 前同步向全部管道广播同一个请求，再由唯一虚拟协调线程聚合 termination。每次离锁广播必须先在锁内登记 token，并在 `finally` 回锁后原子归集失败和注销；启动仍待回滚、child termination 尚未全部完成或仍有广播在途时，不能正常定稿 outcome。deadline 升级先完成自己的 immediate 广播再参与定稿；deadline 失败只等待全部已接受广播归还 token，不等待启动回滚或 child 真实终止，二者继续在后台收敛。outcome 一旦承诺定稿便关闭新的广播入口。单个 child 请求抛错不能阻断其余广播，原始异常必须进入 outcome。并发 graceful/immediate 请求只能单调升级，且每个调用返回前自身模式已完成广播。到 deadline 时，对未终止 child 使用原 deadline 升级 immediate 并返回/抛出聚合结果；后台继续等待真实终止。全部 child stage 完成后同时聚合 termination 异常和 snapshot 首因，Runtime 只有在全部 child 的 termination 完成后才能提交自身终止状态。
 
 启动失败回滚同样向全部已尝试管道广播同一个 immediate deadline；保留按名称和事件类型查找，不恢复另一套管道状态判断。
 
