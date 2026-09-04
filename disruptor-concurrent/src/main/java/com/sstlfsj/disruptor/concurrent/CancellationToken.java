@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.concurrent;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /** 只读的协作取消信号。 */
@@ -23,7 +24,8 @@ public interface CancellationToken {
         public CancellationRegistration onCancellation(
                 Consumer<? super CancellationReason> listener) {
             java.util.Objects.requireNonNull(listener, "listener 不能为空");
-            return () -> true;
+            AtomicBoolean registered = new AtomicBoolean(true);
+            return () -> registered.compareAndSet(true, false);
         }
 
         @Override
@@ -32,7 +34,8 @@ public interface CancellationToken {
                 Consumer<? super CancellationReason> listener) {
             java.util.Objects.requireNonNull(executor, "executor 不能为空");
             java.util.Objects.requireNonNull(listener, "listener 不能为空");
-            return () -> true;
+            AtomicBoolean registered = new AtomicBoolean(true);
+            return () -> registered.compareAndSet(true, false);
         }
     };
 
