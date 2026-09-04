@@ -62,6 +62,25 @@ final class AcceptedTaskRegistry {
         return List.copyOf(returned);
     }
 
+    void cancelAll(CancellationReason reason) {
+        Objects.requireNonNull(reason, "reason 不能为空");
+        for (Entry entry : tasks.values()) {
+            AcceptedTask<?> task = entry.task;
+            while (true) {
+                AcceptedTask.PhysicalState state = task.state();
+                if (state == AcceptedTask.PhysicalState.WAITING) {
+                    if (!task.markCancelledWaiting()) {
+                        continue;
+                    }
+                    task.future().cancel(reason);
+                } else if (state == AcceptedTask.PhysicalState.RUNNING) {
+                    task.future().cancel(reason);
+                }
+                break;
+            }
+        }
+    }
+
     boolean terminate(AcceptedTask<?> task) {
         Objects.requireNonNull(task, "task 不能为空");
         if (!task.terminate()) {

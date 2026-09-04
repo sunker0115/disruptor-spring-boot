@@ -26,7 +26,10 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
     private final NanoClock clock;
     private final BooleanSupplier inEventLoop;
     private final AtomicReference<Runnable> terminalAction = new AtomicReference<>();
+    private final AtomicReference<Runnable> cancellationAction = new AtomicReference<>();
     private final AtomicBoolean terminalActionRun = new AtomicBoolean();
+    private final AtomicBoolean cancellationActionRun = new AtomicBoolean();
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
 
     private ScheduledTaskSnapshot snapshot;
 
@@ -74,6 +77,20 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
         }
     }
 
+    void setCancellationAction(Runnable action) {
+        Objects.requireNonNull(action, "action 不能为空");
+        if (!cancellationAction.compareAndSet(null, action)) {
+            throw new IllegalStateException("cancellationAction 只能设置一次");
+        }
+        if (isCancelled()) {
+            runCancellationAction();
+        }
+    }
+
+    Throwable failure() {
+        return failure.get();
+    }
+
     boolean completeSuccess(V value, ScheduledTaskSnapshot completedSnapshot) {
         synchronized (completionLock) {
             if (super.isDone()) {
@@ -91,6 +108,7 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
             if (super.isDone()) {
                 return false;
             }
+            this.failure.compareAndSet(null, failure);
             super.setException(failure);
             snapshot = requireOutcome(failedSnapshot, TaskOutcome.FAILED);
             return true;
@@ -99,6 +117,7 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
 
     boolean cancel(CancellationReason reason) {
         Objects.requireNonNull(reason, "reason 不能为空");
+        boolean cancelled;
         synchronized (completionLock) {
             if (!super.cancel(reason.interruptRequested())) {
                 return false;
@@ -107,8 +126,10 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
                     .outcome(TaskOutcome.CANCELLED)
                     .cancellationReason(reason)
                     .build();
-            return true;
+            cancelled = true;
         }
+        runCancellationAction();
+        return cancelled;
     }
 
     @Override
@@ -169,6 +190,12 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
             }
         }
         runTerminalAction();
+    }
+
+    @Override
+    protected void setException(Throwable throwable) {
+        failure.compareAndSet(null, throwable);
+        super.setException(throwable);
     }
 
     @Override
@@ -234,6 +261,13 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
     private void runTerminalAction() {
         Runnable action = terminalAction.get();
         if (action != null && terminalActionRun.compareAndSet(false, true)) {
+            action.run();
+        }
+    }
+
+    private void runCancellationAction() {
+        Runnable action = cancellationAction.get();
+        if (action != null && cancellationActionRun.compareAndSet(false, true)) {
             action.run();
         }
     }

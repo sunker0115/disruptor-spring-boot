@@ -18,6 +18,8 @@ final class AcceptedTask<V> {
     private final long acceptedSequence;
     private final Runnable originalRunnable;
     private final EventLoopFutureTask<V> future;
+    private final ScheduledTask<V> scheduledTask;
+    private final boolean reportFailure;
     private final AtomicReference<PhysicalState> state = new AtomicReference<>(PhysicalState.WAITING);
     private final AtomicBoolean cancellationQueued = new AtomicBoolean();
 
@@ -25,6 +27,15 @@ final class AcceptedTask<V> {
             long acceptedSequence,
             Runnable originalRunnable,
             EventLoopFutureTask<V> future) {
+        this(acceptedSequence, originalRunnable, future, null, false);
+    }
+
+    AcceptedTask(
+            long acceptedSequence,
+            Runnable originalRunnable,
+            EventLoopFutureTask<V> future,
+            ScheduledTask<V> scheduledTask,
+            boolean reportFailure) {
         if (acceptedSequence < 0) {
             throw new IllegalArgumentException("acceptedSequence 不能为负数");
         }
@@ -32,6 +43,8 @@ final class AcceptedTask<V> {
         this.originalRunnable = Objects.requireNonNull(originalRunnable,
                 "originalRunnable 不能为空");
         this.future = Objects.requireNonNull(future, "future 不能为空");
+        this.scheduledTask = scheduledTask;
+        this.reportFailure = reportFailure;
     }
 
     long acceptedSequence() {
@@ -44,6 +57,18 @@ final class AcceptedTask<V> {
 
     EventLoopFutureTask<V> future() {
         return future;
+    }
+
+    ScheduledTask<V> scheduledTask() {
+        return scheduledTask;
+    }
+
+    boolean scheduled() {
+        return scheduledTask != null;
+    }
+
+    boolean reportFailure() {
+        return reportFailure;
     }
 
     PhysicalState state() {

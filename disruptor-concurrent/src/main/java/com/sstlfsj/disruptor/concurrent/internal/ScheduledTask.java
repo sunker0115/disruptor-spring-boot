@@ -13,6 +13,7 @@ import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /** 只由 EventLoop worker 推进触发时间和周期状态的调度任务。 */
 final class ScheduledTask<V> {
@@ -24,6 +25,7 @@ final class ScheduledTask<V> {
 
     private long triggerNanos;
     private int heapIndex = -1;
+    private AcceptedTask<V> acceptedTask;
 
     ScheduledTask(
             long acceptedSequence,
@@ -40,6 +42,17 @@ final class ScheduledTask<V> {
             long acceptedAtNanos,
             NanoClock clock,
             Consumer<Throwable> continuedFailureHandler) {
+        this(acceptedSequence, spec, acceptedAtNanos, clock, continuedFailureHandler,
+                () -> false);
+    }
+
+    ScheduledTask(
+            long acceptedSequence,
+            ScheduledTaskSpec<V> spec,
+            long acceptedAtNanos,
+            NanoClock clock,
+            Consumer<Throwable> continuedFailureHandler,
+            BooleanSupplier inEventLoop) {
         if (acceptedSequence < 0) {
             throw new IllegalArgumentException("acceptedSequence 不能为负数");
         }
@@ -65,7 +78,8 @@ final class ScheduledTask<V> {
                 .started(false)
                 .outcome(TaskOutcome.WAITING)
                 .build();
-        future = new EventLoopFutureTask<>(clock, initialSnapshot);
+        future = new EventLoopFutureTask<>(() -> null, clock, initialSnapshot,
+                Objects.requireNonNull(inEventLoop, "inEventLoop 不能为空"));
         CancellationRegistration tokenRegistration = spec.cancellationToken()
                 .onCancellation(future::cancel);
         future.setTerminalAction(tokenRegistration::unregister);
@@ -73,6 +87,21 @@ final class ScheduledTask<V> {
 
     EventLoopFutureTask<V> future() {
         return future;
+    }
+
+    void bind(AcceptedTask<V> acceptedTask) {
+        Objects.requireNonNull(acceptedTask, "acceptedTask 不能为空");
+        if (this.acceptedTask != null) {
+            throw new IllegalStateException("scheduled task 只能绑定一次 accepted task");
+        }
+        this.acceptedTask = acceptedTask;
+    }
+
+    AcceptedTask<V> acceptedTask() {
+        if (acceptedTask == null) {
+            throw new IllegalStateException("scheduled task 尚未绑定 accepted task");
+        }
+        return acceptedTask;
     }
 
     long triggerNanos() {
@@ -176,6 +205,10 @@ final class ScheduledTask<V> {
     int compareTo(ScheduledTask<?> other) {
         return ScheduledTaskSnapshotOrder.compare(
                 future.snapshot(), other.future.snapshot(), clock.nanoTime());
+    }
+
+    boolean isPeriodic() {
+        return spec.scheduleMode() != ScheduleMode.ONE_SHOT;
     }
 
     private long nextTrigger(ScheduledTaskSnapshot lastRun, long completedAtNanos) throws Exception {

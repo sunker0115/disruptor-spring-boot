@@ -8,9 +8,10 @@ import java.util.Objects;
 final class IndexedScheduledHeap {
 
     private final List<ScheduledTask<?>> heap = new ArrayList<>();
+    private volatile int publishedSize;
 
     int size() {
-        return heap.size();
+        return publishedSize;
     }
 
     boolean isEmpty() {
@@ -30,6 +31,7 @@ final class IndexedScheduledHeap {
         heap.add(task);
         task.heapIndex(index);
         siftUp(index);
+        publishedSize = heap.size();
     }
 
     ScheduledTask<?> poll() {
@@ -52,6 +54,7 @@ final class IndexedScheduledHeap {
         ScheduledTask<?> moved = heap.remove(lastIndex);
         removed.heapIndex(-1);
         if (index == lastIndex) {
+            publishedSize = heap.size();
             return removed;
         }
         heap.set(index, moved);
@@ -59,6 +62,7 @@ final class IndexedScheduledHeap {
         if (!siftDown(index)) {
             siftUp(index);
         }
+        publishedSize = heap.size();
         return removed;
     }
 
