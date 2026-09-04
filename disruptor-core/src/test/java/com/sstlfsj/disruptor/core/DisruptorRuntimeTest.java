@@ -182,7 +182,7 @@ class DisruptorRuntimeTest {
     }
 
     @Test
-    void startupRollbackAndLaterStopCallsReuseOneShutdownSessionDeadline() throws Exception {
+    void startupRollbackAndLaterStopCallsReuseOneShutdownSessionDeadline() throws Throwable {
         IllegalStateException startupFailure = new IllegalStateException("second start failed");
         StubPipeline first = new StubPipeline("rollback-blocked");
         StubPipeline second = new StubPipeline("rollback-failed")
@@ -191,25 +191,42 @@ class DisruptorRuntimeTest {
         DisruptorRuntime runtime = new DisruptorRuntime(
                 List.of(first, second), Duration.ofSeconds(2));
         CompletionStage<Void> start = runtime.startAsync();
-        awaitCondition(() -> first.deadlines.size() == 1 && second.deadlines.size() == 1,
-                Duration.ofSeconds(2));
-        ShutdownDeadline rollbackDeadline = first.deadlines.get(0);
+        Throwable testFailure = null;
+        try {
+            awaitCondition(() -> first.deadlines.size() == 1 && second.deadlines.size() == 1,
+                    Duration.ofSeconds(2));
+            ShutdownDeadline rollbackDeadline = first.deadlines.get(0);
 
-        CompletionStage<Void> halt = runtime.haltAsync();
-        CompletionStage<Void> repeated = runtime.shutdownAsync();
+            CompletionStage<Void> halt = runtime.haltAsync();
+            CompletionStage<Void> repeated = runtime.shutdownAsync();
 
-        assertSame(halt, repeated);
-        assertEquals(3, first.deadlines.size());
-        assertEquals(3, second.deadlines.size());
-        assertTrue(first.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
-        assertTrue(second.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
-        assertEquals(rollbackDeadline.deadlineNanos(),
-                second.deadlines.get(0).deadlineNanos());
+            assertSame(halt, repeated);
+            assertEquals(3, first.deadlines.size());
+            assertEquals(3, second.deadlines.size());
+            assertTrue(first.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
+            assertTrue(second.deadlines.stream().allMatch(deadline -> deadline == rollbackDeadline));
+            assertEquals(rollbackDeadline.deadlineNanos(),
+                    second.deadlines.get(0).deadlineNanos());
 
-        first.completeTermination(ShutdownMode.IMMEDIATE, null);
-        assertThrows(CompletionException.class, () -> start.toCompletableFuture().join());
-        assertThrows(CompletionException.class, () -> halt.toCompletableFuture().join());
-        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            first.completeTermination(ShutdownMode.IMMEDIATE, null);
+            assertThrows(CompletionException.class, () -> start.toCompletableFuture().join());
+            assertThrows(CompletionException.class, () -> halt.toCompletableFuture().join());
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                first.completeTermination(ShutdownMode.IMMEDIATE, null);
+                second.completeTermination(ShutdownMode.IMMEDIATE, startupFailure);
+                runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
+            }
+        }
     }
 
     @Test
@@ -316,7 +333,7 @@ class DisruptorRuntimeTest {
     }
 
     @Test
-    void shutdownOutcomeWaitsForEveryConcurrentBroadcastToFinish() throws Exception {
+    void shutdownOutcomeWaitsForEveryConcurrentBroadcastToFinish() throws Throwable {
         IllegalStateException requestFailure = new IllegalStateException("late request failed");
         CountDownLatch secondRequestEntered = new CountDownLatch(1);
         CountDownLatch releaseSecondRequest = new CountDownLatch(1);
@@ -331,6 +348,7 @@ class DisruptorRuntimeTest {
         AtomicReference<CompletionStage<Void>> repeatedOutcome = new AtomicReference<>();
         Thread haltCaller = Thread.ofPlatform().start(
                 () -> repeatedOutcome.set(runtime.haltAsync()));
+        Throwable testFailure = null;
         try {
             assertTrue(secondRequestEntered.await(2, TimeUnit.SECONDS));
             pipeline.completeTermination(ShutdownMode.IMMEDIATE, null);
@@ -339,21 +357,35 @@ class DisruptorRuntimeTest {
             assertFalse(outcomeCompleted.await(100, TimeUnit.MILLISECONDS),
                     "仍有同步广播在途时不能定稿 shutdown outcome");
             assertFalse(runtime.termination().toCompletableFuture().isDone());
-        } finally {
             releaseSecondRequest.countDown();
             haltCaller.join(2_000);
-        }
 
-        assertFalse(haltCaller.isAlive());
-        assertSame(outcome, repeatedOutcome.get());
-        CompletionException failure = assertThrows(CompletionException.class,
-                () -> outcome.toCompletableFuture().join());
-        assertSuppressedIdentity(failure.getCause(), requestFailure);
-        runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        assertSame(outcome, runtime.shutdownAsync());
-        assertSame(outcome, runtime.haltAsync());
-        assertEquals(2, pipeline.requestCount,
-                "outcome 承诺定稿后不能再接受新的 shutdown 广播");
+            assertFalse(haltCaller.isAlive());
+            assertSame(outcome, repeatedOutcome.get());
+            CompletionException failure = assertThrows(CompletionException.class,
+                    () -> outcome.toCompletableFuture().join());
+            assertSuppressedIdentity(failure.getCause(), requestFailure);
+            runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            assertSame(outcome, runtime.shutdownAsync());
+            assertSame(outcome, runtime.haltAsync());
+            assertEquals(2, pipeline.requestCount,
+                    "outcome 承诺定稿后不能再接受新的 shutdown 广播");
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                releaseSecondRequest.countDown();
+                pipeline.completeTermination(ShutdownMode.IMMEDIATE, null);
+                haltCaller.join(2_000);
+                runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
+            }
+        }
     }
 
     @Test
