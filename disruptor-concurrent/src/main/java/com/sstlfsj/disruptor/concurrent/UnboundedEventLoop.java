@@ -2,11 +2,11 @@ package com.sstlfsj.disruptor.concurrent;
 
 import com.sstlfsj.disruptor.concurrent.internal.EventLoopKernel;
 
-/** 默认的有界、严格单线程 EventLoop。 */
-public final class DisruptorEventLoop extends AbstractEventLoop {
+/** 显式选择的无界、严格单线程 EventLoop。 */
+public final class UnboundedEventLoop extends AbstractEventLoop {
 
-    DisruptorEventLoop(EventLoopBuilder.Configuration configuration) {
-        initializeKernel(EventLoopKernel.bounded(
+    UnboundedEventLoop(EventLoopBuilder.Configuration configuration) {
+        initializeKernel(EventLoopKernel.unbounded(
                 this,
                 configuration.name(),
                 configuration.queueSize(),

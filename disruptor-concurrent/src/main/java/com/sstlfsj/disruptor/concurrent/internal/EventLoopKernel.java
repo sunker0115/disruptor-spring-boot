@@ -80,7 +80,10 @@ public final class EventLoopKernel {
     private EventLoopKernel(
             EventLoop owner,
             String name,
-            int capacity,
+            CapacityMode capacityMode,
+            OptionalLong capacityLimit,
+            TaskQueue queue,
+            TaskAdmissionGate gate,
             ThreadFactory threadFactory,
             Duration shutdownTimeout,
             NanoClock clock,
@@ -90,10 +93,10 @@ public final class EventLoopKernel {
             List<EventLoopModule> modules) {
         this.owner = Objects.requireNonNull(owner, "owner 不能为空");
         this.name = Objects.requireNonNull(name, "name 不能为空");
-        this.capacityMode = CapacityMode.BOUNDED;
-        this.capacityLimit = OptionalLong.of(capacity);
-        this.queue = new BoundedTaskQueue(capacity);
-        this.gate = TaskAdmissionGate.bounded(capacity);
+        this.capacityMode = Objects.requireNonNull(capacityMode, "capacityMode 不能为空");
+        this.capacityLimit = Objects.requireNonNull(capacityLimit, "capacityLimit 不能为空");
+        this.queue = Objects.requireNonNull(queue, "queue 不能为空");
+        this.gate = Objects.requireNonNull(gate, "gate 不能为空");
         this.modules = new ModuleLifecycle(modules);
         this.clock = Objects.requireNonNull(clock, "clock 不能为空");
         this.maxCommandBatchSize = requirePositive(maxCommandBatchSize,
@@ -132,8 +135,46 @@ public final class EventLoopKernel {
             int maxTimerBatchSize,
             TaskExceptionHandler taskExceptionHandler,
             List<EventLoopModule> modules) {
-        return new EventLoopKernel(owner, name, capacity, threadFactory, shutdownTimeout,
-                clock, maxCommandBatchSize, maxTimerBatchSize, taskExceptionHandler,
+        return new EventLoopKernel(
+                owner,
+                name,
+                CapacityMode.BOUNDED,
+                OptionalLong.of(capacity),
+                new BoundedTaskQueue(capacity),
+                TaskAdmissionGate.bounded(capacity),
+                threadFactory,
+                shutdownTimeout,
+                clock,
+                maxCommandBatchSize,
+                maxTimerBatchSize,
+                taskExceptionHandler,
+                List.copyOf(modules));
+    }
+
+    public static EventLoopKernel unbounded(
+            EventLoop owner,
+            String name,
+            int segmentSize,
+            ThreadFactory threadFactory,
+            Duration shutdownTimeout,
+            NanoClock clock,
+            int maxCommandBatchSize,
+            int maxTimerBatchSize,
+            TaskExceptionHandler taskExceptionHandler,
+            List<EventLoopModule> modules) {
+        return new EventLoopKernel(
+                owner,
+                name,
+                CapacityMode.UNBOUNDED,
+                OptionalLong.empty(),
+                new UnboundedTaskQueue(segmentSize),
+                TaskAdmissionGate.unbounded(),
+                threadFactory,
+                shutdownTimeout,
+                clock,
+                maxCommandBatchSize,
+                maxTimerBatchSize,
+                taskExceptionHandler,
                 List.copyOf(modules));
     }
 
