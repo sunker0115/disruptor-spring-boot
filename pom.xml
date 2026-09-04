@@ -10,6 +10,7 @@
 
     <modules>
         <module>disruptor-core</module>
+        <module>disruptor-concurrent</module>
         <module>disruptor-benchmarks</module>
         <module>disruptor-spring-boot-autoconfigure</module>
         <module>disruptor-spring-boot-starter</module>
@@ -60,6 +61,11 @@
             <dependency>
                 <groupId>com.sstlfsj</groupId>
                 <artifactId>disruptor-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.sstlfsj</groupId>
+                <artifactId>disruptor-concurrent</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
