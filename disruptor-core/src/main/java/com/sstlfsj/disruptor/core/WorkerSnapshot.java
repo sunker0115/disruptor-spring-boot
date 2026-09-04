@@ -8,7 +8,7 @@ import java.util.Objects;
 @Builder(builderMethodName = "builder", toBuilder = true)
 public record WorkerSnapshot(
         String name,
-        PipelineLifecycle lifecycle,
+        SupervisedLifecycle lifecycle,
         boolean registrationSealed,
         int expectedWorkers,
         int registeredWorkers,
@@ -51,7 +51,7 @@ public record WorkerSnapshot(
     }
 
     public boolean gracefulTermination() {
-        return lifecycle == PipelineLifecycle.TERMINATED
+        return lifecycle == SupervisedLifecycle.TERMINATED
                 && registrationSealed
                 && reachedRunning
                 && drainCommitted
@@ -63,7 +63,7 @@ public record WorkerSnapshot(
     }
 
     private static void validateLifecycle(
-            PipelineLifecycle lifecycle,
+            SupervisedLifecycle lifecycle,
             boolean registrationSealed,
             int expectedWorkers,
             int registeredWorkers,
@@ -74,7 +74,7 @@ public record WorkerSnapshot(
             boolean reachedRunning,
             boolean drainCommitted,
             boolean gracefulStopApplied) {
-        if (lifecycle == PipelineLifecycle.RUNNING
+        if (lifecycle == SupervisedLifecycle.RUNNING
                 && (!registrationSealed
                 || expectedWorkers == 0
                 || startedWorkers != registeredWorkers
@@ -84,19 +84,19 @@ public record WorkerSnapshot(
                 || shutdownMode != null)) {
             throw new IllegalArgumentException("RUNNING 必须对应已封口且全部入场存活的无故障 worker 集");
         }
-        if ((lifecycle == PipelineLifecycle.NEW || lifecycle == PipelineLifecycle.STARTING)
+        if ((lifecycle == SupervisedLifecycle.NEW || lifecycle == SupervisedLifecycle.STARTING)
                 && (reachedRunning || shutdownMode != null)) {
             throw new IllegalArgumentException("启动阶段不能包含已运行或关闭事实");
         }
-        if (lifecycle == PipelineLifecycle.QUIESCING
+        if (lifecycle == SupervisedLifecycle.QUIESCING
                 && (!reachedRunning || shutdownMode != ShutdownMode.GRACEFUL || drainCommitted)) {
             throw new IllegalArgumentException("QUIESCING 必须是尚未提交排空的优雅关闭阶段");
         }
-        if ((lifecycle == PipelineLifecycle.STOPPING || lifecycle == PipelineLifecycle.TERMINATED)
+        if ((lifecycle == SupervisedLifecycle.STOPPING || lifecycle == SupervisedLifecycle.TERMINATED)
                 && shutdownMode == null) {
             throw new IllegalArgumentException("停止阶段必须包含 shutdownMode");
         }
-        if (lifecycle == PipelineLifecycle.TERMINATED
+        if (lifecycle == SupervisedLifecycle.TERMINATED
                 && (!registrationSealed || aliveWorkers != 0)) {
             throw new IllegalArgumentException("TERMINATED 状态必须已封口且没有存活 worker");
         }
@@ -104,13 +104,13 @@ public record WorkerSnapshot(
             throw new IllegalArgumentException("提交排空前必须曾进入 RUNNING");
         }
         if (drainCommitted
-                && lifecycle != PipelineLifecycle.STOPPING
-                && lifecycle != PipelineLifecycle.TERMINATED) {
+                && lifecycle != SupervisedLifecycle.STOPPING
+                && lifecycle != SupervisedLifecycle.TERMINATED) {
             throw new IllegalArgumentException("提交排空只能是停止阶段的历史事实");
         }
         if (gracefulStopApplied
-                && lifecycle != PipelineLifecycle.STOPPING
-                && lifecycle != PipelineLifecycle.TERMINATED) {
+                && lifecycle != SupervisedLifecycle.STOPPING
+                && lifecycle != SupervisedLifecycle.TERMINATED) {
             throw new IllegalArgumentException("graceful stop 只能发生在停止阶段");
         }
         if (gracefulStopApplied && reachedRunning && !drainCommitted) {

@@ -165,7 +165,7 @@ public final class DisruptorRuntime {
     public boolean isRunning() {
         synchronized (lifecycleLock) {
             return state == State.RUNNING && pipelines.stream()
-                    .allMatch(pipeline -> pipeline.snapshot().lifecycle() == PipelineLifecycle.RUNNING);
+                    .allMatch(pipeline -> pipeline.snapshot().lifecycle() == SupervisedLifecycle.RUNNING);
         }
     }
 

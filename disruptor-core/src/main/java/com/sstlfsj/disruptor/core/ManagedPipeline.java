@@ -226,7 +226,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 .name(name)
                 .lifecycle(worker.lifecycle())
                 .acceptingPublications(acceptingPublications
-                        && worker.lifecycle() == PipelineLifecycle.RUNNING)
+                        && worker.lifecycle() == SupervisedLifecycle.RUNNING)
                 .registrationSealed(worker.registrationSealed())
                 .expectedConsumers(worker.expectedWorkers())
                 .createdConsumers(worker.registeredWorkers())

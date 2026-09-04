@@ -167,7 +167,7 @@ class WorkerSupervisorTest {
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
 
         supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminate(supervisor).lifecycle());
     }
 
     @Test
@@ -197,7 +197,7 @@ class WorkerSupervisorTest {
                         .get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
         assertSame(original, startupFailure.getCause());
         WorkerSnapshot terminated = terminate(supervisor);
-        assertEquals(PipelineLifecycle.TERMINATED, terminated.lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminated.lifecycle());
         assertSame(original, terminated.failure());
     }
 
@@ -251,7 +251,7 @@ class WorkerSupervisorTest {
         Thread caller = Thread.currentThread();
 
         supervisor.requestShutdown(ShutdownMode.GRACEFUL);
-        assertEquals(PipelineLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
+        assertEquals(SupervisedLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
         WorkerSnapshot terminated = terminate(supervisor);
 
         assertEquals(List.of("beginQuiesce", "isDrained", "stop:GRACEFUL"), backend.actions);
@@ -262,7 +262,7 @@ class WorkerSupervisorTest {
         assertEquals("worker-supervisor-workers", control.getName());
         assertFalse(control == caller);
         assertFalse(backend.calledWithStateLockHeld.get());
-        assertEquals(PipelineLifecycle.STOPPING, backend.lifecycleAtGracefulStop.get());
+        assertEquals(SupervisedLifecycle.STOPPING, backend.lifecycleAtGracefulStop.get());
         assertTrue(terminated.drainCommitted());
         assertTrue(terminated.gracefulStopApplied());
         assertTrue(terminated.gracefulTermination());
@@ -278,9 +278,9 @@ class WorkerSupervisorTest {
 
         supervisor.requestShutdown(ShutdownMode.GRACEFUL);
         assertTrue(backend.probed.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
-        assertEquals(PipelineLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
+        assertEquals(SupervisedLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE);
-        assertEquals(PipelineLifecycle.STOPPING, supervisor.snapshot().lifecycle());
+        assertEquals(SupervisedLifecycle.STOPPING, supervisor.snapshot().lifecycle());
 
         WorkerSnapshot terminated = terminate(supervisor);
         assertTrue(backend.actions.contains("stop:IMMEDIATE"));
@@ -366,7 +366,7 @@ class WorkerSupervisorTest {
         awaitCondition(() -> actionCount(backend, "isDrained") >= 2);
         supervisor.requestShutdown(ShutdownMode.GRACEFUL, ShutdownDeadline.after(Duration.ofSeconds(10)));
 
-        assertEquals(PipelineLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
+        assertEquals(SupervisedLifecycle.QUIESCING, supervisor.snapshot().lifecycle());
         assertEquals(1, actionCount(backend, "beginQuiesce"));
         assertFalse(backend.actions.contains("stop:GRACEFUL"));
 
@@ -512,14 +512,14 @@ class WorkerSupervisorTest {
         assertTrue(backend.immediateStopped.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
 
         WorkerSnapshot stopping = supervisor.snapshot();
-        assertEquals(PipelineLifecycle.STOPPING, stopping.lifecycle());
+        assertEquals(SupervisedLifecycle.STOPPING, stopping.lifecycle());
         assertEquals(ShutdownMode.IMMEDIATE, stopping.shutdownMode());
         assertInstanceOf(WorkerSupervisor.WorkerTerminationTimeoutException.class, stopping.failure());
         assertFalse(supervisor.termination().toCompletableFuture().isDone());
         assertEquals(1, actionCount(backend, "stop:GRACEFUL"));
         assertEquals(1, actionCount(backend, "stop:IMMEDIATE"));
         releaseWorker.countDown();
-        assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminate(supervisor).lifecycle());
     }
 
     @Test
@@ -545,9 +545,9 @@ class WorkerSupervisorTest {
 
     @Test
     void normalExitInStartingRunningAndQuiescingTriggersFailStop() throws Exception {
-        assertUnexpectedExit(PipelineLifecycle.STARTING);
-        assertUnexpectedExit(PipelineLifecycle.RUNNING);
-        assertUnexpectedExit(PipelineLifecycle.QUIESCING);
+        assertUnexpectedExit(SupervisedLifecycle.STARTING);
+        assertUnexpectedExit(SupervisedLifecycle.RUNNING);
+        assertUnexpectedExit(SupervisedLifecycle.QUIESCING);
     }
 
     @Test
@@ -603,7 +603,7 @@ class WorkerSupervisorTest {
         allowRequest.countDown();
 
         assertTrue(returnedFromRequest.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
-        assertEquals(PipelineLifecycle.TERMINATED, terminate(supervisor).lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminate(supervisor).lifecycle());
     }
 
     @Test
@@ -725,11 +725,11 @@ class WorkerSupervisorTest {
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
                 .registrationSealed(true).expectedWorkers(2).build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.RUNNING).aliveWorkers(0).build());
+                .lifecycle(SupervisedLifecycle.RUNNING).aliveWorkers(0).build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED).aliveWorkers(1).build());
+                .lifecycle(SupervisedLifecycle.TERMINATED).aliveWorkers(1).build());
         assertThrows(IllegalArgumentException.class, () -> validWorkerSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .registrationSealed(false)
                 .expectedWorkers(0)
                 .aliveWorkers(0)
@@ -739,7 +739,7 @@ class WorkerSupervisorTest {
                 .drainCommitted(true).build());
 
         WorkerSnapshot nonGraceful = validWorkerSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .aliveWorkers(0)
                 .shutdownMode(ShutdownMode.IMMEDIATE)
                 .reachedRunning(true)
@@ -771,7 +771,23 @@ class WorkerSupervisorTest {
                 .name("workers").shutdownTimeout(TEST_TIMEOUT).build());
     }
 
-    private static void assertUnexpectedExit(PipelineLifecycle phase) throws Exception {
+    @Test
+    void exposesGenericLifecycleAndTrulyUnboundedDeadline() {
+        ShutdownDeadline unbounded = ShutdownDeadline.unbounded();
+        ShutdownDeadline bounded = ShutdownDeadline.after(TEST_TIMEOUT);
+
+        assertSame(unbounded, ShutdownDeadline.unbounded());
+        assertFalse(unbounded.isBounded());
+        assertFalse(unbounded.isExpired());
+        assertEquals(Long.MAX_VALUE, unbounded.remainingNanos());
+        assertEquals(Long.MAX_VALUE, unbounded.deadlineNanos());
+        assertTrue(bounded.isBounded());
+
+        WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
+        assertEquals(SupervisedLifecycle.NEW, supervisor.snapshot().lifecycle());
+    }
+
+    private static void assertUnexpectedExit(SupervisedLifecycle phase) throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         RecordingBackend backend = new RecordingBackend();
@@ -786,12 +802,12 @@ class WorkerSupervisorTest {
         assertTrue(entered.await(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
         supervisor.sealWorkers();
         supervisor.workersStarted().toCompletableFuture().get(TEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        if (phase != PipelineLifecycle.STARTING) {
+        if (phase != SupervisedLifecycle.STARTING) {
             supervisor.markRunning();
         }
-        if (phase == PipelineLifecycle.QUIESCING) {
+        if (phase == SupervisedLifecycle.QUIESCING) {
             supervisor.requestShutdown(ShutdownMode.GRACEFUL);
-            awaitCondition(() -> supervisor.snapshot().lifecycle() == PipelineLifecycle.QUIESCING);
+            awaitCondition(() -> supervisor.snapshot().lifecycle() == SupervisedLifecycle.QUIESCING);
         }
 
         release.countDown();
@@ -842,7 +858,7 @@ class WorkerSupervisorTest {
     private static WorkerSnapshot.WorkerSnapshotBuilder validWorkerSnapshotBuilder() {
         return WorkerSnapshot.builder()
                 .name("workers")
-                .lifecycle(PipelineLifecycle.RUNNING)
+                .lifecycle(SupervisedLifecycle.RUNNING)
                 .registrationSealed(true)
                 .expectedWorkers(1)
                 .registeredWorkers(1)
@@ -853,7 +869,7 @@ class WorkerSupervisorTest {
 
     private static WorkerSnapshot validTerminatedSnapshot() {
         return validWorkerSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .aliveWorkers(0)
                 .shutdownMode(ShutdownMode.GRACEFUL)
                 .drainCommitted(true)
@@ -949,7 +965,7 @@ class WorkerSupervisorTest {
         private final AtomicInteger concurrentCalls = new AtomicInteger();
         private final AtomicInteger maxConcurrentCalls = new AtomicInteger();
         private final AtomicBoolean calledWithStateLockHeld = new AtomicBoolean();
-        private final AtomicReference<PipelineLifecycle> lifecycleAtGracefulStop = new AtomicReference<>();
+        private final AtomicReference<SupervisedLifecycle> lifecycleAtGracefulStop = new AtomicReference<>();
         private final CountDownLatch probed = new CountDownLatch(1);
         private final CountDownLatch immediateStopped = new CountDownLatch(1);
         private volatile WorkerSupervisor supervisor;

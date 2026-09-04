@@ -8,7 +8,7 @@ package com.sstlfsj.disruptor.core;
  * {@link Thread#join()} worker，不得调用业务 handler、module 或其它用户代码。</p>
  *
  * <p>{@link #beginQuiesce()} 至多调用一次；{@link #isDrained()} 只在
- * {@link PipelineLifecycle#QUIESCING} 期间调用，可以被重复探测；
+ * {@link SupervisedLifecycle#QUIESCING} 期间调用，可以被重复探测；
  * {@link #stop(ShutdownMode)} 对 {@link ShutdownMode#GRACEFUL} 和
  * {@link ShutdownMode#IMMEDIATE} 各至多调用一次。graceful stop 后若 worker 未在 deadline 前退出，
  * supervisor 可以继续串行调用一次 immediate stop。任一阶段抛出的首个异常会成为 supervisor 首因，

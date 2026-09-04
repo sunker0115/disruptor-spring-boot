@@ -44,7 +44,7 @@ class DisruptorPipelineTest {
         assertTrue(threadCreated.await(2, TimeUnit.SECONDS));
         assertFalse(start.isDone());
         PipelineSnapshot starting = pipeline.snapshot();
-        assertEquals(PipelineLifecycle.STARTING, starting.lifecycle());
+        assertEquals(SupervisedLifecycle.STARTING, starting.lifecycle());
         assertTrue(starting.registrationSealed());
         assertEquals(1, starting.expectedConsumers());
         assertEquals(1, starting.createdConsumers());
@@ -54,7 +54,7 @@ class DisruptorPipelineTest {
         start.get(2, TimeUnit.SECONDS);
 
         PipelineSnapshot running = pipeline.snapshot();
-        assertEquals(PipelineLifecycle.RUNNING, running.lifecycle());
+        assertEquals(SupervisedLifecycle.RUNNING, running.lifecycle());
         assertEquals(PipelineHealth.HEALTHY, running.health());
         assertEquals(1, running.startedConsumers());
         assertEquals(1, running.aliveConsumers());
@@ -320,7 +320,7 @@ class DisruptorPipelineTest {
     @Test
     void invokesHaltOnlyAfterThePipelineEnteredStopping() throws Exception {
         AtomicReference<DisruptorPipeline<TestEvent>> pipelineRef = new AtomicReference<>();
-        AtomicReference<PipelineLifecycle> lifecycleAtHalt = new AtomicReference<>();
+        AtomicReference<SupervisedLifecycle> lifecycleAtHalt = new AtomicReference<>();
         ObservingProcessor processor = new ObservingProcessor() {
             @Override
             public void halt() {
@@ -340,7 +340,7 @@ class DisruptorPipelineTest {
                 ShutdownDeadline.after(Duration.ofSeconds(2)));
         pipeline.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
 
-        assertEquals(PipelineLifecycle.STOPPING, lifecycleAtHalt.get());
+        assertEquals(SupervisedLifecycle.STOPPING, lifecycleAtHalt.get());
         assertEquals(1, processor.haltCalls.get());
     }
 
@@ -358,7 +358,7 @@ class DisruptorPipelineTest {
         PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
                 .get(2, TimeUnit.SECONDS);
 
-        assertEquals(PipelineLifecycle.TERMINATED, terminated.lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminated.lifecycle());
         assertEquals(ShutdownMode.IMMEDIATE, terminated.shutdownMode());
         assertNull(terminated.failure(), "受控中断不能被误报成 consumer 故障");
         assertFalse(terminated.gracefulTermination());
@@ -401,7 +401,7 @@ class DisruptorPipelineTest {
         CompletionStage<Void> firstStart = pipeline.start();
         CompletionStage<Void> repeatedStart = pipeline.start();
 
-        assertEquals(PipelineLifecycle.TERMINATED, terminated.lifecycle());
+        assertEquals(SupervisedLifecycle.TERMINATED, terminated.lifecycle());
         assertSame(firstStart, repeatedStart);
         assertTrue(firstStart.toCompletableFuture().isCompletedExceptionally());
         assertThrows(CompletionException.class, () -> firstStart.toCompletableFuture().join());
@@ -429,7 +429,7 @@ class DisruptorPipelineTest {
 
         pipeline.requestShutdown(ShutdownMode.GRACEFUL,
                 ShutdownDeadline.after(Duration.ofSeconds(2)));
-        assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
+        assertEquals(SupervisedLifecycle.STOPPING, pipeline.snapshot().lifecycle());
         assertEquals(PublicationResult.NOT_RUNNING,
                 pipeline.handle().tryPublishEvent((event, sequence) -> { }));
         allowEntry.countDown();
@@ -560,7 +560,7 @@ class DisruptorPipelineTest {
                 }
                 assertEquals(Thread.State.BLOCKED, workerThread.get().getState());
                 stoppingObservedWhileGateCloseWasBlocked =
-                        pipeline.snapshot().lifecycle() == PipelineLifecycle.STOPPING;
+                        pipeline.snapshot().lifecycle() == SupervisedLifecycle.STOPPING;
                 if (stoppingObservedWhileGateCloseWasBlocked) {
                     assertEquals(PublicationResult.PIPELINE_FAILED,
                             pipeline.handle().tryPublishEvent((event, sequence) -> { }),
@@ -569,7 +569,7 @@ class DisruptorPipelineTest {
             }
             if (!stoppingObservedWhileGateCloseWasBlocked) {
                 assertTrue(haltEntered.await(2, TimeUnit.SECONDS));
-                assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
+                assertEquals(SupervisedLifecycle.STOPPING, pipeline.snapshot().lifecycle());
                 assertEquals(PublicationResult.PIPELINE_FAILED,
                         pipeline.handle().tryPublishEvent((event, sequence) -> { }),
                         "一旦可观察到 STOPPING，实际发布准入必须已经关闭");

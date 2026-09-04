@@ -1,9 +1,9 @@
 package com.sstlfsj.disruptor.core;
 
 /**
- * 管道生命周期阶段。
+ * 受监督 worker 集的生命周期阶段。
  */
-public enum PipelineLifecycle {
+public enum SupervisedLifecycle {
     NEW,
     STARTING,
     RUNNING,

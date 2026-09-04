@@ -35,7 +35,7 @@ public final class WorkerSupervisor {
     private final CompletableFuture<WorkerSnapshot> termination = new CompletableFuture<>();
     private final CompletionStage<WorkerSnapshot> terminationView = termination.minimalCompletionStage();
 
-    private PipelineLifecycle lifecycle = PipelineLifecycle.NEW;
+    private SupervisedLifecycle lifecycle = SupervisedLifecycle.NEW;
     private boolean startupInitiated;
     private boolean registrationSealed;
     private StartupOutcome startupOutcome = StartupOutcome.PENDING;
@@ -83,18 +83,18 @@ public final class WorkerSupervisor {
     }
 
     /**
-     * 登记尚未启动的 worker。允许预构造 worker 在 {@link PipelineLifecycle#NEW} 登记；
-     * 启动协议已进入 {@link PipelineLifecycle#STARTING} 后也可动态登记。若并发关闭先把生命周期
-     * 推进到 {@link PipelineLifecycle#STOPPING}，尚未结束的启动协议仍可继续登记，直至封口。
+     * 登记尚未启动的 worker。允许预构造 worker 在 {@link SupervisedLifecycle#NEW} 登记；
+     * 启动协议已进入 {@link SupervisedLifecycle#STARTING} 后也可动态登记。若并发关闭先把生命周期
+     * 推进到 {@link SupervisedLifecycle#STOPPING}，尚未结束的启动协议仍可继续登记，直至封口。
      */
     public void register(Thread thread) {
         Objects.requireNonNull(thread, "thread 不能为空");
         synchronized (stateLock) {
-            boolean startupFinishingWhileStopping = lifecycle == PipelineLifecycle.STOPPING
+            boolean startupFinishingWhileStopping = lifecycle == SupervisedLifecycle.STOPPING
                     && startupInitiated
                     && !registrationSealed;
-            if (lifecycle != PipelineLifecycle.NEW
-                    && lifecycle != PipelineLifecycle.STARTING
+            if (lifecycle != SupervisedLifecycle.NEW
+                    && lifecycle != SupervisedLifecycle.STARTING
                     && !startupFinishingWhileStopping) {
                 throw new IllegalStateException("不能在 " + lifecycle + " 状态登记 worker");
             }
@@ -112,11 +112,11 @@ public final class WorkerSupervisor {
 
     public void markStarting() {
         synchronized (stateLock) {
-            if (lifecycle != PipelineLifecycle.NEW) {
+            if (lifecycle != SupervisedLifecycle.NEW) {
                 throw new IllegalStateException("只有 NEW 状态可以进入 STARTING，当前状态=" + lifecycle);
             }
             startupInitiated = true;
-            lifecycle = PipelineLifecycle.STARTING;
+            lifecycle = SupervisedLifecycle.STARTING;
             stateLock.notifyAll();
         }
     }
@@ -126,14 +126,14 @@ public final class WorkerSupervisor {
      *
      * <p>调用方只能在 {@link #markStarting()} 之后调用，并且必须保证全部线程创建以及所有
      * {@link Thread#start()} 调用都已返回，之后不会再尝试启动或登记 worker。并发关闭可能已把
-     * 生命周期推进到 {@link PipelineLifecycle#STOPPING}，启动方仍必须在自己的 finally 路径封口。</p>
+     * 生命周期推进到 {@link SupervisedLifecycle#STOPPING}，启动方仍必须在自己的 finally 路径封口。</p>
      */
     public void sealWorkers() {
         StartupNotification startupNotification;
         synchronized (stateLock) {
             if (!startupInitiated
-                    || (lifecycle != PipelineLifecycle.STARTING
-                    && lifecycle != PipelineLifecycle.STOPPING)) {
+                    || (lifecycle != SupervisedLifecycle.STARTING
+                    && lifecycle != SupervisedLifecycle.STOPPING)) {
                 throw new IllegalStateException("不能在 " + lifecycle + " 状态封口 worker 登记");
             }
             if (registrationSealed) {
@@ -156,7 +156,7 @@ public final class WorkerSupervisor {
 
     public void markRunning() {
         synchronized (stateLock) {
-            if (lifecycle != PipelineLifecycle.STARTING) {
+            if (lifecycle != SupervisedLifecycle.STARTING) {
                 throw new IllegalStateException("只有 STARTING 状态可以进入 RUNNING，当前状态=" + lifecycle);
             }
             if (!registrationSealed || expectedWorkers == 0) {
@@ -169,7 +169,7 @@ public final class WorkerSupervisor {
                 throw new IllegalStateException("已失败或已请求关闭的 supervisor 不能进入 RUNNING");
             }
             reachedRunning = true;
-            lifecycle = PipelineLifecycle.RUNNING;
+            lifecycle = SupervisedLifecycle.RUNNING;
             stateLock.notifyAll();
         }
     }
@@ -178,7 +178,7 @@ public final class WorkerSupervisor {
         Objects.requireNonNull(cause, "failure 不能为空");
         ShutdownSignals signals;
         synchronized (stateLock) {
-            if (lifecycle == PipelineLifecycle.TERMINATED) {
+            if (lifecycle == SupervisedLifecycle.TERMINATED) {
                 return;
             }
             signals = requestImmediateLocked(cause, defaultDeadlineLocked());
@@ -195,13 +195,13 @@ public final class WorkerSupervisor {
         Objects.requireNonNull(deadline, "deadline 不能为空");
         ShutdownSignals signals;
         synchronized (stateLock) {
-            if (lifecycle == PipelineLifecycle.TERMINATED) {
+            if (lifecycle == SupervisedLifecycle.TERMINATED) {
                 return;
             }
             freezeDeadlineLocked(deadline);
-            boolean abortStartup = lifecycle == PipelineLifecycle.NEW
-                    || lifecycle == PipelineLifecycle.STARTING;
-            if (lifecycle == PipelineLifecycle.NEW) {
+            boolean abortStartup = lifecycle == SupervisedLifecycle.NEW
+                    || lifecycle == SupervisedLifecycle.STARTING;
+            if (lifecycle == SupervisedLifecycle.NEW) {
                 sealRegistrationLocked();
             }
             boolean firstRequest = shutdownMode == null;
@@ -211,11 +211,11 @@ public final class WorkerSupervisor {
                 shutdownMode = ShutdownMode.IMMEDIATE;
             }
             if (shutdownMode == ShutdownMode.IMMEDIATE) {
-                lifecycle = PipelineLifecycle.STOPPING;
+                lifecycle = SupervisedLifecycle.STOPPING;
             } else if (firstRequest) {
-                lifecycle = lifecycle == PipelineLifecycle.RUNNING
-                        ? PipelineLifecycle.QUIESCING
-                        : PipelineLifecycle.STOPPING;
+                lifecycle = lifecycle == SupervisedLifecycle.RUNNING
+                        ? SupervisedLifecycle.QUIESCING
+                        : SupervisedLifecycle.STOPPING;
             }
             Thread toStart = ensureControlThreadLocked();
             stateLock.notifyAll();
@@ -275,15 +275,15 @@ public final class WorkerSupervisor {
                 return new WorkerAdmission(admissionFailure,
                         requestImmediateLocked(admissionFailure, defaultDeadlineLocked()));
             }
-            if (lifecycle != PipelineLifecycle.STARTING && lifecycle != PipelineLifecycle.RUNNING) {
+            if (lifecycle != SupervisedLifecycle.STARTING && lifecycle != SupervisedLifecycle.RUNNING) {
                 IllegalStateException admissionFailure = new IllegalStateException(
                         "worker 不能在 " + lifecycle + " 状态入场：" + current.getName());
-                if (lifecycle == PipelineLifecycle.TERMINATED) {
+                if (lifecycle == SupervisedLifecycle.TERMINATED) {
                     return new WorkerAdmission(admissionFailure, ShutdownSignals.NONE);
                 }
                 workers.put(current, WorkerState.EXITED);
                 startedWorkers++;
-                ShutdownSignals signals = lifecycle == PipelineLifecycle.NEW
+                ShutdownSignals signals = lifecycle == SupervisedLifecycle.NEW
                         ? requestImmediateLocked(admissionFailure, defaultDeadlineLocked())
                         : ShutdownSignals.NONE;
                 stateLock.notifyAll();
@@ -308,10 +308,10 @@ public final class WorkerSupervisor {
             workers.put(worker, WorkerState.EXITED);
             aliveWorkers--;
             ShutdownSignals signals = ShutdownSignals.NONE;
-            if (lifecycle == PipelineLifecycle.STARTING
-                    || lifecycle == PipelineLifecycle.RUNNING
-                    || lifecycle == PipelineLifecycle.QUIESCING
-                    || (lifecycle == PipelineLifecycle.STOPPING && workerFailure != null)) {
+            if (lifecycle == SupervisedLifecycle.STARTING
+                    || lifecycle == SupervisedLifecycle.RUNNING
+                    || lifecycle == SupervisedLifecycle.QUIESCING
+                    || (lifecycle == SupervisedLifecycle.STOPPING && workerFailure != null)) {
                 Throwable exitFailure = workerFailure != null
                         ? workerFailure
                         : new UnexpectedWorkerExitException(name, worker.getName(), lifecycle);
@@ -323,20 +323,20 @@ public final class WorkerSupervisor {
     }
 
     private ShutdownSignals requestImmediateLocked(Throwable cause, ShutdownDeadline deadline) {
-        if (lifecycle == PipelineLifecycle.TERMINATED) {
+        if (lifecycle == SupervisedLifecycle.TERMINATED) {
             return ShutdownSignals.NONE;
         }
         if (failure == null) {
             failure = cause;
         }
         freezeDeadlineLocked(deadline);
-        boolean abortStartup = lifecycle == PipelineLifecycle.NEW
-                || lifecycle == PipelineLifecycle.STARTING;
-        if (lifecycle == PipelineLifecycle.NEW) {
+        boolean abortStartup = lifecycle == SupervisedLifecycle.NEW
+                || lifecycle == SupervisedLifecycle.STARTING;
+        if (lifecycle == SupervisedLifecycle.NEW) {
             sealRegistrationLocked();
         }
         shutdownMode = ShutdownMode.IMMEDIATE;
-        lifecycle = PipelineLifecycle.STOPPING;
+        lifecycle = SupervisedLifecycle.STOPPING;
         Thread toStart = ensureControlThreadLocked();
         stateLock.notifyAll();
         return new ShutdownSignals(toStart,
@@ -356,7 +356,7 @@ public final class WorkerSupervisor {
                     signals = requestImmediateLocked(timeout, shutdownDeadline);
                 }
                 if (canTerminateLocked()) {
-                    lifecycle = PipelineLifecycle.TERMINATED;
+                    lifecycle = SupervisedLifecycle.TERMINATED;
                     terminated = snapshotLocked();
                     step = ControlStep.TERMINATE;
                 } else {
@@ -374,14 +374,14 @@ public final class WorkerSupervisor {
 
     private ControlStep nextControlStepLocked() {
         if (shutdownMode == ShutdownMode.IMMEDIATE) {
-            lifecycle = PipelineLifecycle.STOPPING;
+            lifecycle = SupervisedLifecycle.STOPPING;
             if (!immediateStopAttempted) {
                 immediateStopAttempted = true;
                 return ControlStep.STOP_IMMEDIATE;
             }
             return ControlStep.WAIT;
         }
-        if (lifecycle == PipelineLifecycle.QUIESCING) {
+        if (lifecycle == SupervisedLifecycle.QUIESCING) {
             if (!beginQuiesceAttempted) {
                 beginQuiesceAttempted = true;
                 return ControlStep.BEGIN_QUIESCE;
@@ -417,10 +417,10 @@ public final class WorkerSupervisor {
         if (drained) {
             synchronized (stateLock) {
                 if (shutdownMode == ShutdownMode.GRACEFUL
-                        && lifecycle == PipelineLifecycle.QUIESCING
+                        && lifecycle == SupervisedLifecycle.QUIESCING
                         && !shutdownDeadline.isExpired()) {
                     drainCommitted = true;
-                    lifecycle = PipelineLifecycle.STOPPING;
+                    lifecycle = SupervisedLifecycle.STOPPING;
                     stateLock.notifyAll();
                 }
             }
@@ -521,7 +521,7 @@ public final class WorkerSupervisor {
     }
 
     private boolean canTerminateLocked() {
-        if (lifecycle != PipelineLifecycle.STOPPING || !registrationSealed) {
+        if (lifecycle != SupervisedLifecycle.STOPPING || !registrationSealed) {
             return false;
         }
         boolean stopFinished = shutdownMode == ShutdownMode.GRACEFUL
@@ -694,7 +694,7 @@ public final class WorkerSupervisor {
 
     public static final class UnexpectedWorkerExitException extends IllegalStateException {
         private UnexpectedWorkerExitException(String supervisorName, String workerName,
-                                              PipelineLifecycle lifecycle) {
+                                              SupervisedLifecycle lifecycle) {
             super("worker 在 " + lifecycle + " 状态下意外退出：supervisor=" + supervisorName
                     + "，worker=" + workerName);
         }

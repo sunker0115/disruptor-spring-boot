@@ -166,7 +166,7 @@ class DisruptorRuntimeTest {
         runtime.shutdown();
 
         runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.pipelines().stream()
+        assertEquals(Set.of(SupervisedLifecycle.TERMINATED), runtime.pipelines().stream()
                 .map(DisruptorPipeline::snapshot)
                 .map(PipelineSnapshot::lifecycle)
                 .collect(java.util.stream.Collectors.toSet()));
@@ -1052,7 +1052,7 @@ class DisruptorRuntimeTest {
                 failingHandle.publishEvent(TRANSLATOR, "fail", 1L, PUBLISH_TIMEOUT));
 
         assertTrue(failedHandlerEntered.await(2, TimeUnit.SECONDS));
-        awaitCondition(() -> failingHandle.snapshot().lifecycle() == PipelineLifecycle.TERMINATED,
+        awaitCondition(() -> failingHandle.snapshot().lifecycle() == SupervisedLifecycle.TERMINATED,
                 Duration.ofSeconds(2));
         assertEquals(PipelineHealth.TERMINATED, failingHandle.snapshot().health());
         assertNotNull(failingHandle.snapshot().failure());
@@ -1113,7 +1113,7 @@ class DisruptorRuntimeTest {
 
             releaseHandlers.countDown();
             runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            assertEquals(Set.of(PipelineLifecycle.TERMINATED), runtime.handles().stream()
+            assertEquals(Set.of(SupervisedLifecycle.TERMINATED), runtime.handles().stream()
                     .map(PipelineHandle::snapshot).map(PipelineSnapshot::lifecycle).collect(
                             java.util.stream.Collectors.toSet()));
         } finally {
@@ -1234,7 +1234,7 @@ class DisruptorRuntimeTest {
 
         private StubPipeline(String name) {
             this.name = name;
-            this.snapshot = snapshot(name, PipelineLifecycle.NEW, null, null);
+            this.snapshot = snapshot(name, SupervisedLifecycle.NEW, null, null);
             startOutcome.complete(null);
         }
 
@@ -1270,12 +1270,12 @@ class DisruptorRuntimeTest {
                 Throwable terminationFailure,
                 Throwable snapshotFailure,
                 ShutdownMode mode) {
-            snapshot = snapshot(name, PipelineLifecycle.TERMINATED, snapshotFailure, mode);
+            snapshot = snapshot(name, SupervisedLifecycle.TERMINATED, snapshotFailure, mode);
             terminationOutcome.completeExceptionally(terminationFailure);
         }
 
         private void completeTermination(ShutdownMode mode, Throwable failure) {
-            snapshot = snapshot(name, PipelineLifecycle.TERMINATED, failure, mode);
+            snapshot = snapshot(name, SupervisedLifecycle.TERMINATED, failure, mode);
             terminationOutcome.complete(snapshot);
         }
 
@@ -1403,10 +1403,10 @@ class DisruptorRuntimeTest {
 
         private static PipelineSnapshot snapshot(
                 String name,
-                PipelineLifecycle lifecycle,
+                SupervisedLifecycle lifecycle,
                 Throwable failure,
                 ShutdownMode mode) {
-            boolean terminated = lifecycle == PipelineLifecycle.TERMINATED;
+            boolean terminated = lifecycle == SupervisedLifecycle.TERMINATED;
             return PipelineSnapshot.builder()
                     .name(name)
                     .lifecycle(lifecycle)

@@ -15,7 +15,7 @@ class PipelineSnapshotTest {
     @Test
     void exposesTheDefinedLifecycleAndResultValues() {
         assertEquals(Arrays.asList("NEW", "STARTING", "RUNNING", "QUIESCING", "STOPPING", "TERMINATED"),
-                Arrays.stream(PipelineLifecycle.values()).map(Enum::name).toList());
+                Arrays.stream(SupervisedLifecycle.values()).map(Enum::name).toList());
         assertEquals(Arrays.asList("STARTING", "HEALTHY", "UNHEALTHY", "OUT_OF_SERVICE", "TERMINATED"),
                 Arrays.stream(PipelineHealth.values()).map(Enum::name).toList());
         assertEquals(Arrays.asList("PUBLISHED", "CAPACITY_EXHAUSTED", "TIMED_OUT", "NOT_RUNNING", "PIPELINE_FAILED"),
@@ -44,7 +44,7 @@ class PipelineSnapshotTest {
                 .health());
 
         PipelineSnapshot stopping = runningSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.STOPPING)
+                .lifecycle(SupervisedLifecycle.STOPPING)
                 .acceptingPublications(false)
                 .shutdownMode(ShutdownMode.IMMEDIATE)
                 .aliveConsumers(1)
@@ -52,7 +52,7 @@ class PipelineSnapshotTest {
         assertEquals(PipelineHealth.OUT_OF_SERVICE, stopping.health());
 
         PipelineSnapshot terminated = stopping.toBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .aliveConsumers(0)
                 .build();
         assertEquals(PipelineHealth.TERMINATED, terminated.health());
@@ -62,7 +62,7 @@ class PipelineSnapshotTest {
     void preservesFailureIdentityAndDerivesGracefulTerminationFromHistory() {
         IllegalStateException failure = new IllegalStateException("boom");
         PipelineSnapshot failed = runningSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.STOPPING)
+                .lifecycle(SupervisedLifecycle.STOPPING)
                 .acceptingPublications(false)
                 .shutdownMode(ShutdownMode.IMMEDIATE)
                 .failure(failure)
@@ -71,7 +71,7 @@ class PipelineSnapshotTest {
         assertFalse(failed.gracefulTermination());
 
         PipelineSnapshot graceful = runningSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .acceptingPublications(false)
                 .aliveConsumers(0)
                 .shutdownMode(ShutdownMode.GRACEFUL)
@@ -90,9 +90,9 @@ class PipelineSnapshotTest {
         assertThrows(IllegalArgumentException.class, () -> newSnapshotBuilder()
                 .registrationSealed(true).expectedConsumers(2).createdConsumers(1).build());
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED).aliveConsumers(1).build());
+                .lifecycle(SupervisedLifecycle.TERMINATED).aliveConsumers(1).build());
         assertThrows(IllegalArgumentException.class, () -> runningSnapshotBuilder()
-                .lifecycle(PipelineLifecycle.TERMINATED)
+                .lifecycle(SupervisedLifecycle.TERMINATED)
                 .acceptingPublications(false)
                 .registrationSealed(false)
                 .expectedConsumers(0)
@@ -108,7 +108,7 @@ class PipelineSnapshotTest {
     private static PipelineSnapshot.PipelineSnapshotBuilder runningSnapshotBuilder() {
         return PipelineSnapshot.builder()
                 .name("orders")
-                .lifecycle(PipelineLifecycle.RUNNING)
+                .lifecycle(SupervisedLifecycle.RUNNING)
                 .acceptingPublications(true)
                 .registrationSealed(true)
                 .expectedConsumers(2)
@@ -123,7 +123,7 @@ class PipelineSnapshotTest {
     private static PipelineSnapshot.PipelineSnapshotBuilder newSnapshotBuilder() {
         return PipelineSnapshot.builder()
                 .name("orders")
-                .lifecycle(PipelineLifecycle.NEW)
+                .lifecycle(SupervisedLifecycle.NEW)
                 .acceptingPublications(false)
                 .expectedConsumers(0)
                 .createdConsumers(0)
