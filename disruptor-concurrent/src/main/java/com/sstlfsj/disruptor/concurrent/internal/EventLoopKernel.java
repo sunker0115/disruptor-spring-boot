@@ -76,6 +76,7 @@ public final class EventLoopKernel {
     private final AtomicLong cancelled = new AtomicLong();
     private final AtomicLong returned = new AtomicLong();
     private volatile AcceptedTask<?> currentTask;
+    private volatile GroupLifecycleCoordinator groupOwner;
 
     private EventLoopKernel(
             EventLoop owner,
@@ -182,6 +183,17 @@ public final class EventLoopKernel {
         return name;
     }
 
+    public synchronized void bindOwner(GroupLifecycleCoordinator groupOwner) {
+        Objects.requireNonNull(groupOwner, "groupOwner 不能为空");
+        if (this.groupOwner != null) {
+            throw new IllegalStateException("EventLoopKernel 只能绑定一个 Group owner");
+        }
+        if (supervisor.snapshot().lifecycle() != SupervisedLifecycle.NEW) {
+            throw new IllegalStateException("只能在 NEW 状态绑定 Group owner");
+        }
+        this.groupOwner = groupOwner;
+    }
+
     public CompletionStage<Void> start() {
         if (!startRequested.compareAndSet(false, true)) {
             return startupView;
@@ -194,6 +206,7 @@ public final class EventLoopKernel {
             worker.start();
         } catch (Throwable startFailure) {
             failure = startFailure;
+            reportOwnerFailure(startFailure);
             supervisor.fail(startFailure);
             publishStartupFailure(startFailure);
         } finally {
@@ -202,6 +215,7 @@ public final class EventLoopKernel {
                     supervisor.sealWorkers();
                 } catch (Throwable sealFailure) {
                     if (failure == null) {
+                        reportOwnerFailure(sealFailure);
                         supervisor.fail(sealFailure);
                         publishStartupFailure(sealFailure);
                     } else if (failure != sealFailure) {
@@ -219,7 +233,7 @@ public final class EventLoopKernel {
 
     public EventLoopSnapshot snapshot() {
         while (true) {
-            boolean accepting = gate.accepting();
+            boolean accepting = acceptingTasks();
             WorkerSnapshot workerSnapshot = supervisor.snapshot();
             if (!accepting || workerSnapshot.lifecycle() == SupervisedLifecycle.RUNNING) {
                 return snapshot(workerSnapshot, accepting);
@@ -353,12 +367,17 @@ public final class EventLoopKernel {
     }
 
     public List<Runnable> shutdownNow() {
+        return shutdownNow(ShutdownDeadline.unbounded());
+    }
+
+    public List<Runnable> shutdownNow(ShutdownDeadline deadline) {
+        Objects.requireNonNull(deadline, "deadline 不能为空");
         gate.closeForAdmissions();
         publishStartupFailure(new StartupAbortedException(name));
         awaitAdmissionsUninterruptibly();
         List<Runnable> notStarted = registry.sweepShutdownNow();
         returned.addAndGet(notStarted.size());
-        supervisor.requestShutdown(ShutdownMode.IMMEDIATE, ShutdownDeadline.unbounded());
+        supervisor.requestShutdown(ShutdownMode.IMMEDIATE, deadline);
         LockSupport.unpark(worker);
         return notStarted;
     }
@@ -438,6 +457,7 @@ public final class EventLoopKernel {
             primaryFailure = unwrap(failure);
             gate.closeForAdmissions();
             publishStartupFailure(primaryFailure);
+            reportOwnerFailure(primaryFailure);
             supervisor.fail(primaryFailure);
         } finally {
             gate.closeForAdmissions();
@@ -446,6 +466,7 @@ public final class EventLoopKernel {
                     ? modules.stop(owner, primaryFailure)
                     : primaryFailure;
             if (stopFailure != null && stopFailure != primaryFailure) {
+                reportOwnerFailure(stopFailure);
                 supervisor.fail(stopFailure);
                 primaryFailure = stopFailure;
             }
@@ -685,33 +706,63 @@ public final class EventLoopKernel {
     }
 
     private <T> EventLoopFutureTask<T> admit(TaskFactory<T> factory) {
-        AdmissionToken token = gate.tryAcquire();
-        if (token == null) {
+        GroupLifecycleCoordinator.AdmissionLease ownerLease = acquireOwnerAdmission();
+        if (groupOwner != null && ownerLease == null) {
             return null;
         }
-        TaskReservation reservation = queue.tryReserve();
-        if (reservation == null) {
-            token.abort();
-            return null;
-        }
-        AcceptedTask<T> task = null;
-        boolean registered = false;
         try {
-            long acceptedAt = clock.nanoTime();
-            task = factory.create(reservation.sequence(), acceptedAt);
-            registry.register(task, token);
-            registered = true;
-            reservation.publish(task);
-            token.commit();
-            LockSupport.unpark(worker);
-            return task.future();
-        } catch (Throwable failure) {
-            reservation.abort();
-            if (registered) {
-                registry.rollback(task);
+            AdmissionToken token = gate.tryAcquire();
+            if (token == null) {
+                return null;
             }
-            token.abort();
-            throw failure;
+            TaskReservation reservation = queue.tryReserve();
+            if (reservation == null) {
+                token.abort();
+                return null;
+            }
+            AcceptedTask<T> task = null;
+            boolean registered = false;
+            try {
+                long acceptedAt = clock.nanoTime();
+                task = factory.create(reservation.sequence(), acceptedAt);
+                registry.register(task, token);
+                registered = true;
+                reservation.publish(task);
+                token.commit();
+                LockSupport.unpark(worker);
+                return task.future();
+            } catch (Throwable failure) {
+                reservation.abort();
+                if (registered) {
+                    registry.rollback(task);
+                }
+                token.abort();
+                throw failure;
+            }
+        } finally {
+            if (ownerLease != null) {
+                ownerLease.close();
+            }
+        }
+    }
+
+    private GroupLifecycleCoordinator.AdmissionLease acquireOwnerAdmission() {
+        GroupLifecycleCoordinator current = groupOwner;
+        return current == null ? null : current.tryAcquireAdmission();
+    }
+
+    private boolean acceptingTasks() {
+        if (!gate.accepting()) {
+            return false;
+        }
+        GroupLifecycleCoordinator current = groupOwner;
+        return current == null || current.snapshot().accepting();
+    }
+
+    private void reportOwnerFailure(Throwable failure) {
+        GroupLifecycleCoordinator current = groupOwner;
+        if (current != null) {
+            current.childFailed(owner, failure);
         }
     }
 

@@ -7,4 +7,6 @@ public interface EventLoopGroup
     EventLoop next();
 
     EventLoop select(int affinityKey);
+
+    <V> EventLoopScheduledFuture<V> schedule(ScheduledTaskSpec<V> spec);
 }

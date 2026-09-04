@@ -1,6 +1,7 @@
 package com.sstlfsj.disruptor.concurrent;
 
 import com.sstlfsj.disruptor.concurrent.internal.EventLoopKernel;
+import com.sstlfsj.disruptor.concurrent.internal.GroupLifecycleCoordinator;
 import com.sstlfsj.disruptor.core.ShutdownDeadline;
 import com.sstlfsj.disruptor.core.ShutdownMode;
 
@@ -20,12 +21,33 @@ import java.util.concurrent.TimeoutException;
 abstract class AbstractEventLoop extends AbstractExecutorService implements EventLoop {
 
     private EventLoopKernel kernel;
+    private EventLoopGroup parent;
+    private Object lifecycleOwnerToken;
 
     final void initializeKernel(EventLoopKernel kernel) {
         if (this.kernel != null) {
             throw new IllegalStateException("EventLoopKernel 只能初始化一次");
         }
         this.kernel = Objects.requireNonNull(kernel, "kernel 不能为空");
+    }
+
+    final void bindOwner(
+            EventLoopGroup parent,
+            int childIndex,
+            GroupLifecycleCoordinator coordinator,
+            Object lifecycleOwnerToken) {
+        Objects.requireNonNull(parent, "parent 不能为空");
+        Objects.requireNonNull(coordinator, "coordinator 不能为空");
+        Objects.requireNonNull(lifecycleOwnerToken, "lifecycleOwnerToken 不能为空");
+        if (childIndex < 0) {
+            throw new IllegalArgumentException("childIndex 不能为负数");
+        }
+        if (this.parent != null) {
+            throw new IllegalStateException("EventLoop 只能绑定一个 Group owner");
+        }
+        kernel().bindOwner(coordinator);
+        this.parent = parent;
+        this.lifecycleOwnerToken = lifecycleOwnerToken;
     }
 
     @Override
@@ -35,11 +57,13 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
 
     @Override
     public final CompletionStage<Void> start() {
+        requireStandaloneLifecycle();
         return kernel().start();
     }
 
     @Override
     public final void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline) {
+        requireStandaloneLifecycle();
         kernel().requestShutdown(mode, deadline);
     }
 
@@ -59,8 +83,8 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
     }
 
     @Override
-    public EventLoopGroup parent() {
-        return null;
+    public final EventLoopGroup parent() {
+        return parent;
     }
 
     @Override
@@ -123,11 +147,13 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
 
     @Override
     public final void shutdown() {
+        requireStandaloneLifecycle();
         kernel().shutdown();
     }
 
     @Override
     public final List<Runnable> shutdownNow() {
+        requireStandaloneLifecycle();
         return kernel().shutdownNow();
     }
 
@@ -180,7 +206,28 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
 
     @Override
     public final void close() {
+        requireStandaloneLifecycle();
         kernel().close();
+    }
+
+    final CompletionStage<Void> startFromOwner(Object lifecycleOwnerToken) {
+        requireOwner(lifecycleOwnerToken);
+        return kernel().start();
+    }
+
+    final void requestShutdownFromOwner(
+            Object lifecycleOwnerToken,
+            ShutdownMode mode,
+            ShutdownDeadline deadline) {
+        requireOwner(lifecycleOwnerToken);
+        kernel().requestShutdown(mode, deadline);
+    }
+
+    final List<Runnable> shutdownNowFromOwner(
+            Object lifecycleOwnerToken,
+            ShutdownDeadline deadline) {
+        requireOwner(lifecycleOwnerToken);
+        return kernel().shutdownNow(deadline);
     }
 
     private EventLoopKernel kernel() {
@@ -189,6 +236,20 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
             throw new IllegalStateException("EventLoopKernel 尚未初始化");
         }
         return current;
+    }
+
+    private void requireStandaloneLifecycle() {
+        EventLoopGroup currentParent = parent;
+        if (currentParent != null) {
+            throw new ChildLifecycleOwnershipException(name(), currentParent.name());
+        }
+    }
+
+    private void requireOwner(Object token) {
+        if (parent == null || lifecycleOwnerToken != token) {
+            throw new ChildLifecycleOwnershipException(
+                    name(), parent == null ? "<unbound>" : parent.name());
+        }
     }
 
     private void rejectBlockingInvoke(Collection<?> tasks) {
