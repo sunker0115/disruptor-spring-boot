@@ -6,9 +6,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 /** 生产者向单消费者 worker 传递物理取消清理的邮箱。 */
 final class CancellationMailbox {
 
-    private final ConcurrentLinkedQueue<AcceptedTask> queue = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<AcceptedTask<?>> queue = new ConcurrentLinkedQueue<>();
 
-    boolean offer(AcceptedTask task) {
+    boolean offer(AcceptedTask<?> task) {
         Objects.requireNonNull(task, "task 不能为空");
         if (!task.markCancellationQueued()) {
             return false;
@@ -17,8 +17,8 @@ final class CancellationMailbox {
         return true;
     }
 
-    AcceptedTask poll() {
-        AcceptedTask task = queue.poll();
+    AcceptedTask<?> poll() {
+        AcceptedTask<?> task = queue.poll();
         if (task != null) {
             task.clearCancellationQueued();
         }

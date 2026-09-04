@@ -5,7 +5,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** accepted 任务的 registry 记录，将 Future 终态与物理清理分离。 */
-final class AcceptedTask {
+final class AcceptedTask<V> {
 
     enum PhysicalState {
         WAITING,
@@ -17,17 +17,14 @@ final class AcceptedTask {
 
     private final long acceptedSequence;
     private final Runnable originalRunnable;
-    private final EventLoopFutureTask<?> future;
-    private final Runnable cleanup;
+    private final EventLoopFutureTask<V> future;
     private final AtomicReference<PhysicalState> state = new AtomicReference<>(PhysicalState.WAITING);
     private final AtomicBoolean cancellationQueued = new AtomicBoolean();
-    private final AtomicBoolean cleaned = new AtomicBoolean();
 
     AcceptedTask(
             long acceptedSequence,
             Runnable originalRunnable,
-            EventLoopFutureTask<?> future,
-            Runnable cleanup) {
+            EventLoopFutureTask<V> future) {
         if (acceptedSequence < 0) {
             throw new IllegalArgumentException("acceptedSequence 不能为负数");
         }
@@ -35,7 +32,6 @@ final class AcceptedTask {
         this.originalRunnable = Objects.requireNonNull(originalRunnable,
                 "originalRunnable 不能为空");
         this.future = Objects.requireNonNull(future, "future 不能为空");
-        this.cleanup = Objects.requireNonNull(cleanup, "cleanup 不能为空");
     }
 
     long acceptedSequence() {
@@ -46,7 +42,7 @@ final class AcceptedTask {
         return originalRunnable;
     }
 
-    EventLoopFutureTask<?> future() {
+    EventLoopFutureTask<V> future() {
         return future;
     }
 
@@ -70,11 +66,8 @@ final class AcceptedTask {
         return state.compareAndSet(PhysicalState.WAITING, PhysicalState.RETURNED);
     }
 
-    void terminate() {
-        PhysicalState previous = state.getAndSet(PhysicalState.TERMINAL);
-        if (previous != PhysicalState.TERMINAL && cleaned.compareAndSet(false, true)) {
-            cleanup.run();
-        }
+    boolean terminate() {
+        return state.getAndSet(PhysicalState.TERMINAL) != PhysicalState.TERMINAL;
     }
 
     boolean markCancellationQueued() {

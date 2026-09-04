@@ -16,7 +16,6 @@ import java.util.List;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -151,26 +150,22 @@ class ScheduledTaskTest {
     @Test
     void acceptedTaskSeparatesFutureOutcomeFromPhysicalCleanup() {
         EventLoopFutureTask<Void> future = future(8);
-        AtomicInteger cleanups = new AtomicInteger();
-        AcceptedTask accepted = new AcceptedTask(8, () -> {
-        }, future, cleanups::incrementAndGet);
+        AcceptedTask<Void> accepted = new AcceptedTask<>(8, () -> {
+        }, future);
 
         assertTrue(accepted.tryStart());
         assertTrue(future.cancel(CancellationReason.FUTURE_CANCELLED_INTERRUPT));
         assertEquals(AcceptedTask.PhysicalState.RUNNING, accepted.state());
-        assertEquals(0, cleanups.get());
 
-        accepted.terminate();
-        accepted.terminate();
+        assertTrue(accepted.terminate());
+        assertFalse(accepted.terminate());
         assertEquals(AcceptedTask.PhysicalState.TERMINAL, accepted.state());
-        assertEquals(1, cleanups.get());
     }
 
     @Test
     void cancellationMailboxKeepsAtMostOnePendingNodePerTask() {
-        AcceptedTask accepted = new AcceptedTask(9, () -> {
-        }, future(9), () -> {
-        });
+        AcceptedTask<Void> accepted = new AcceptedTask<>(9, () -> {
+        }, future(9));
         CancellationMailbox mailbox = new CancellationMailbox();
 
         assertTrue(mailbox.offer(accepted));
