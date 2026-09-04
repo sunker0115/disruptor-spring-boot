@@ -2,520 +2,621 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 新增 `disruptor-concurrent`，提供受监督、有界或显式无界、严格单线程、支持高级调度与固定 Group 的标准 JDK Executor，并完成 Spring 集成和 Commons 能力审计。
+**Goal:** 新增 `disruptor-concurrent`，以一套受监督内核提供有界和显式无界 EventLoop、完整 JDK 21 Executor/Scheduler 关闭语义、固定 Group、高级任务能力以及 Boot 4.1 运维集成。
 
-**Architecture:** `DisruptorEventLoop` 与 `UnboundedEventLoop` 共用唯一的 `EventLoopKernel`、单一 worker 和 core `WorkerSupervisor`；两者只替换 LMAX bounded 或 segmented MPSC unbounded `TaskQueue`。Future、timer、module、shutdown、快照、首因、共享 `ShutdownDeadline` 和 Group 终止全部由同一内核实现，公共 API 为 `EventLoop`/`ScheduledExecutorService`。
+**Architecture:** core 先把管道专属生命周期名称重构成通用 `SupervisedLifecycle`，并增加真正无界的 `ShutdownDeadline`。concurrent 只保留一个 `EventLoopKernel`；`TaskAdmissionGate` 和 `AcceptedTaskRegistry` 统一任务准入、容量和 shutdownNow 所有权，两种 `TaskQueue` 仅替换入口存储。EventLoopGroup 独占 child 生命周期，Spring 只管理根对象，并以同一个绝对 deadline 聚合真实 termination。
 
-**Tech Stack:** Java 21、LMAX Disruptor 4.0.0、JUnit 5、Spring Boot 4.1.0、Micrometer、JMH、Maven 3.9.9。
+**Tech Stack:** Java 21、LMAX Disruptor 4.0.0、SLF4J、JUnit 5、AssertJ、Spring Boot 4.1.0、Micrometer、JMH、Maven 3.9.9。
 
 ---
 
-所有 Maven 命令先执行：
+所有 Maven 命令使用项目固定环境：
 
 ```bash
 export JAVA_HOME=/Library/Java/JavaVirtualMachines/zulu-21.jdk/Contents/Home
-export PATH=$JAVA_HOME/bin:$PATH
+export PATH="$JAVA_HOME/bin:$PATH"
 MVN=/Users/sunke/.m2/wrapper/dists/apache-maven-3.9.9-bin/4nf9hui3q3djbarqar9g711ggc/apache-maven-3.9.9/bin/mvn
 ```
 
-### Task 1: 加入 Maven 模块
+每个 Task 都先确认红灯、再实现、再运行列出的模块测试并提交。不能用兼容别名、临时实现、禁用测试或 mock 掉并发边界让中间任务变绿。
+
+### Task 1：core 通用监督命名与无界 deadline
+
+**Files:**
+
+- Rename: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/PipelineLifecycle.java` → `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/SupervisedLifecycle.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSupervisor.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/WorkerSnapshot.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/PipelineSnapshot.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownBackend.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ManagedPipeline.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/DisruptorRuntime.java`
+- Modify: `disruptor-core/src/main/java/com/sstlfsj/disruptor/core/ShutdownDeadline.java`
+- Modify: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/DisruptorPipelineTest.java`
+- Modify: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/DisruptorRuntimeTest.java`
+- Modify: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/PipelineSnapshotTest.java`
+- Test: `disruptor-core/src/test/java/com/sstlfsj/disruptor/core/WorkerSupervisorTest.java`
+
+- [ ] **Step 1：先写无界 deadline 和新类型测试**
+
+在 `WorkerSupervisorTest` 增加以下事实断言：
+
+```java
+@Test
+void unboundedDeadlineNeverExpiresOrDependsOnNanoTime() {
+    ShutdownDeadline deadline = ShutdownDeadline.unbounded();
+    assertFalse(deadline.isBounded());
+    assertFalse(deadline.isExpired());
+    assertEquals(Long.MAX_VALUE, deadline.remainingNanos());
+    assertSame(deadline, ShutdownDeadline.unbounded());
+}
+
+@Test
+void workerSnapshotUsesGenericSupervisedLifecycle() {
+    WorkerSupervisor supervisor = supervisor(TEST_TIMEOUT, new RecordingBackend());
+    assertEquals(SupervisedLifecycle.NEW, supervisor.snapshot().lifecycle());
+}
+```
+
+- [ ] **Step 2：运行红灯**
+
+```bash
+$MVN -pl disruptor-core -Dtest=WorkerSupervisorTest test
+```
+
+Expected: `SupervisedLifecycle`、`unbounded()` 或 `isBounded()` 尚不存在导致编译失败。
+
+- [ ] **Step 3：直接完成通用重命名**
+
+新枚举完整内容为：
+
+```java
+public enum SupervisedLifecycle {
+    NEW, STARTING, RUNNING, QUIESCING, STOPPING, TERMINATED
+}
+```
+
+用 `SupervisedLifecycle` 替换 core 全部生产和测试引用，并删除 `PipelineLifecycle`；不创建兼容类型。完成后执行：
+
+```bash
+rg -n 'PipelineLifecycle' disruptor-core
+```
+
+Expected: 无输出。
+
+- [ ] **Step 4：实现显式 bounded/unbounded 表示**
+
+`ShutdownDeadline` 使用 `bounded` 字段区分语义，`unbounded()` 返回静态单例；`after(Duration)` 仍校验非负并饱和换算。无界分支不得通过绝对 `Long.MAX_VALUE` 再做 `deadline-now` 判断。
+
+- [ ] **Step 5：验证 core 并提交**
+
+```bash
+$MVN -pl disruptor-core test
+git diff --check
+git add disruptor-core
+git commit -m "refactor(core): generalize supervised lifecycle"
+```
+
+Expected: core 全部测试通过；现有 pipeline/runtime 生命周期、失败和关闭测试没有退化。
+
+### Task 2：模块与完整公共契约
 
 **Files:**
 
 - Modify: `pom.xml`
 - Create: `disruptor-concurrent/pom.xml`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/SupervisedScheduledExecutor.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoop.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopGroup.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopFactory.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopModule.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopSnapshot.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopGroupSnapshot.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopScheduledFuture.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/ScheduledTaskSnapshot.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/ScheduledTaskSpec.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/ScheduleMode.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CapacityMode.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/TaskOutcome.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/TaskContext.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/ContextCallable.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/DynamicDelay.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CancellationToken.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CancellationReason.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CancellationRegistration.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/TaskExceptionHandler.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CancellationListenerExceptionHandler.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/BlockingOperationException.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/PublicContractTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/ScheduledTaskSpecTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/TaskContextTest.java`
 
-- [ ] **Step 1: 添加 reactor 和受管依赖**
+- [ ] **Step 1：加入 reactor 与直接依赖**
 
-根 POM modules 与 dependencyManagement 同时加入：
+根 POM 的 `<modules>` 和 `<dependencyManagement>` 加入 `disruptor-concurrent`。模块 POM compile 依赖必须同时包含：
 
 ```xml
-<module>disruptor-concurrent</module>
-<dependency>
-    <groupId>com.sstlfsj</groupId>
-    <artifactId>disruptor-concurrent</artifactId>
-    <version>${project.version}</version>
-</dependency>
+<dependency><groupId>com.lmax</groupId><artifactId>disruptor</artifactId></dependency>
+<dependency><groupId>com.sstlfsj</groupId><artifactId>disruptor-core</artifactId></dependency>
+<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>
+<dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><optional>true</optional></dependency>
 ```
 
-- [ ] **Step 2: 创建模块 POM**
+test scope 加 `junit-jupiter` 与 `assertj-core`。模块 POM 不得出现 Spring 依赖。
 
-模块 compile 依赖 `disruptor-core` 与 `slf4j-api`，test 依赖 `junit-jupiter` 和 `assertj-core`，不依赖 Spring。
+- [ ] **Step 2：写公共类型和验证红灯**
 
-- [ ] **Step 3: 验证 reactor**
+`PublicContractTest` 用编译期赋值确认 `EventLoop` 和 `EventLoopGroup` 都是 `SupervisedScheduledExecutor`、Group 可迭代且 EventLoop 暴露 `parent()`。`ScheduledTaskSpecTest` 验证四种调度模式互斥、负 trigger/expires、非正 period/max executions，并拒绝 null dynamic calculator；calculator 运行后返回 null 的失败语义由 Task 3 的 `ScheduledTaskTest` 覆盖。`TaskContextTest` 验证 typed key、不可变复制和空 context。
+
+```bash
+$MVN -pl disruptor-concurrent -am -Dtest=PublicContractTest,ScheduledTaskSpecTest,TaskContextTest -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Expected: 公共类型不存在导致编译失败。
+
+- [ ] **Step 3：实现不依赖运行内核的完整公共类型**
+
+`SupervisedScheduledExecutor<S>` 的签名必须与规格一致：
+
+```java
+public interface SupervisedScheduledExecutor<S>
+        extends ScheduledExecutorService, AutoCloseable {
+    String name();
+    CompletionStage<Void> start();
+    void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline);
+    CompletionStage<S> termination();
+    S snapshot();
+}
+```
+
+`ScheduledTaskSpec`、`TaskContext`、reason、snapshot 均实现真实不可变性、构造校验、equals/hashCode 所需的 record 或 value object 语义。接口只定义稳定行为，不提供抛 `UnsupportedOperationException` 的临时实现，也不创建尚不能工作的 EventLoop builder。
+
+- [ ] **Step 4：验证模块边界并提交**
 
 ```bash
 $MVN -pl disruptor-concurrent -am test
+$MVN -pl disruptor-concurrent dependency:tree
+git diff --check
+git add pom.xml disruptor-concurrent
+git commit -m "feat(concurrent): define public concurrency contracts"
 ```
 
-Expected: `BUILD SUCCESS` 且 reactor 包含 core、concurrent。
+Expected: reactor 包含 core、concurrent；dependency tree 显示 concurrent 直接依赖 LMAX、core、SLF4J，且没有 Spring。
 
-- [ ] **Step 4: 提交模块骨架**
-
-```bash
-git add pom.xml disruptor-concurrent/pom.xml
-git commit -m "build: add disruptor concurrent module"
-```
-
-### Task 2: 定义 EventLoop 公共契约和有界队列
+### Task 3：任务基元、取消、上下文与 module
 
 **Files:**
 
-- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoop.java`
-- Create: `.../EventLoopSnapshot.java`
-- Create: `.../EventLoopState.java`
-- Create: `.../CapacityMode.java`
-- Create: `.../TaskExceptionHandler.java`
-- Create: `.../EventLoopBuilder.java`
-- Create: `.../internal/TaskSlot.java`
-- Create: `.../internal/TaskQueue.java`
-- Create: `.../internal/BoundedTaskQueue.java`
-- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoopTest.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/CancellationSource.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/NanoClock.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/EventLoopFutureTask.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/AcceptedTask.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/ScheduledTask.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/IndexedScheduledHeap.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/CancellationMailbox.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/ModuleLifecycle.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/CancellationSourceTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/ScheduledTaskTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/IndexedScheduledHeapTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/ModuleLifecycleTest.java`
 
-- [ ] **Step 1: 写公共契约编译测试**
+- [ ] **Step 1：写取消竞态和监听器契约测试**
 
-```java
-@Test
-void exposesStandardScheduledExecutorContract() {
-    EventLoop loop = EventLoopBuilder.builder("orders")
-            .bufferSize(16)
-            .maxBatchSize(4)
-            .build();
-    assertInstanceOf(ScheduledExecutorService.class, loop);
-    assertEquals("orders", loop.name());
-    assertEquals(EventLoopState.NEW, loop.snapshot().state());
-}
+测试至少包含这些独立用例：
+
+```text
+firstCancellationWinsAndFreezesReason
+lateSynchronousListenerRunsOnRegisteringThread
+asynchronousListenerRunsOnProvidedExecutor
+successfulUnregisterPreventsInvocationAndUnlinksNode
+cancelAndUnregisterLinearizeWithoutDoubleInvocation
+listenerFailureDoesNotSkipRemainingListeners
+rejectedListenerExecutorIsReportedWithoutChangingReason
+cancelAfterUsesExplicitSchedulerAndCancelsTimerWhenSourceWinsFirst
 ```
 
-- [ ] **Step 2: 确认红灯**
+对 cancel/unregister 竞态重复运行并记录每个 listener 次数，断言只能是 0 或 1，不能大于 1。
+
+- [ ] **Step 2：写任务、上下文、堆和 module 测试**
+
+使用 `ManualNanoClock` 验证 timer heap 严格按 `trigger asc -> priority desc -> acceptedSequence asc`；删除任意 index 后仍保持堆序；dynamic calculator 返回 null 或负值时 Future 异常终止。module 测试断言 start 声明顺序、只 stop 已成功启动项、stop 逆序、每项一次，以及 start/update 主异常保留、stop 异常全部 suppressed。
+
+- [ ] **Step 3：运行红灯**
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest test
+$MVN -pl disruptor-concurrent -Dtest=CancellationSourceTest,ScheduledTaskTest,IndexedScheduledHeapTest,ModuleLifecycleTest test
 ```
 
-Expected: 公共类型不存在。
+Expected: 具体任务基元尚不存在。
 
-- [ ] **Step 3: 实现稳定公共接口**
+- [ ] **Step 4：实现 CancellationSource**
 
-```java
-public interface EventLoop extends ScheduledExecutorService {
-    String name();
-    boolean inEventLoop();
-    CompletionStage<Void> start();
-    CompletionStage<EventLoopSnapshot> termination();
-    EventLoopSnapshot snapshot();
-    boolean tryExecute(Runnable command);
-}
-```
+用锁保护双向 listener 链表和首次 reason 提交；锁内只取得 listener 执行权并物理摘链，锁外调用。同步/异步与晚注册线程遵守规格；所有异常交给 `CancellationListenerExceptionHandler`。`cancelAfter` 强制传入 `ScheduledExecutorService`，不引用 GlobalEventLoop。
 
-`EventLoopSnapshot` 包含状态、健康、容量模式、worker 登记是否封口、registered/started/alive、pending、remaining、scheduled、completed、failed、cancelled、首因和 worker 线程名。快照沿用 core 不变量：`RUNNING` 时单一 worker 必须已封口、启动且存活；`TERMINATED` 时 alive 为 0。
+- [ ] **Step 5：实现任务物理状态和 Future 唯一终态**
 
-- [ ] **Step 4: 实现 BoundedTaskQueue 最小契约**
+`AcceptedTask` 区分 Future outcome 与物理 `WAITING/RUNNING/CANCELLED_WAITING/RETURNED/TERMINAL`，`EventLoopFutureTask` 实现 JDK Future 结果。`ScheduledTask` 只在 loop 线程计算 fixed-rate、fixed-delay、dynamic-delay 下一 trigger；dynamic 计算失败使 Future 异常终止。`CancellationMailbox` 对同一 accepted task 最多保留一个待删除节点。
 
-`TaskQueue.offer` 成功后返回单调 acceptedSequence，失败返回容量/状态原因；`poll(maxBatchSize)` 只能由单消费者调用；消费后清空 `TaskSlot` 引用。
+- [ ] **Step 6：实现 module 生命周期并提交**
 
-- [ ] **Step 5: 运行测试并提交**
+`ModuleLifecycle` 冻结输入列表，记录成功 started 的前缀；update 异常向上抛给未来 kernel；stop 遍历完整 started 逆序并聚合 suppressed。
 
 ```bash
 $MVN -pl disruptor-concurrent test
+git diff --check
 git add disruptor-concurrent
-git commit -m "feat(concurrent): define event loop contracts"
+git commit -m "feat(concurrent): add task cancellation and module primitives"
 ```
 
-### Task 3: 实现共享 EventLoopKernel、有界后端与 ExecutorService
+### Task 4：gate、registry 与两种 TaskQueue 契约
+
+**Files:**
+
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/TaskEnvelope.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/TaskReservation.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/TaskQueue.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/BoundedTaskQueue.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/UnboundedTaskQueue.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/TaskAdmissionGate.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/AdmissionToken.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/AcceptedTaskRegistry.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/TaskAdmissionGateTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/AcceptedTaskRegistryTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/internal/TaskQueueContractTest.java`
+
+- [ ] **Step 1：写 gate 容量与关闭握手测试**
+
+分别把任务停在 admission、入口、timer 模拟持有和 executing 模拟持有状态，断言有界容量都被占用；关闭 gate 后新 token 拒绝，已取得 token 可以完成登记，控制方只有在 token 清零后才能冻结 accepted 集。取消 running Future 不得提前归还 permit。
+
+- [ ] **Step 2：写 registry shutdownNow CAS 测试**
+
+创建乱序 `WAITING/RUNNING/CANCELLED_WAITING/RETURNED/TERMINAL` 记录并并发调用 sweep，断言：只有成功执行 `WAITING -> RETURNED` CAS 的 task 被返回；按 accepted sequence 排序；返回 original Runnable 而非 envelope；running 不返回且收到 cancel(true)；已被普通取消的 waiting task 不返回；每项最多返回一次；sweep 本身不提前释放 permit，worker 物理清理后 registry 和 permit 才都为零。
+
+- [ ] **Step 3：写两后端参数化 queue contract**
+
+同一测试工厂分别创建 `BoundedTaskQueue` 和 `UnboundedTaskQueue`，覆盖四生产者并发 reservation/publish、连续 sequence、abort tombstone、单消费者顺序、消费清引用、segment 跨界与回收。测试不引用 kernel，确保 queue 只承担存储职责。
+
+- [ ] **Step 4：运行红灯**
+
+```bash
+$MVN -pl disruptor-concurrent -Dtest=TaskAdmissionGateTest,AcceptedTaskRegistryTest,TaskQueueContractTest test
+```
+
+Expected: gate、registry 和 queue 类型不存在。
+
+- [ ] **Step 5：实现统一 reservation/publish 协议**
+
+`TaskQueue` 契约固定为内部 claim 入口：
+
+```java
+interface TaskQueue {
+    TaskReservation tryReserve();
+    AcceptedTask<?> poll();
+    long pending();
+    long remainingCapacity();
+    int allocatedSegments();
+}
+
+interface TaskReservation {
+    long sequence();
+    void publish(AcceptedTask<?> task);
+    void abort();
+}
+```
+
+`abort()` 必须发布可跳过 tombstone，不能留下 sequence hole。Bounded 使用 LMAX multi-producer RingBuffer；Unbounded 使用分段 MPSC release/acquire 发布。两者只由一个消费者 poll，poll 后必须清引用。
+
+- [ ] **Step 6：验证压力与提交**
+
+```bash
+$MVN -pl disruptor-concurrent test
+git diff --check
+git add disruptor-concurrent
+git commit -m "feat(concurrent): add admission registry and task queues"
+```
+
+Expected: 两后端各执行至少 4×10,000 条并发任务，无丢失、重复、永久洞和遗留引用。
+
+### Task 5：bounded 完整 executor、scheduler 与 shutdown
 
 **Files:**
 
 - Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoop.java`
-- Create: `.../internal/EventLoopKernel.java`
-- Create: `.../internal/EventLoopWorker.java`
-- Create: `.../internal/SubmittedTask.java`
-- Test: `.../DisruptorEventLoopTest.java`
-- Test: `.../ExecutorContractTest.java`
-- Test: `.../EventLoopBackendContractTest.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopBuilder.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/EventLoopKernel.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/EventLoopWorker.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/EventLoopShutdownBackend.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoopTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopExecutorContractTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopSchedulingTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopShutdownTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopBlockingGuardTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopModuleTest.java`
 
-- [ ] **Step 1: 写启动、顺序、拒绝和终止失败测试**
+- [ ] **Step 1：先实现精确 startup 的红灯测试**
 
-```java
-@Test
-void executesAcceptedCommandsOnOneThreadInClaimOrder() throws Exception {
-    EventLoop loop = EventLoopBuilder.builder("orders").bufferSize(64).build();
-    loop.start().toCompletableFuture().get(1, SECONDS);
-    List<Integer> seen = new CopyOnWriteArrayList<>();
-    for (int i = 0; i < 32; i++) loop.execute(new IndexedCommand(i, seen));
-    loop.shutdown();
-    assertTrue(loop.awaitTermination(1, SECONDS));
-    assertEquals(IntStream.range(0, 32).boxed().toList(), seen);
-}
-```
+用可控 ThreadFactory 和阻塞 module 覆盖：构造不启动线程；register 发生在 start 前；`markStarting -> Thread.start -> finally seal`；worker 入场和 module start 后才 RUNNING/open gate/start stage complete；启动中 shutdown 唯一结局；Thread.start 失败和 module 部分启动失败都真实终止且无线程泄漏。
 
-- [ ] **Step 2: 确认测试红灯**
+- [ ] **Step 2：实现唯一 kernel 与 bounded facade**
+
+`EventLoopKernel` 持有唯一 `WorkerSupervisor`、gate、registry、Future/timer/module 状态；`DisruptorEventLoop` 只委派公共 API。`EventLoopBuilder.bounded(name, capacity)` 校验容量为 2 的幂，并创建 `BoundedTaskQueue`。在这一步通过 startup 测试后提交：
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,ExecutorContractTest test
-```
-
-Expected: `build()` 尚未返回可运行实现或 Executor 方法未实现。
-
-- [ ] **Step 3: 接入 core 统一监督生命周期**
-
-`EventLoopKernel` 唯一持有 core `WorkerSupervisor`。启动时登记单一 worker，进入 `STARTING` 后启动并封口；worker 完成已配置模块启动后调用 `markRunning()`。NEW 下意外启动不得执行循环；worker 在 `STARTING/RUNNING/QUIESCING` 提前退出必须 fail-stop。
-
-kernel 实现非阻塞 `ShutdownBackend`：`beginQuiesce` 只 unpark，`isDrained` 只读取 worker 发布的 drain 事实，`stop(GRACEFUL/IMMEDIATE)` 只发布停止意图并 unpark。所有后端动作由 supervisor 控制线程串行调用；Future 终态化、TaskQueue 引用清理和模块 stop 必须在 worker `finally` 中完成，线程被 join 后才能完成 termination。
-
-- [ ] **Step 4: 实现 EventPoller worker**
-
-循环必须按以下顺序：执行到期 timer、poll 最多 `maxBatchSize` 条、模块 update、按下一 deadline park。每次成功发布调用 `LockSupport.unpark(workerThread)`；检查为空与 park 之间的发布依赖 unpark permit 防止丢唤醒。
-
-- [ ] **Step 5: 实现 ExecutorService 与关闭终态**
-
-`execute` 使用非阻塞 offer，拒绝时抛包含 `NOT_STARTED/FULL/SHUTTING_DOWN/FAILED` 的 `RejectedExecutionException`。`submit` 使用 FutureTask；`shutdown` 与 `shutdownNow` 都使用首次冻结的 `ShutdownDeadline` 非阻塞请求 supervisor。`shutdownNow` 返回空列表，pending 队列仍只由 worker 清理，避免调用线程破坏单消费者所有权；所有 accepted Future 在 termination 前终态化。
-
-graceful 必须经历 `RUNNING → QUIESCING → STOPPING → TERMINATED`；立即停止、基础设施故障和 deadline 到期单调进入 `STOPPING`。deadline 只触发首因与 immediate 升级，worker 存活时 termination 不完成。graceful flag 要求 `reachedRunning + drainCommitted + gracefulStopApplied + 单一 worker 真实退出`。
-
-- [ ] **Step 6: 补齐任务异常与关闭架构测试并通过**
-
-裸任务的 `Throwable` 进入 `TaskExceptionHandler` 后继续循环；submit 的异常只进入 Future；只有任务边界之外的 processor/queue 异常触发 core supervisor。
-
-增加参数化后端契约：bounded/unbounded 必须共用同一 kernel 快照；`QUIESCING/STOPPING` 均可观察；drain pending 时 immediate 不受阻塞；抗中断任务退出前 termination 不完成；Future、timer、module cleanup 在 termination 前完成。
-
-```bash
-$MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,ExecutorContractTest test
-```
-
-Expected: `BUILD SUCCESS`。
-
-- [ ] **Step 7: 提交共享内核和有界 EventLoop**
-
-```bash
+$MVN -pl disruptor-concurrent -Dtest=DisruptorEventLoopTest,EventLoopModuleTest test
 git add disruptor-concurrent
-git commit -m "feat(concurrent): add supervised event loop kernel"
+git commit -m "feat(concurrent): start supervised bounded event loops"
 ```
 
-### Task 4: 实现取消令牌和确定性调度
+- [ ] **Step 3：写并通过 Executor/Future/阻塞保护测试**
 
-**Files:**
-
-- Create: `.../NanoClock.java`
-- Create: `.../CancellationToken.java`
-- Create: `.../CancellationSource.java`
-- Create: `.../CancellationReason.java`
-- Create: `.../TaskContext.java`
-- Create: `.../ScheduledTaskSpec.java`
-- Create: `.../TaskSnapshot.java`
-- Create: `.../internal/ScheduledTask.java`
-- Create: `.../internal/IndexedScheduledHeap.java`
-- Create: `.../internal/CancellationMailbox.java`
-- Test: `.../CancellationTest.java`
-- Test: `.../EventLoopSchedulingTest.java`
-
-- [ ] **Step 1: 写取消恰好一次测试**
-
-```java
-@Test
-void cancellationPublishesOneReasonToEveryListener() {
-    CancellationSource source = new CancellationSource();
-    List<CancellationReason> seen = new ArrayList<>();
-    source.token().onCancel(seen::add);
-    assertTrue(source.cancel(CancellationReason.user("stop")));
-    assertFalse(source.cancel(CancellationReason.user("again")));
-    assertEquals(List.of(CancellationReason.user("stop")), seen);
-}
-```
-
-- [ ] **Step 2: 写调度顺序失败测试**
-
-用注入的 `ManualNanoClock` 验证一次、fixed-rate、fixed-delay、动态延迟、次数、截止时间，以及 `deadline asc -> priority desc -> acceptedSequence asc`。
-
-- [ ] **Step 3: 确认红灯**
+覆盖 execute、tryExecute、三个 submit 重载、invokeAll、invokeAny、拒绝原因、裸 Runnable 异常 handler、submit 异常只进 Future、严格单线程、accepted sequence，以及未完成 Future.get/awaitTermination/invoke/close 的 same-loop `BlockingOperationException`。已完成 Future.get 必须可在 loop 内读取。
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=CancellationTest,EventLoopSchedulingTest test
+$MVN -pl disruptor-concurrent -Dtest=EventLoopExecutorContractTest,EventLoopBlockingGuardTest test
 ```
 
-Expected: 调度类型不存在。
+Expected: `BUILD SUCCESS`。随后提交 `feat(concurrent): execute bounded event loop tasks`。
 
-- [ ] **Step 4: 实现 ScheduledTaskSpec**
+- [ ] **Step 4：写完整调度红灯测试**
 
-同时给 `EventLoop` 增加高级调度入口：
+使用手动时钟逐项测试 one-shot、fixed-rate 追赶、fixed-delay、dynamic-delay、expires 前不执行、max executions、continueOnFailure、同 trigger priority、`schedule(0)` 先于后续 execute、timer/command 双向批次公平，以及 `EventLoopScheduledFuture.snapshot()` 的每次状态变化。
 
-```java
-<V> ScheduledFuture<V> schedule(ScheduledTaskSpec<V> spec);
-```
+- [ ] **Step 5：实现 scheduler 循环并通过测试**
 
-```java
-ScheduledTaskSpec<Void> spec = ScheduledTaskSpec.run(command)
-        .fixedRate(Duration.ZERO, Duration.ofMillis(10))
-        .maxExecutions(3)
-        .deadline(Duration.ofSeconds(1))
-        .priority(10)
-        .cancellationToken(source.token())
-        .context(TaskContext.of("traceId", "abc"))
-        .continueOnFailure(false)
-        .build();
-```
-
-拒绝负周期、非正次数和溢出的 duration。Future.cancel 与 token cancel 汇合到一个原子终态。
-
-- [ ] **Step 5: 实现索引堆和 cancellation mailbox**
-
-堆的 offer/poll/remove 为 O(log n)；仅 loop 线程修改堆。外部取消每个任务最多写入一次 mailbox 并 unpark。
-
-- [ ] **Step 6: 运行测试并提交**
+worker 严格执行“cancel mailbox → bounded timer batch → 至少一条且 bounded command batch → module update → 重新读时钟 → park”。遇到刚登记且已到期的 timer 立即结束 command batch。所有 schedule 入口先通过 gate/queue/registry，不允许同 loop 绕过容量。
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=CancellationTest,EventLoopSchedulingTest test
+$MVN -pl disruptor-concurrent -Dtest=EventLoopSchedulingTest test
 git add disruptor-concurrent
-git commit -m "feat(concurrent): add deterministic task scheduling"
+git commit -m "feat(concurrent): schedule bounded event loop tasks"
 ```
 
-### Task 5: 实现模块生命周期
+- [ ] **Step 6：写 JDK 21 shutdown 红灯测试**
 
-**Files:**
+测试名称和核心断言固定为：
 
-- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopModule.java`
-- Modify: `.../EventLoopBuilder.java`
-- Modify: `.../internal/EventLoopWorker.java`
-- Test: `.../EventLoopModuleTest.java`
-
-- [ ] **Step 1: 写顺序与回滚失败测试**
-
-```java
-@Test
-void startsInOrderAndStopsOnlyStartedModulesInReverseOrder() {
-    List<String> calls = new CopyOnWriteArrayList<>();
-    EventLoop loop = builderWithModules(
-            module("a", calls), failingStartModule("b", calls), module("c", calls)).build();
-    assertThrows(ExecutionException.class,
-            () -> loop.start().toCompletableFuture().get(1, SECONDS));
-    assertEquals(List.of("start-a", "start-b", "stop-a"), calls);
-}
+```text
+shutdownUsesUnboundedDeadlineAndRunsAcceptedFutureOneShot
+shutdownCancelsWaitingPeriodicButDoesNotInterruptCurrentInvocation
+shutdownNowReturnsWaitingOriginalRunnablesInAcceptedOrder
+shutdownNowDoesNotReturnRunningTaskAndInterruptsWorker
+boundedGracefulDeadlineEscalatesWithoutFakingTermination
+terminationWaitsForInterruptIgnoringTaskToReallyExit
+everyAcceptedFutureIsTerminalAndEveryReferenceIsCleared
 ```
 
-- [ ] **Step 2: 确认红灯并实现接口**
+未来 one-shot 用手动时钟推进证明 shutdown 不会提前取消；抗中断任务用 latch 证明 deadline 到期后 termination 仍未完成。
 
-```java
-public interface EventLoopModule {
-    default void onStart(EventLoop loop) throws Exception {}
-    default void onUpdate(EventLoop loop, long nowNanos) throws Exception {}
-    default void onStop(EventLoop loop) throws Exception {}
-}
-```
+- [ ] **Step 7：实现非阻塞阶段关闭并通过完整模块测试**
 
-- [ ] **Step 3: 实现 worker hook**
-
-start 声明顺序、stop 逆序；每批任务后或 timer 唤醒后调用 update。模块异常在任务边界之外，触发 supervisor fail-stop；stop 异常作为 suppressed 保留。
-
-- [ ] **Step 4: 运行测试并提交**
+`shutdown()` 调用 `requestShutdown(GRACEFUL, ShutdownDeadline.unbounded())`；`shutdownNow()` 先 close/await admission，再 registry CAS 收集，最后 immediate。`EventLoopShutdownBackend` 的 `beginQuiesce` 只 unpark，`isDrained` 只读 worker 发布的事实，`stop` 只发布模式并唤醒；worker finally 完成 Future、引用和 module 清理，supervisor join 后才 termination。
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=EventLoopModuleTest test
+$MVN -pl disruptor-concurrent test
+git diff --check
 git add disruptor-concurrent
-git commit -m "feat(concurrent): add event loop modules"
+git commit -m "feat(concurrent): complete bounded event loop shutdown"
 ```
 
-### Task 6: 实现固定 EventLoopGroup
-
-**Files:**
-
-- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoopGroup.java`
-- Create: `.../EventLoopGroupBuilder.java`
-- Test: `.../EventLoopGroupTest.java`
-
-- [ ] **Step 1: 写 chooser 和故障传播测试**
-
-```java
-@Test
-void affinitySelectionIsStableForEveryIntKey() {
-    DisruptorEventLoopGroup group = EventLoopGroupBuilder.builder("workers", 4).build();
-    for (int key : List.of(Integer.MIN_VALUE, -1, 0, 1, Integer.MAX_VALUE)) {
-        assertSame(group.select(key), group.select(key));
-    }
-}
-```
-
-- [ ] **Step 2: 确认红灯**
-
-```bash
-$MVN -pl disruptor-concurrent -Dtest=EventLoopGroupTest test
-```
-
-- [ ] **Step 3: 实现固定 children 和共享 deadline 聚合生命周期**
-
-`next()` 使用无锁递增和 `floorMod`；`select(key)` 使用稳定 hash spread 后 `floorMod`。任一 child 基础设施故障锁存 Group 首因，以同一个 `ShutdownDeadline` 触发所有 child immediate stop，不重新映射 key。Group 只有在全部 child 真实 termination 后才能提交 terminated。
-
-- [ ] **Step 4: 验证启动回滚、委派和终止**
-
-补充 Group execute/submit/schedule、单 child 顺序、启动失败回滚、所有 child 收到相同绝对 deadline、同时发停止请求后聚合真实终止、不可变 iterator 测试。
-
-```bash
-$MVN -pl disruptor-concurrent -Dtest=EventLoopGroupTest test
-```
-
-- [ ] **Step 5: 提交 Group**
-
-```bash
-git add disruptor-concurrent
-git commit -m "feat(concurrent): add fixed event loop groups"
-```
-
-### Task 7: 实现显式无界分段 MPSC 后端
+### Task 6：unbounded 共用全部契约
 
 **Files:**
 
 - Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/UnboundedEventLoop.java`
-- Create: `.../internal/SegmentedMpscTaskQueue.java`
-- Modify: `.../EventLoopBuilder.java`
-- Test: `.../SegmentedMpscTaskQueueTest.java`
-- Test: `.../EventLoopBackendContractTest.java`
+- Modify: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopBuilder.java`
+- Create: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopBackendContractTest.java`
+- Test: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/UnboundedEventLoopTest.java`
 
-- [ ] **Step 1: 写 segment 边界与并发失败测试**
+- [ ] **Step 1：把完整 EventLoop 契约参数化**
 
-```java
-@Test
-void consumesEveryClaimedSequenceExactlyOnceAcrossSegments() throws Exception {
-    SegmentedMpscTaskQueue queue = new SegmentedMpscTaskQueue(8);
-    publishConcurrently(queue, 4, 1_000);
-    List<Long> sequences = drainSequences(queue, 4_000);
-    assertEquals(LongStream.range(0, 4_000).boxed().toList(), sequences);
-    assertEquals(1, queue.allocatedSegmentsAfterReclaim());
-}
-```
+`EventLoopBackendContractTest` 的 factory 参数分别构造 bounded/unbounded，并复用 Task 5 的 startup、Executor、四种 schedule、cancel、module、shutdown、blocking guard 和真实 termination 核心断言。增加反射或 package-private 测试入口，断言两种 facade 内持有的对象 class 都是同一个 `EventLoopKernel`。
 
-- [ ] **Step 2: 确认红灯并实现分段队列**
-
-每个 segment 为 2 的幂固定槽数组；生产者以全局原子 sequence 定位 segment 和 offset，发布位使用 release/acquire；单消费者只按连续 sequence 前进。消费后清引用，越过整块后回收前序块。
-
-- [ ] **Step 3: 仅替换共享内核的 TaskQueue 后端**
-
-`UnboundedEventLoop` 不创建 LMAX RingBuffer，也不创建第二个 supervisor 或 lifecycle；它只向同一个 `EventLoopKernel` 注入 segmented MPSC `TaskQueue`。调度、取消、Future、模块、关闭、快照和 Group 行为与 bounded 后端使用完全相同的代码路径。
-
-- [ ] **Step 4: 运行后端契约与压力测试**
+- [ ] **Step 2：运行 unbounded 红灯**
 
 ```bash
-$MVN -pl disruptor-concurrent -Dtest=SegmentedMpscTaskQueueTest,EventLoopBackendContractTest test
+$MVN -pl disruptor-concurrent -Dtest=EventLoopBackendContractTest,UnboundedEventLoopTest test
 ```
 
-Expected: 两种 TaskQueue 通过同一队列契约，两种 EventLoop 通过同一生命周期/Future/timer/module/shutdown 契约；无丢失、重复和遗留引用。
+Expected: `UnboundedEventLoop` 与 builder 入口不存在。
 
-- [ ] **Step 5: 提交无界后端**
+- [ ] **Step 3：只注入 UnboundedTaskQueue**
+
+`EventLoopBuilder.unbounded(name, segmentSize)` 创建 `UnboundedEventLoop`，除此之外走与 bounded 完全相同的 kernel 构造。不得复制 worker loop、scheduler、Future、module、supervisor 或 shutdown 类。snapshot 的 remaining capacity 固定表达 unbounded，allocated segments 报真实值。
+
+- [ ] **Step 4：验证并提交**
 
 ```bash
+$MVN -pl disruptor-concurrent test
+rg -n 'class EventLoopKernel|class EventLoopWorker' disruptor-concurrent/src/main/java
+git diff --check
 git add disruptor-concurrent
-git commit -m "feat(concurrent): add explicit unbounded event loops"
+git commit -m "feat(concurrent): add unbounded event loop facade"
 ```
 
-### Task 8: Spring 生命周期、健康和指标
+Expected: kernel/worker 各只有一个生产实现；两后端通过同一契约。
+
+### Task 7：EventLoopGroup 生命周期所有权
+
+**Files:**
+
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/DisruptorEventLoopGroup.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/EventLoopGroupBuilder.java`
+- Create: `disruptor-concurrent/src/main/java/com/sstlfsj/disruptor/concurrent/internal/GroupLifecycleCoordinator.java`
+- Create: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopGroupTest.java`
+- Create: `disruptor-concurrent/src/test/java/com/sstlfsj/disruptor/concurrent/EventLoopGroupShutdownTest.java`
+
+- [ ] **Step 1：写选择、parent 和 owner gate 红灯测试**
+
+对 `Integer.MIN_VALUE/-1/0/1/Integer.MAX_VALUE` 重复调用 `select`，断言固定映射；`next` 按 child index 轮询；iterator 不可修改。child `parent()` 返回同一个 Group，Group RUNNING 前和关闭开始后 child 直接提交都拒绝。
+
+- [ ] **Step 2：写 child 生命周期所有权测试**
+
+从 `select`/iterator 取得 child 后调用 `start/shutdown/shutdownNow/requestShutdown`，断言抛 `ChildLifecycleOwnershipException` 且 Group 状态未被部分改变。只有 Group 内部 coordinator 持 owner token 才能驱动 child 生命周期。
+
+- [ ] **Step 3：写聚合启动和关闭测试**
+
+覆盖全部 child 成功后 Group gate 一次开放；一个 child 启动失败先关闭 gate、再以同一 rollback deadline fail-stop 所有 child；child 运行时基础设施失败不重映射 affinity；标准 Group shutdown 使用同一 unbounded deadline；Group shutdownNow 按 child index 和 child accepted sequence 聚合返回值；显式 bounded request 把同一个对象广播给全部 child；Group termination 等最后一个抗中断 child 真实退出。
+
+- [ ] **Step 4：运行红灯**
+
+```bash
+$MVN -pl disruptor-concurrent -Dtest=EventLoopGroupTest,EventLoopGroupShutdownTest test
+```
+
+Expected: Group 实现与 owner coordinator 不存在。
+
+- [ ] **Step 5：实现固定 Group 与唯一关闭会话**
+
+`GroupLifecycleCoordinator` 维护 startup outcome、首个 deadline、最高 shutdown mode、broadcast-in-flight token、child termination facts 和唯一 outcome。任务委派在提交时选择 child；Group snapshot 按 child index 聚合。启动/停止广播不得因单个 child 抛异常而跳过其余 child。
+
+- [ ] **Step 6：验证并提交**
+
+```bash
+$MVN -pl disruptor-concurrent test
+git diff --check
+git add disruptor-concurrent
+git commit -m "feat(concurrent): add owned event loop groups"
+```
+
+### Task 8：Boot 4.1 生命周期、健康与指标
 
 **Files:**
 
 - Modify: `disruptor-spring-boot-autoconfigure/pom.xml`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentProperties.java`
 - Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentLifecycle.java`
-- Create: `.../DisruptorConcurrentAutoConfiguration.java`
-- Create: `.../DisruptorConcurrentHealthContributor.java`
-- Create: `.../DisruptorConcurrentMetrics.java`
-- Modify: `.../META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
-- Create: `disruptor-spring-boot-autoconfigure/src/test/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentAutoConfigurationTest.java`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentAutoConfiguration.java`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentHealthContributor.java`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentHealthAutoConfiguration.java`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentMetrics.java`
+- Create: `disruptor-spring-boot-autoconfigure/src/main/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentMetricsAutoConfiguration.java`
+- Modify: `disruptor-spring-boot-autoconfigure/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
+- Test: `disruptor-spring-boot-autoconfigure/src/test/java/com/sstlfsj/disruptor/DisruptorConcurrentAutoConfigurationTest.java`
+- Test: `disruptor-spring-boot-autoconfigure/src/test/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentLifecycleTest.java`
+- Test: `disruptor-spring-boot-autoconfigure/src/test/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentHealthContributorTest.java`
+- Test: `disruptor-spring-boot-autoconfigure/src/test/java/com/sstlfsj/disruptor/autoconfigure/DisruptorConcurrentMetricsTest.java`
 
-- [ ] **Step 1: 写条件装配失败测试**
+- [ ] **Step 1：添加 optional compile/test 依赖**
 
-```java
-@Test
-void managesOnlyExplicitEventLoopBeans() {
-    contextRunner.withUserConfiguration(LoopBeans.class).run(context -> {
-        assertThat(context).hasSingleBean(DisruptorConcurrentLifecycle.class);
-        assertThat(context).doesNotHaveBean("globalEventLoop");
-    });
-}
-```
+autoconfigure compile optional 加 `disruptor-concurrent` 和 `org.springframework.boot:spring-boot-health`；现有 `micrometer-core` 保持 optional。测试依赖加入 concurrent 与 Boot health/metrics 实现。starter POM 不添加 concurrent。
 
-- [ ] **Step 2: 确认红灯并添加 optional 模块依赖**
+- [ ] **Step 2：写三类条件装配红灯测试**
 
-autoconfigure 对 concurrent 使用 `<optional>true</optional>`；starter 不直接依赖 concurrent。
+分别用 `FilteredClassLoader` 隐藏 concurrent、`HealthIndicator`、`MeterRegistry`，断言基础生命周期、health、metrics 互不误装配且不存在 `NoClassDefFoundError`。有两个 standalone loop 和一个 Group Bean 时只管理三个根 Bean，不扫描 Group child，不创建全局 loop。
 
-- [ ] **Step 3: 实现生命周期、健康与 metrics binder**
+- [ ] **Step 3：写 SmartLifecycle 真实 termination 测试**
 
-生命周期按 bean 顺序启动；关闭时创建一次 `ShutdownDeadline`，向所有 bean 广播后聚合真实 termination，不能为每个 bean 重算 timeout。指标包括 healthy、worker registered/started/alive、pending、remaining（仅 bounded）、segments（仅 unbounded）、scheduled、completed、failed、cancelled。
+`stop(callback)` 测试记录每个 root 收到的 deadline 对象身份；断言先完成全部同步 request，再异步等待 termination；一个 root 超时或异常时 callback 仍只在全部 root 真实 termination 后恰好一次执行。
 
-- [ ] **Step 4: 运行自动配置测试**
+- [ ] **Step 4：实现拆分自动配置**
+
+基础配置不得 import health 或 Micrometer 类型。Health 配置使用 Boot 4.1 `org.springframework.boot.health.contributor` 包；Metrics 配置只从 snapshot 注册 gauge。属性前缀为 `disruptor.concurrent`，只包含 `enabled`、`lifecycle-phase` 和 `shutdown-timeout`，不自动创建业务 EventLoop。
+
+- [ ] **Step 5：验证并提交**
 
 ```bash
 $MVN -pl disruptor-spring-boot-autoconfigure -am test
-```
-
-Expected: 有 concurrent 时装配，无 concurrent classpath 时现有 starter 测试仍通过。
-
-- [ ] **Step 5: 提交 Spring 集成**
-
-```bash
+git diff --check
 git add disruptor-spring-boot-autoconfigure
-git commit -m "feat(boot): manage disruptor event loops"
+git commit -m "feat(boot): manage supervised event loops"
 ```
 
-### Task 9: 示例、文档和 Commons 能力审计
+Expected: 无 actuator/health 时基础装配通过，无 Micrometer 时 health 仍通过，三类 metadata 都由真实测试覆盖。
+
+### Task 9：示例、架构文档与 Commons 事实矩阵
 
 **Files:**
 
 - Modify: `README.md`
 - Modify: `docs/disruptor-architecture-design.md`
-- Create: `disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/concurrent/ConcurrentDemo.java`
+- Modify: `docs/superpowers/specs/2026-09-02-disruptor-concurrent-design.md`
 - Modify: `disruptor-spring-boot-example/pom.xml`
-- Modify: `disruptor-spring-boot-example/src/test/java/com/sstlfsj/disruptor/example/ExampleSmokeTest.java`
+- Create: `disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/concurrent/ConcurrentExampleConfiguration.java`
+- Create: `disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/concurrent/OrderEventLoopService.java`
+- Create: `disruptor-spring-boot-example/src/test/java/com/sstlfsj/disruptor/example/concurrent/ConcurrentExampleTest.java`
+- Create: `docs/commons-capability-matrix.md`
 
-- [ ] **Step 1: 添加纯 Java 与 Spring 示例**
+- [ ] **Step 1：写会真实运行的示例测试**
 
-示例必须覆盖 bounded、显式 unbounded、schedule、CancellationToken、Group affinity、模块 hook 和关闭等待；不创建隐藏全局单例。
+Spring 示例显式声明一个 bounded root loop 和一个两 child Group；测试等待 start stage，提交 `ContextCallable`、fixed-rate、dynamic-delay、cancel listener 和 affinity 任务，然后通过 lifecycle 发起共享 deadline 关闭并等待真实 termination。示例不创建 hidden singleton，也不直接关闭 Group child。
 
-- [ ] **Step 2: 更新架构与能力矩阵**
+- [ ] **Step 2：更新用户与维护者文档**
 
-逐项映射 Commons 的 executor、future、scheduler、cancel、context、agent/module、group、bounded/unbounded、raw event、global helper。标准 JDK 等价必须说明语义，不写“完全兼容”。
+README 只说明依赖、启动、普通提交、高级 schedule、shutdown 与 Group owner 规则。架构文档更新最终模块依赖、`SupervisedLifecycle`、标准无界 shutdown 与显式 bounded 运维关闭，不保留旧 `PipelineLifecycle` 或“shutdownNow 返回空列表”的描述。
 
-- [ ] **Step 3: 运行示例测试并提交**
+- [ ] **Step 3：固化 Commons 源码证据矩阵**
+
+`docs/commons-capability-matrix.md` 记录参考 commit `5c831c06` 和具体类/方法证据；dynamic delay 与 priority 标为本项目增强；lazy start、阻塞保护、cancelAfter、parent、factory、local order、Agent phases、ComponentId indexing 分别标为覆盖、项目级替代或不复制。文档明确“不承诺二进制/API 兼容”。
+
+- [ ] **Step 4：验证示例与文档一致性并提交**
 
 ```bash
 $MVN -pl disruptor-spring-boot-example -am test
-git add README.md docs/disruptor-architecture-design.md disruptor-spring-boot-example
-git commit -m "docs: add disruptor concurrent guide"
+rg -n 'PipelineLifecycle|等价覆盖.*Agent' README.md docs/disruptor-architecture-design.md docs/commons-capability-matrix.md
+rg -n '本项目.*shutdownNow.*空列表|完全兼容' README.md docs/disruptor-architecture-design.md docs/commons-capability-matrix.md
+git diff --check
+git add README.md docs disruptor-spring-boot-example
+git commit -m "docs: document supervised concurrent usage"
 ```
 
-### Task 10: JMH 和最终完成审计
+Expected: 示例通过；搜索无过时断言，能力矩阵每行都有明确分类。
+
+### Task 10：JMH 与全仓完成审计
 
 **Files:**
 
 - Modify: `disruptor-benchmarks/pom.xml`
 - Create: `disruptor-benchmarks/src/main/java/com/sstlfsj/disruptor/benchmark/EventLoopBenchmark.java`
+- Create: `disruptor-benchmarks/src/commons/java/com/sstlfsj/disruptor/benchmark/CommonsEventLoopBenchmark.java`
 - Modify: `disruptor-benchmarks/src/main/java/com/sstlfsj/disruptor/benchmark/BenchmarkMain.java`
+- Create: `docs/disruptor-concurrent-verification.md`
 
-- [ ] **Step 1: 添加可运行基准**
+- [ ] **Step 1：写可枚举的基准 smoke test**
 
-同一 benchmark 参数下比较原生 LMAX、core managed try publish、bounded EventLoop、unbounded EventLoop 和 JDK 单线程 executor。Commons 能在本地 reactor 外构建时以独立 profile 加入，否则不增加生产依赖。
+基准类包含相同工作负载下的：原生 LMAX publish/consume、core managed publish、bounded EventLoop、unbounded EventLoop、JDK single-thread executor。先用 JMH runner 的 include 列表和最短配置运行，断言五个基准名称都能被发现并完成。
 
-- [ ] **Step 2: 运行全仓验证**
+- [ ] **Step 2：加入可选 Commons profile**
+
+POM 的 `commons-baseline` profile 只在显式 `-Pcommons-baseline` 时依赖 `cn.wjybxx.commons:commons-concurrent:2.0.0`，并通过 `build-helper-maven-plugin:3.6.1` 把 `src/commons/java` 加入该 profile 的编译源。运行前在参考仓安装当前 commit：
+
+```bash
+$MVN -f /Users/sunke/dev/ai-project/commons/java/pom.xml -pl Commons-Concurrent -am install -DskipTests
+```
+
+默认 reactor 不依赖本机参考仓；profile 缺少本地 artifact 时明确构建失败，不静默跳过后又宣称已比较。
+
+- [ ] **Step 3：运行全仓验证**
 
 ```bash
 $MVN clean verify
 $MVN -pl disruptor-benchmarks -am package
-java -jar disruptor-benchmarks/target/benchmarks.jar -wi 1 -i 2 -f 1
-git diff --check
+java -jar disruptor-benchmarks/target/benchmarks.jar EventLoopBenchmark -wi 1 -i 2 -f 1
+$MVN -pl disruptor-benchmarks -am -Pcommons-baseline package
+java -jar disruptor-benchmarks/target/benchmarks.jar CommonsEventLoopBenchmark -wi 1 -i 2 -f 1
 ```
 
-Expected: 全部测试通过，JMH 五组基准均产生结果；不设置机器敏感硬阈值。
+Expected: 全 reactor `BUILD SUCCESS`；默认五组和 Commons profile 都产生结果。不设置机器敏感的吞吐硬阈值。
 
-- [ ] **Step 3: 执行静态审计**
+- [ ] **Step 4：执行静态边界审计**
 
 ```bash
-rg -n 'System\.(out|err)|TODO|TBD|CallerRuns|DiscardPolicy' disruptor-core disruptor-concurrent disruptor-spring-boot-autoconfigure
-rg -n 'void publishEvent|boolean tryPublishEvent' disruptor-core/src/main/java
+rg -n 'System\.(out|err)|CallerRuns|DiscardPolicy|UnsupportedOperationException' disruptor-core disruptor-concurrent disruptor-spring-boot-autoconfigure
+rg -n 'class EventLoopKernel|class EventLoopWorker|class TaskAdmissionGate|class AcceptedTaskRegistry' disruptor-concurrent/src/main/java
+rg -n 'PipelineLifecycle' disruptor-core/src disruptor-concurrent/src disruptor-spring-boot-autoconfigure/src
+git diff --check
 git status --short
 ```
 
-Expected: 无新增违规、旧受管发布签名已消失、工作区只包含本次计划内变更。
+Expected: 无新增违规或旧生命周期名称；kernel、worker、gate、registry 各只有一个生产实现；工作区只有本任务计划内文件。
 
-- [ ] **Step 4: 对照规格逐项核验并提交**
+- [ ] **Step 5：逐条记录完成证据并提交**
 
-逐条核验两份 spec 的目标、不变量、Commons 能力矩阵和验证项，每项记录对应测试类或基准。存在未验证项时继续实现，不以窄测试代替完整完成。
+`docs/disruptor-concurrent-verification.md` 按设计文档“验证策略”和 Commons 矩阵逐项记录对应测试类、测试方法、JMH 名称或明确的非复制边界。每个 design requirement 必须有直接证据；缺少证据时回到对应 Task 实现，不能用全仓绿灯替代范围证明。
 
 ```bash
-git add disruptor-benchmarks README.md docs disruptor-core disruptor-concurrent disruptor-spring-boot-autoconfigure disruptor-spring-boot-example pom.xml
-git commit -m "perf: benchmark disruptor concurrent executors"
+git add disruptor-benchmarks docs/disruptor-concurrent-verification.md
+git commit -m "perf: verify disruptor concurrent architecture"
+git status --short --branch
 ```
+
+Expected: 最终工作区干净，当前分支包含十个纵向切片的可审计提交。
