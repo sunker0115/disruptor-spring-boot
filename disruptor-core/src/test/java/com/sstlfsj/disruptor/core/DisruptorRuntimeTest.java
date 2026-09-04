@@ -742,47 +742,67 @@ class DisruptorRuntimeTest {
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
         PipelineHandle<TestEvent> handle = runtime.require("publication-boundary", TestEvent.class);
-        runtime.start();
-
-        Thread publisher = Thread.ofPlatform().name("test-publisher").start(() -> {
-            try {
-                PublicationResult result = handle.publishEvent((event, sequence) -> {
-                    translating.countDown();
-                    try {
-                        releaseTranslator.await();
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw new IllegalStateException("发布线程被中断", interrupted);
+        Thread publisher = null;
+        Thread shutdown = null;
+        Throwable testFailure = null;
+        try {
+            runtime.start();
+            publisher = Thread.ofPlatform().name("test-publisher").start(() -> {
+                try {
+                    PublicationResult result = handle.publishEvent((event, sequence) -> {
+                        translating.countDown();
+                        try {
+                            releaseTranslator.await();
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("发布线程被中断", interrupted);
+                        }
+                        event.value = "accepted";
+                    }, PUBLISH_TIMEOUT);
+                    if (result != PublicationResult.PUBLISHED) {
+                        throw new AssertionError("发布失败：" + result);
                     }
-                    event.value = "accepted";
-                }, PUBLISH_TIMEOUT);
-                if (result != PublicationResult.PUBLISHED) {
-                    throw new AssertionError("发布失败：" + result);
+                } catch (Throwable failure) {
+                    publisherFailure.set(failure);
                 }
-            } catch (Throwable failure) {
-                publisherFailure.set(failure);
-            }
-        });
-        assertTrue(translating.await(2, TimeUnit.SECONDS));
+            });
+            assertTrue(translating.await(2, TimeUnit.SECONDS));
 
-        Thread shutdown = Thread.ofPlatform().name("test-shutdown").start(() -> {
+            shutdown = Thread.ofPlatform().name("test-shutdown").start(() -> {
+                try {
+                    runtime.shutdown();
+                } catch (Throwable failure) {
+                    shutdownFailure.set(failure);
+                }
+            });
+            awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
+
+            releaseTranslator.countDown();
+            publisher.join(2_000);
+            shutdown.join(2_000);
+
+            assertFalse(publisher.isAlive());
+            assertFalse(shutdown.isAlive());
+            assertEquals(null, publisherFailure.get());
+            assertEquals(null, shutdownFailure.get());
+            assertEquals(0L, consumed.getCount(), "关闭边界前进入的发布必须被消费");
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
             try {
-                runtime.shutdown();
-            } catch (Throwable failure) {
-                shutdownFailure.set(failure);
+                releaseTranslator.countDown();
+                runtime.haltAsync();
+                interruptAndJoin(publisher);
+                interruptAndJoin(shutdown);
+                runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
             }
-        });
-        awaitCondition(() -> !runtime.isRunning(), Duration.ofSeconds(2));
-
-        releaseTranslator.countDown();
-        publisher.join(2_000);
-        shutdown.join(2_000);
-
-        assertFalse(publisher.isAlive());
-        assertFalse(shutdown.isAlive());
-        assertEquals(null, publisherFailure.get());
-        assertEquals(null, shutdownFailure.get());
-        assertEquals(0L, consumed.getCount(), "关闭边界前进入的发布必须被消费");
+        }
     }
 
     @Test
@@ -803,54 +823,75 @@ class DisruptorRuntimeTest {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
         PipelineHandle<TestEvent> handle = runtime.require(
                 "multi-publication-boundary", TestEvent.class);
-        runtime.start();
-
         Thread[] publishers = new Thread[publisherCount];
-        for (int index = 0; index < publisherCount; index++) {
-            publishers[index] = Thread.ofPlatform().name("multi-publisher-" + index).start(() -> {
-                try {
-                    PublicationResult result = handle.publishEvent((event, sequence) -> {
-                        translating.countDown();
-                        try {
-                            releaseTranslators.await();
-                        } catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                            throw new IllegalStateException("发布线程被中断", interrupted);
+        Thread shutdown = null;
+        Throwable testFailure = null;
+        try {
+            runtime.start();
+            for (int index = 0; index < publisherCount; index++) {
+                publishers[index] = Thread.ofPlatform().name("multi-publisher-" + index).start(() -> {
+                    try {
+                        PublicationResult result = handle.publishEvent((event, sequence) -> {
+                            translating.countDown();
+                            try {
+                                releaseTranslators.await();
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new IllegalStateException("发布线程被中断", interrupted);
+                            }
+                            event.number = sequence;
+                        }, PUBLISH_TIMEOUT);
+                        if (result != PublicationResult.PUBLISHED) {
+                            throw new AssertionError("发布失败：" + result);
                         }
-                        event.number = sequence;
-                    }, PUBLISH_TIMEOUT);
-                    if (result != PublicationResult.PUBLISHED) {
-                        throw new AssertionError("发布失败：" + result);
+                    } catch (Throwable failure) {
+                        publisherFailure.compareAndSet(null, failure);
                     }
+                });
+            }
+            assertTrue(translating.await(2, TimeUnit.SECONDS));
+
+            shutdown = Thread.ofPlatform().name("multi-publisher-shutdown").start(() -> {
+                try {
+                    runtime.shutdown();
                 } catch (Throwable failure) {
-                    publisherFailure.compareAndSet(null, failure);
+                    shutdownFailure.set(failure);
                 }
             });
-        }
-        assertTrue(translating.await(2, TimeUnit.SECONDS));
+            awaitCondition(() -> handle.tryPublishEvent(TRANSLATOR, "probe", 1L)
+                            == PublicationResult.NOT_RUNNING,
+                    Duration.ofSeconds(2));
 
-        Thread shutdown = Thread.ofPlatform().name("multi-publisher-shutdown").start(() -> {
-            try {
-                runtime.shutdown();
-            } catch (Throwable failure) {
-                shutdownFailure.set(failure);
+            releaseTranslators.countDown();
+            for (Thread publisher : publishers) {
+                publisher.join(2_000);
+                assertFalse(publisher.isAlive());
             }
-        });
-        awaitCondition(() -> handle.tryPublishEvent(TRANSLATOR, "probe", 1L)
-                        == PublicationResult.NOT_RUNNING,
-                Duration.ofSeconds(2));
+            shutdown.join(2_000);
 
-        releaseTranslators.countDown();
-        for (Thread publisher : publishers) {
-            publisher.join(2_000);
-            assertFalse(publisher.isAlive());
+            assertFalse(shutdown.isAlive());
+            assertEquals(null, publisherFailure.get());
+            assertEquals(null, shutdownFailure.get());
+            assertEquals(0L, consumed.getCount());
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                releaseTranslators.countDown();
+                runtime.haltAsync();
+                for (Thread publisher : publishers) {
+                    interruptAndJoin(publisher);
+                }
+                interruptAndJoin(shutdown);
+                runtime.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
+            }
         }
-        shutdown.join(2_000);
-
-        assertFalse(shutdown.isAlive());
-        assertEquals(null, publisherFailure.get());
-        assertEquals(null, shutdownFailure.get());
-        assertEquals(0L, consumed.getCount());
     }
 
     @Test
@@ -1104,6 +1145,17 @@ class DisruptorRuntimeTest {
         }
         if (interrupted) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void interruptAndJoin(Thread thread) throws InterruptedException {
+        if (thread == null) {
+            return;
+        }
+        thread.interrupt();
+        thread.join(2_000);
+        if (thread.isAlive()) {
+            throw new AssertionError("清理线程超时：" + thread.getName());
         }
     }
 

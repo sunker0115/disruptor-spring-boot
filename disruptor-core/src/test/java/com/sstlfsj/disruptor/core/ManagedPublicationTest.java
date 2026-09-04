@@ -122,8 +122,14 @@ class ManagedPublicationTest {
 
             assertEquals(PublicationResult.TIMED_OUT,
                     pipeline.handle().publishEvent(translator, Duration.ZERO));
+            long startedAt = System.nanoTime();
             assertEquals(PublicationResult.TIMED_OUT,
                     pipeline.handle().publishEvent(translator, Duration.ofMillis(20)));
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
+            assertTrue(elapsed.compareTo(Duration.ofMillis(20)) >= 0,
+                    "满环等待不能提前越过 deadline，实际=" + elapsed);
+            assertTrue(elapsed.compareTo(Duration.ofSeconds(1)) < 0,
+                    "满环等待必须在有界 deadline 后返回，实际=" + elapsed);
             assertEquals(0, translations.get());
             assertThrows(IllegalArgumentException.class,
                     () -> pipeline.handle().publishEvent(translator, Duration.ofNanos(-1)));

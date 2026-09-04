@@ -98,6 +98,131 @@ class DisruptorPipelineTest {
     }
 
     @Test
+    void startupWorkerFailureClosesNewGateBeforeSupervisorSettlesAndPreservesCause()
+            throws Throwable {
+        IllegalStateException original = new IllegalStateException("startup worker failed");
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch failWorker = new CountDownLatch(1);
+        CountDownLatch threadStarted = new CountDownLatch(1);
+        CountDownLatch allowStartReturn = new CountDownLatch(1);
+        CountDownLatch supervisorLockHeld = new CountDownLatch(1);
+        CountDownLatch releaseSupervisorLock = new CountDownLatch(1);
+        AtomicReference<Thread> workerThread = new AtomicReference<>();
+        AtomicReference<Thread> supervisorLockHolder = new AtomicReference<>();
+        AtomicReference<CompletionStage<Void>> startStage = new AtomicReference<>();
+        AtomicReference<Throwable> startInvocationFailure = new AtomicReference<>();
+        EventProcessor processor = new EventProcessor() {
+            private final Sequence sequence = new Sequence();
+
+            @Override
+            public Sequence getSequence() {
+                return sequence;
+            }
+
+            @Override
+            public void halt() {
+                failWorker.countDown();
+            }
+
+            @Override
+            public boolean isRunning() {
+                return workerEntered.getCount() == 0L && failWorker.getCount() != 0L;
+            }
+
+            @Override
+            public void run() {
+                workerEntered.countDown();
+                awaitUninterruptibly(failWorker);
+                throw original;
+            }
+        };
+        PipelineSpec<TestEvent> spec = PipelineSpec.builder(
+                        "startup-worker-failure-window", TestEvent.class, TestEvent::new)
+                .threadFactory(runnable -> {
+                    Thread thread = new Thread(runnable, "startup-worker-failure-window") {
+                        @Override
+                        public synchronized void start() {
+                            super.start();
+                            threadStarted.countDown();
+                            awaitUninterruptibly(allowStartReturn);
+                        }
+                    };
+                    thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+                    workerThread.set(thread);
+                    return thread;
+                })
+                .topology(disruptor -> disruptor.handleEventsWith(processor))
+                .build();
+        DisruptorPipeline<TestEvent> pipeline = pipeline(spec);
+        Thread starter = Thread.ofPlatform().name("startup-worker-failure-starter").start(() -> {
+            try {
+                startStage.set(pipeline.start());
+            } catch (Throwable failure) {
+                startInvocationFailure.set(failure);
+            }
+        });
+        Throwable testFailure = null;
+        try {
+            assertTrue(threadStarted.await(2, TimeUnit.SECONDS));
+            assertTrue(workerEntered.await(2, TimeUnit.SECONDS));
+            Object lifecycleLock = lifecycleLock(pipeline);
+            Object supervisorStateLock = supervisorStateLock(pipeline);
+            synchronized (lifecycleLock) {
+                failWorker.countDown();
+                awaitThreadState(workerThread.get(), Thread.State.BLOCKED);
+                Thread lockHolder = Thread.ofPlatform()
+                        .name("startup-worker-failure-supervisor-lock")
+                        .start(() -> {
+                            synchronized (supervisorStateLock) {
+                                supervisorLockHeld.countDown();
+                                awaitUninterruptibly(releaseSupervisorLock);
+                            }
+                        });
+                supervisorLockHolder.set(lockHolder);
+                assertTrue(supervisorLockHeld.await(2, TimeUnit.SECONDS));
+            }
+
+            awaitWorkerFailurePending(pipeline);
+            assertEquals(PublicationResult.PIPELINE_FAILED,
+                    pipeline.handle().tryPublishEvent((event, sequence) -> { }),
+                    "supervisor 尚未锁存首因时，NEW gate 也必须明确报告管道故障");
+
+            releaseSupervisorLock.countDown();
+            allowStartReturn.countDown();
+            starter.join(2_000);
+            assertFalse(starter.isAlive());
+            assertNull(startInvocationFailure.get());
+            CompletionException startupFailure = assertThrows(CompletionException.class,
+                    () -> startStage.get().toCompletableFuture().join());
+            assertSame(original, startupFailure.getCause());
+            PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                    .get(2, TimeUnit.SECONDS);
+            assertSame(original, terminated.failure());
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
+            try {
+                failWorker.countDown();
+                releaseSupervisorLock.countDown();
+                allowStartReturn.countDown();
+                pipeline.requestShutdown(ShutdownMode.IMMEDIATE,
+                        ShutdownDeadline.after(Duration.ofSeconds(2)));
+                Thread lockHolder = supervisorLockHolder.get();
+                interruptAndJoin(lockHolder);
+                interruptAndJoin(starter);
+                interruptAndJoin(workerThread.get());
+                pipeline.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
+            }
+        }
+    }
+
+    @Test
     void doesNotCaptureDrainCursorUntilEveryAdmittedPublisherReturns() throws Exception {
         ObservingProcessor processor = new ObservingProcessor();
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
@@ -105,38 +230,59 @@ class DisruptorPipelineTest {
                 .topology(disruptor -> disruptor.handleEventsWith(processor))
                 .build();
         DisruptorPipeline<TestEvent> pipeline = pipeline(spec);
-        pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
         CountDownLatch translating = new CountDownLatch(1);
         CountDownLatch releaseTranslator = new CountDownLatch(1);
         AtomicReference<Throwable> publicationFailure = new AtomicReference<>();
-        Thread publisher = Thread.ofPlatform().start(() -> {
+        Thread publisher = null;
+        Throwable testFailure = null;
+        try {
+            pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            publisher = Thread.ofPlatform().start(() -> {
+                try {
+                    assertEquals(PublicationResult.PUBLISHED, pipeline.handle().publishEvent(
+                            (event, sequence) -> {
+                                translating.countDown();
+                                awaitUninterruptibly(releaseTranslator);
+                            }, Duration.ofSeconds(2)));
+                } catch (Throwable failure) {
+                    publicationFailure.set(failure);
+                }
+            });
+            assertTrue(translating.await(2, TimeUnit.SECONDS));
+
+            processor.sequence.observe();
+            pipeline.requestShutdown(ShutdownMode.GRACEFUL,
+                    ShutdownDeadline.after(Duration.ofSeconds(2)));
+
+            assertFalse(processor.sequence.awaitRead(Duration.ofMillis(100)),
+                    "在途 publisher 返回前不得捕获 drain cursor 或读取叶子 gating sequence");
+            releaseTranslator.countDown();
+            assertTrue(processor.sequence.awaitRead(Duration.ofSeconds(2)));
+            publisher.join(2_000);
+            assertFalse(publisher.isAlive());
+            assertNull(publicationFailure.get());
+            processor.sequence.set(0L);
+
+            PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
+                    .get(2, TimeUnit.SECONDS);
+            assertTrue(terminated.gracefulTermination());
+        } catch (Throwable failure) {
+            testFailure = failure;
+            throw failure;
+        } finally {
             try {
-                assertEquals(PublicationResult.PUBLISHED, pipeline.handle().publishEvent(
-                        (event, sequence) -> {
-                            translating.countDown();
-                            awaitUninterruptibly(releaseTranslator);
-                        }, Duration.ofSeconds(2)));
-            } catch (Throwable failure) {
-                publicationFailure.set(failure);
+                releaseTranslator.countDown();
+                pipeline.requestShutdown(ShutdownMode.IMMEDIATE,
+                        ShutdownDeadline.after(Duration.ofSeconds(2)));
+                interruptAndJoin(publisher);
+                pipeline.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            } catch (Throwable cleanupFailure) {
+                if (testFailure == null) {
+                    throw cleanupFailure;
+                }
+                testFailure.addSuppressed(cleanupFailure);
             }
-        });
-        assertTrue(translating.await(2, TimeUnit.SECONDS));
-
-        processor.sequence.observe();
-        pipeline.requestShutdown(ShutdownMode.GRACEFUL,
-                ShutdownDeadline.after(Duration.ofSeconds(2)));
-
-        assertFalse(processor.sequence.awaitRead(Duration.ofMillis(100)),
-                "在途 publisher 返回前不得捕获 drain cursor 或读取叶子 gating sequence");
-        releaseTranslator.countDown();
-        assertTrue(processor.sequence.awaitRead(Duration.ofSeconds(2)));
-        publisher.join(2_000);
-        assertNull(publicationFailure.get());
-        processor.sequence.set(0L);
-
-        PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
-                .get(2, TimeUnit.SECONDS);
-        assertTrue(terminated.gracefulTermination());
+        }
     }
 
     @Test
@@ -463,6 +609,17 @@ class DisruptorPipelineTest {
         }
     }
 
+    private static void interruptAndJoin(Thread thread) throws InterruptedException {
+        if (thread == null) {
+            return;
+        }
+        thread.interrupt();
+        thread.join(2_000);
+        if (thread.isAlive()) {
+            throw new AssertionError("清理线程超时：" + thread.getName());
+        }
+    }
+
     private static Object lifecycleLock(DisruptorPipeline<?> pipeline) {
         try {
             var field = pipeline.getClass().getDeclaredField("lifecycleLock");
@@ -471,6 +628,49 @@ class DisruptorPipelineTest {
         } catch (ReflectiveOperationException failure) {
             throw new AssertionError("无法读取 ManagedPipeline 生命周期锁", failure);
         }
+    }
+
+    private static Object supervisorStateLock(DisruptorPipeline<?> pipeline) {
+        try {
+            var supervisorField = pipeline.getClass().getDeclaredField("supervisor");
+            supervisorField.setAccessible(true);
+            Object supervisor = supervisorField.get(pipeline);
+            var stateLockField = supervisor.getClass().getDeclaredField("stateLock");
+            stateLockField.setAccessible(true);
+            return stateLockField.get(supervisor);
+        } catch (ReflectiveOperationException failure) {
+            throw new AssertionError("无法读取 WorkerSupervisor 状态锁", failure);
+        }
+    }
+
+    private static void awaitWorkerFailurePending(DisruptorPipeline<?> pipeline) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+        while (!workerFailurePending(pipeline) && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertTrue(workerFailurePending(pipeline));
+    }
+
+    private static boolean workerFailurePending(DisruptorPipeline<?> pipeline) {
+        Object lifecycleLock = lifecycleLock(pipeline);
+        synchronized (lifecycleLock) {
+            try {
+                var field = pipeline.getClass().getDeclaredField("workerFailurePending");
+                field.setAccessible(true);
+                Object pending = field.get(pipeline);
+                return pending instanceof Boolean value ? value : pending != null;
+            } catch (ReflectiveOperationException failure) {
+                throw new AssertionError("无法读取 worker failure pending 状态", failure);
+            }
+        }
+    }
+
+    private static void awaitThreadState(Thread thread, Thread.State state) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos();
+        while (thread.getState() != state && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertEquals(state, thread.getState());
     }
 
     private static class ObservingProcessor implements EventProcessor {

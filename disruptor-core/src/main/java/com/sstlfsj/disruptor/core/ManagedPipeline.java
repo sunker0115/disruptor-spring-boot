@@ -37,6 +37,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     private final CompletionStage<Void> startedView = started.minimalCompletionStage();
     private final CompletableFuture<PipelineSnapshot> terminated = new CompletableFuture<>();
     private final CompletionStage<PipelineSnapshot> terminatedView = terminated.minimalCompletionStage();
+    private final CompletableFuture<Void> workerExitSettled = new CompletableFuture<>();
     private final Set<Thread> publicationWaiters =
             Collections.newSetFromMap(new IdentityHashMap<>());
 
@@ -62,7 +63,10 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 .shutdownTimeout(shutdownTimeout)
                 .shutdownBackend(new LmaxShutdownBackend())
                 .build();
-        threadFactory.bind(supervisor, this::closePublicationGateAfterWorkerExit);
+        threadFactory.bind(
+                supervisor,
+                this::closePublicationGateBeforeWorkerExit,
+                () -> workerExitSettled.complete(null));
         supervisor.termination().whenComplete((workerSnapshot, failure) -> {
             if (failure != null) {
                 terminated.completeExceptionally(unwrap(failure));
@@ -169,13 +173,18 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     private void completeStart(Throwable startupFailure) {
         Throwable completionFailure = null;
         boolean failSupervisor = false;
+        boolean awaitWorkerExitSettlement = false;
         if (startupFailure != null) {
             completionFailure = unwrap(startupFailure);
             closePublicationGate();
         } else {
             synchronized (lifecycleLock) {
                 if (publicationGate == PublicationGate.CLOSED) {
-                    completionFailure = startupFailureFromSupervisor();
+                    if (workerFailurePending && !workerExitSettled.isDone()) {
+                        awaitWorkerExitSettlement = true;
+                    } else {
+                        completionFailure = startupFailureFromSupervisor();
+                    }
                 } else {
                     try {
                         supervisor.markRunning();
@@ -191,6 +200,10 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     }
                 }
             }
+        }
+        if (awaitWorkerExitSettlement) {
+            workerExitSettled.whenComplete((ignored, failure) -> completeStart(failure));
+            return;
         }
         if (completionFailure == null) {
             started.complete(null);
@@ -261,7 +274,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     }
 
     private PublicationResult beforePublicationAttempt(
-            long deadlineNanos,
+            MonotonicDeadline deadline,
             boolean allowExpiredAttempt)
             throws InterruptedException {
         if (Thread.interrupted()) {
@@ -271,12 +284,12 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         if (state != null) {
             return state;
         }
-        return !allowExpiredAttempt && remainingNanos(deadlineNanos) == 0L
+        return !allowExpiredAttempt && deadline.isExpired()
                 ? PublicationResult.TIMED_OUT
                 : null;
     }
 
-    private PublicationResult awaitPublicationRetry(long deadlineNanos)
+    private PublicationResult awaitPublicationRetry(MonotonicDeadline deadline)
             throws InterruptedException {
         if (Thread.interrupted()) {
             throw new InterruptedException("等待管道 '" + name + "' 发布容量时被中断");
@@ -285,7 +298,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         if (publicationState != null) {
             return publicationState;
         }
-        long remaining = remainingNanos(deadlineNanos);
+        long remaining = deadline.remainingNanos();
         if (remaining == 0L) {
             return PublicationResult.TIMED_OUT;
         }
@@ -294,30 +307,6 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             throw new InterruptedException("等待管道 '" + name + "' 发布容量时被中断");
         }
         return null;
-    }
-
-    private static long publicationDeadline(Duration timeout) {
-        Objects.requireNonNull(timeout, "timeout 不能为空");
-        if (timeout.isNegative()) {
-            throw new IllegalArgumentException("timeout 不能为负数，实际值=" + timeout);
-        }
-        long timeoutNanos;
-        try {
-            timeoutNanos = timeout.toNanos();
-        } catch (ArithmeticException overflow) {
-            timeoutNanos = Long.MAX_VALUE;
-        }
-        long now = System.nanoTime();
-        try {
-            return Math.addExact(now, timeoutNanos);
-        } catch (ArithmeticException overflow) {
-            return Long.MAX_VALUE;
-        }
-    }
-
-    private static long remainingNanos(long deadlineNanos) {
-        long remaining = deadlineNanos - System.nanoTime();
-        return remaining > 0L ? remaining : 0L;
     }
 
     private void registerPublicationWaiter(Thread publisher) {
@@ -351,9 +340,9 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         }
     }
 
-    private void closePublicationGateAfterWorkerExit() {
+    private void closePublicationGateBeforeWorkerExit() {
         synchronized (lifecycleLock) {
-            if (publicationGate == PublicationGate.OPEN) {
+            if (publicationGate != PublicationGate.CLOSED) {
                 workerFailurePending = true;
             }
             closePublicationGateLocked();
@@ -445,7 +434,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         public PublicationResult publishEvent(EventTranslator<E> translator, Duration timeout)
                 throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            long deadlineNanos = publicationDeadline(timeout);
+            MonotonicDeadline deadline = MonotonicDeadline.after(timeout);
             boolean allowExpiredAttempt = timeout.isZero();
             PublicationResult admission = enterPublisher();
             if (admission != PublicationResult.PUBLISHED) {
@@ -456,7 +445,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             try {
                 while (true) {
                     PublicationResult state = beforePublicationAttempt(
-                            deadlineNanos, allowExpiredAttempt);
+                            deadline, allowExpiredAttempt);
                     allowExpiredAttempt = false;
                     if (state != null) {
                         return state;
@@ -464,7 +453,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     if (ringBuffer.tryPublishEvent(translator)) {
                         return PublicationResult.PUBLISHED;
                     }
-                    state = awaitPublicationRetry(deadlineNanos);
+                    state = awaitPublicationRetry(deadline);
                     if (state != null) {
                         return state;
                     }
@@ -497,7 +486,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 EventTranslatorOneArg<E, A> translator, A arg0, Duration timeout)
                 throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            long deadlineNanos = publicationDeadline(timeout);
+            MonotonicDeadline deadline = MonotonicDeadline.after(timeout);
             boolean allowExpiredAttempt = timeout.isZero();
             PublicationResult admission = enterPublisher();
             if (admission != PublicationResult.PUBLISHED) {
@@ -508,7 +497,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             try {
                 while (true) {
                     PublicationResult state = beforePublicationAttempt(
-                            deadlineNanos, allowExpiredAttempt);
+                            deadline, allowExpiredAttempt);
                     allowExpiredAttempt = false;
                     if (state != null) {
                         return state;
@@ -516,7 +505,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     if (ringBuffer.tryPublishEvent(translator, arg0)) {
                         return PublicationResult.PUBLISHED;
                     }
-                    state = awaitPublicationRetry(deadlineNanos);
+                    state = awaitPublicationRetry(deadline);
                     if (state != null) {
                         return state;
                     }
@@ -549,7 +538,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1, Duration timeout)
                 throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            long deadlineNanos = publicationDeadline(timeout);
+            MonotonicDeadline deadline = MonotonicDeadline.after(timeout);
             boolean allowExpiredAttempt = timeout.isZero();
             PublicationResult admission = enterPublisher();
             if (admission != PublicationResult.PUBLISHED) {
@@ -560,7 +549,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             try {
                 while (true) {
                     PublicationResult state = beforePublicationAttempt(
-                            deadlineNanos, allowExpiredAttempt);
+                            deadline, allowExpiredAttempt);
                     allowExpiredAttempt = false;
                     if (state != null) {
                         return state;
@@ -568,7 +557,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     if (ringBuffer.tryPublishEvent(translator, arg0, arg1)) {
                         return PublicationResult.PUBLISHED;
                     }
-                    state = awaitPublicationRetry(deadlineNanos);
+                    state = awaitPublicationRetry(deadline);
                     if (state != null) {
                         return state;
                     }
@@ -601,7 +590,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 EventTranslatorThreeArg<E, A, B, C> translator,
                 A arg0, B arg1, C arg2, Duration timeout) throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            long deadlineNanos = publicationDeadline(timeout);
+            MonotonicDeadline deadline = MonotonicDeadline.after(timeout);
             boolean allowExpiredAttempt = timeout.isZero();
             PublicationResult admission = enterPublisher();
             if (admission != PublicationResult.PUBLISHED) {
@@ -612,7 +601,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
             try {
                 while (true) {
                     PublicationResult state = beforePublicationAttempt(
-                            deadlineNanos, allowExpiredAttempt);
+                            deadline, allowExpiredAttempt);
                     allowExpiredAttempt = false;
                     if (state != null) {
                         return state;
@@ -620,7 +609,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                     if (ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2)) {
                         return PublicationResult.PUBLISHED;
                     }
-                    state = awaitPublicationRetry(deadlineNanos);
+                    state = awaitPublicationRetry(deadline);
                     if (state != null) {
                         return state;
                     }
@@ -642,6 +631,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         private final ThreadFactory delegate;
         private WorkerSupervisor supervisor;
         private Runnable closePublicationGate;
+        private Runnable settleWorkerExit;
         private boolean enabled;
 
         private SupervisingThreadFactory(ThreadFactory delegate) {
@@ -650,13 +640,16 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
         private synchronized void bind(
                 WorkerSupervisor supervisor,
-                Runnable closePublicationGate) {
+                Runnable closePublicationGate,
+                Runnable settleWorkerExit) {
             if (this.supervisor != null) {
                 throw new IllegalStateException("supervisor 已绑定");
             }
             this.supervisor = Objects.requireNonNull(supervisor, "supervisor 不能为空");
             this.closePublicationGate = Objects.requireNonNull(
                     closePublicationGate, "closePublicationGate 不能为空");
+            this.settleWorkerExit = Objects.requireNonNull(
+                    settleWorkerExit, "settleWorkerExit 不能为空");
         }
 
         private synchronized void enable() {
@@ -667,12 +660,14 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         public Thread newThread(Runnable runnable) {
             WorkerSupervisor currentSupervisor;
             Runnable currentClosePublicationGate;
+            Runnable currentSettleWorkerExit;
             synchronized (this) {
                 if (!enabled || supervisor == null) {
                     throw new IllegalStateException("线程只能由 DisruptorPipeline.start() 创建");
                 }
                 currentSupervisor = supervisor;
                 currentClosePublicationGate = closePublicationGate;
+                currentSettleWorkerExit = settleWorkerExit;
             }
             Runnable monitoredWorker = () -> {
                 try {
@@ -682,8 +677,15 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 }
             };
             Runnable supervisedWorker = currentSupervisor.supervise(monitoredWorker);
+            Runnable settledWorker = () -> {
+                try {
+                    supervisedWorker.run();
+                } finally {
+                    currentSettleWorkerExit.run();
+                }
+            };
             Thread thread = Objects.requireNonNull(
-                    delegate.newThread(supervisedWorker),
+                    delegate.newThread(settledWorker),
                     "threadFactory 不能返回 null");
             currentSupervisor.register(thread);
             return thread;

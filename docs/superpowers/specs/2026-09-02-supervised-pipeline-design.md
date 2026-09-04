@@ -114,6 +114,8 @@ LMAX 管道的启动顺序是：
 6. 启动前关闭通过 `markStarting + sealWorkers` 显式封口零 worker，启动 stage 异常完成，后续重复 `start()` 返回同一个失败 stage；
 7. 任一步失败都锁存原始首因并使用同一 lifecycle 进入 `IMMEDIATE` 回滚。
 
+worker 提前退出固定按“关闭发布 gate 并标记 pending failure → supervisor 锁存首因→发布 worker-exit settled”的顺序收敛。若启动成功通知与该退出并发，启动完成必须等到 settled 后读取 supervisor 的真实首因，不得用合成的启动取消异常覆盖它。
+
 这样支持 LMAX 任意原生 topology，不依赖反射读取 ConsumerRepository，也不把线程已创建误认为线程已运行。
 
 ### 发布协议
@@ -144,7 +146,7 @@ PublicationResult publishEvent(..., Duration timeout) throws InterruptedExceptio
 
 ### deadline、首因与真实终止
 
-`ShutdownDeadline.after(Duration)` 使用饱和加法生成绝对 `deadlineNanos`。第一次关闭请求或自主故障冻结 deadline，重复请求和 `IMMEDIATE` 升级不得延长。独立管道/EventLoop 使用自己的默认 shutdown timeout；Runtime/Group 在首次请求前创建一个共享 deadline 并传给全部 child。
+core 内部只使用一套单调 deadline 实现：保存 `startNanos + budgetNanos`，以 `now - startNanos` 的 elapsed 差值判定剩余时间，因而允许 `System.nanoTime()` 正向回绕；`Duration` 转纳秒溢出时只饱和预算，不把绝对时点截断为 `Long.MAX_VALUE`。`ShutdownDeadline` 与有界发布共用该实现。第一次关闭请求或自主故障冻结 deadline，重复请求和 `IMMEDIATE` 升级不得延长。独立管道/EventLoop 使用自己的默认 shutdown timeout；Runtime/Group 在首次请求前创建一个共享 deadline 并传给全部 child。
 
 控制线程只做非阻塞 drain probe 和有界等待，因此 deadline 不会被后端排空回调卡住。外部 `IMMEDIATE` 请求在线性化点直接关闭准入、把 `QUIESCING` 升级为 `STOPPING` 并唤醒控制线程；控制线程随后先串行执行 immediate stop，再中断仍存活 worker。即使 stop 抛错，中断也在其 `finally` 路径执行。这样 LMAX 会先通过 halt/alert 结束正常等待，不会把监督器主动中断误报为消费故障。
 
