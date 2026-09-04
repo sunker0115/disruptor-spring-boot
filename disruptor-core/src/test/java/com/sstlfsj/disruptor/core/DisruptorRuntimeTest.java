@@ -41,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DisruptorRuntimeTest {
 
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(2);
     private static final EventTranslatorTwoArg<TestEvent, String, Long> TRANSLATOR =
             (event, sequence, value, number) -> {
                 event.value = value;
@@ -105,7 +106,8 @@ class DisruptorRuntimeTest {
 
         runtime.start();
         assertTrue(started.await(2, TimeUnit.SECONDS));
-        handle.publishEvent(TRANSLATOR, "order-1", 42L);
+        assertEquals(PublicationResult.PUBLISHED,
+                handle.publishEvent(TRANSLATOR, "order-1", 42L, PUBLISH_TIMEOUT));
 
         assertTrue(consumed.await(2, TimeUnit.SECONDS));
         assertEquals(0L, seenSequence.get());
@@ -405,8 +407,9 @@ class DisruptorRuntimeTest {
                 .build();
         runtime.start();
         try {
-            runtime.require("api-boundary", TestEvent.class)
-                    .publishEvent(TRANSLATOR, "blocked", 1L);
+            assertEquals(PublicationResult.PUBLISHED,
+                    runtime.require("api-boundary", TestEvent.class)
+                            .publishEvent(TRANSLATOR, "blocked", 1L, PUBLISH_TIMEOUT));
             assertTrue(handlerEntered.await(2, TimeUnit.SECONDS));
             Object pipelineLock = lifecycleLock(
                     runtime.requirePipeline("api-boundary", TestEvent.class));
@@ -571,7 +574,7 @@ class DisruptorRuntimeTest {
         PipelineHandle<TestEvent> handle = runtime.require("publish-null", TestEvent.class);
         long cursor = handle.unsafeRingBuffer().getCursor();
 
-        assertThrows(NullPointerException.class, () -> handle.publish(null));
+        assertThrows(NullPointerException.class, () -> handle.publish(null, PUBLISH_TIMEOUT));
         assertEquals(cursor, handle.unsafeRingBuffer().getCursor());
         assertThrows(NullPointerException.class, () -> handle.tryPublish(null));
         assertEquals(cursor, handle.unsafeRingBuffer().getCursor());
@@ -594,7 +597,7 @@ class DisruptorRuntimeTest {
         runtime.start();
         assertThrows(IllegalStateException.class, () -> handle.publish(event -> {
             throw new IllegalStateException("boom");
-        }));
+        }, PUBLISH_TIMEOUT));
         assertEquals(0L, handle.unsafeRingBuffer().getCursor());
 
         runtime.shutdown();
@@ -619,7 +622,9 @@ class DisruptorRuntimeTest {
 
         runtime.start();
         try {
-            runtime.require("slow", TestEvent.class).publishEvent(TRANSLATOR, "x", 1L);
+            assertEquals(PublicationResult.PUBLISHED,
+                    runtime.require("slow", TestEvent.class).publishEvent(
+                            TRANSLATOR, "x", 1L, PUBLISH_TIMEOUT));
             assertTrue(entered.await(2, TimeUnit.SECONDS));
             // handler 卡死，shutdown 必须在超时后强制 halt 返回，而不是永久阻塞。
             assertTimeoutPreemptively(Duration.ofSeconds(3), () ->
@@ -700,7 +705,8 @@ class DisruptorRuntimeTest {
         start.get(2, TimeUnit.SECONDS);
         PipelineHandle<TestEvent> handle = runtime.require("drain", TestEvent.class);
         for (int i = 0; i < total; i++) {
-            handle.publishEvent(TRANSLATOR, "v", (long) i);
+            assertEquals(PublicationResult.PUBLISHED,
+                    handle.publishEvent(TRANSLATOR, "v", (long) i, PUBLISH_TIMEOUT));
         }
 
         Thread shutdown = Thread.ofPlatform().name("delayed-consumer-shutdown").start(() -> {
@@ -740,7 +746,7 @@ class DisruptorRuntimeTest {
 
         Thread publisher = Thread.ofPlatform().name("test-publisher").start(() -> {
             try {
-                handle.publishEvent((event, sequence) -> {
+                PublicationResult result = handle.publishEvent((event, sequence) -> {
                     translating.countDown();
                     try {
                         releaseTranslator.await();
@@ -749,7 +755,10 @@ class DisruptorRuntimeTest {
                         throw new IllegalStateException("发布线程被中断", interrupted);
                     }
                     event.value = "accepted";
-                });
+                }, PUBLISH_TIMEOUT);
+                if (result != PublicationResult.PUBLISHED) {
+                    throw new AssertionError("发布失败：" + result);
+                }
             } catch (Throwable failure) {
                 publisherFailure.set(failure);
             }
@@ -800,7 +809,7 @@ class DisruptorRuntimeTest {
         for (int index = 0; index < publisherCount; index++) {
             publishers[index] = Thread.ofPlatform().name("multi-publisher-" + index).start(() -> {
                 try {
-                    handle.publishEvent((event, sequence) -> {
+                    PublicationResult result = handle.publishEvent((event, sequence) -> {
                         translating.countDown();
                         try {
                             releaseTranslators.await();
@@ -809,7 +818,10 @@ class DisruptorRuntimeTest {
                             throw new IllegalStateException("发布线程被中断", interrupted);
                         }
                         event.number = sequence;
-                    });
+                    }, PUBLISH_TIMEOUT);
+                    if (result != PublicationResult.PUBLISHED) {
+                        throw new AssertionError("发布失败：" + result);
+                    }
                 } catch (Throwable failure) {
                     publisherFailure.compareAndSet(null, failure);
                 }
@@ -824,7 +836,8 @@ class DisruptorRuntimeTest {
                 shutdownFailure.set(failure);
             }
         });
-        awaitCondition(() -> !handle.tryPublishEvent(TRANSLATOR, "probe", 1L),
+        awaitCondition(() -> handle.tryPublishEvent(TRANSLATOR, "probe", 1L)
+                        == PublicationResult.NOT_RUNNING,
                 Duration.ofSeconds(2));
 
         releaseTranslators.countDown();
@@ -861,7 +874,9 @@ class DisruptorRuntimeTest {
         PipelineHandle<TestEvent> secondHandle = runtime.require("second", TestEvent.class);
 
         runtime.start();
-        secondHandle.publishEvent(TRANSLATOR, "blocking", 1L);
+        assertEquals(PublicationResult.PUBLISHED,
+                secondHandle.publishEvent(
+                        TRANSLATOR, "blocking", 1L, PUBLISH_TIMEOUT));
         assertTrue(secondHandlerEntered.await(2, TimeUnit.SECONDS));
 
         Thread shutdown = Thread.ofPlatform().name("multi-pipeline-shutdown").start(() -> {
@@ -871,10 +886,12 @@ class DisruptorRuntimeTest {
                 shutdownFailure.set(failure);
             }
         });
-        awaitCondition(() -> !secondHandle.tryPublishEvent(TRANSLATOR, "probe", 2L),
+        awaitCondition(() -> secondHandle.tryPublishEvent(TRANSLATOR, "probe", 2L)
+                        == PublicationResult.NOT_RUNNING,
                 Duration.ofSeconds(2));
 
-        assertFalse(firstHandle.tryPublishEvent(TRANSLATOR, "late", 3L),
+        assertEquals(PublicationResult.NOT_RUNNING,
+                firstHandle.tryPublishEvent(TRANSLATOR, "late", 3L),
                 "排空任一管道前必须先关闭全部受管发布入口");
 
         releaseSecondHandler.countDown();
@@ -885,21 +902,24 @@ class DisruptorRuntimeTest {
     }
 
     @Test
-    void rejectsManagedPublishingOutsideRunningState() {
+    void rejectsManagedPublishingOutsideRunningState() throws Exception {
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec("managed-state")).build();
         PipelineHandle<TestEvent> handle = runtime.require("managed-state", TestEvent.class);
 
-        assertFalse(handle.tryPublishEvent(TRANSLATOR, "before", 1L));
-        assertThrows(IllegalStateException.class,
-                () -> handle.publishEvent(TRANSLATOR, "before", 1L));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                handle.tryPublishEvent(TRANSLATOR, "before", 1L));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                handle.publishEvent(TRANSLATOR, "before", 1L, PUBLISH_TIMEOUT));
 
         runtime.start();
-        assertTrue(handle.tryPublishEvent(TRANSLATOR, "running", 2L));
+        assertEquals(PublicationResult.PUBLISHED,
+                handle.tryPublishEvent(TRANSLATOR, "running", 2L));
         runtime.shutdown();
 
-        assertFalse(handle.tryPublishEvent(TRANSLATOR, "after", 3L));
-        assertThrows(IllegalStateException.class,
-                () -> handle.publishEvent(TRANSLATOR, "after", 3L));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                handle.tryPublishEvent(TRANSLATOR, "after", 3L));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                handle.publishEvent(TRANSLATOR, "after", 3L, PUBLISH_TIMEOUT));
     }
 
     @Test
@@ -923,10 +943,13 @@ class DisruptorRuntimeTest {
                 };
 
         runtime.start();
-        handle.publishEvent(zero);
-        assertTrue(handle.tryPublishEvent(one, 1L));
-        handle.publishEvent(TRANSLATOR, "two", 2L);
-        assertTrue(handle.tryPublishEvent(three, "three", 3L, true));
+        assertEquals(PublicationResult.PUBLISHED,
+                handle.publishEvent(zero, PUBLISH_TIMEOUT));
+        assertEquals(PublicationResult.PUBLISHED, handle.tryPublishEvent(one, 1L));
+        assertEquals(PublicationResult.PUBLISHED,
+                handle.publishEvent(TRANSLATOR, "two", 2L, PUBLISH_TIMEOUT));
+        assertEquals(PublicationResult.PUBLISHED,
+                handle.tryPublishEvent(three, "three", 3L, true));
 
         assertTrue(consumed.await(2, TimeUnit.SECONDS));
         runtime.shutdown();
@@ -984,7 +1007,8 @@ class DisruptorRuntimeTest {
         PipelineHandle<TestEvent> healthyHandle = runtime.require("healthy", TestEvent.class);
         runtime.start();
 
-        failingHandle.publishEvent(TRANSLATOR, "fail", 1L);
+        assertEquals(PublicationResult.PUBLISHED,
+                failingHandle.publishEvent(TRANSLATOR, "fail", 1L, PUBLISH_TIMEOUT));
 
         assertTrue(failedHandlerEntered.await(2, TimeUnit.SECONDS));
         awaitCondition(() -> failingHandle.snapshot().lifecycle() == PipelineLifecycle.TERMINATED,
@@ -992,7 +1016,8 @@ class DisruptorRuntimeTest {
         assertEquals(PipelineHealth.TERMINATED, failingHandle.snapshot().health());
         assertNotNull(failingHandle.snapshot().failure());
         assertEquals(PipelineHealth.HEALTHY, healthyHandle.snapshot().health());
-        assertTrue(healthyHandle.tryPublishEvent(TRANSLATOR, "still-running", 2L));
+        assertEquals(PublicationResult.PUBLISHED,
+                healthyHandle.tryPublishEvent(TRANSLATOR, "still-running", 2L));
 
         assertThrows(DisruptorShutdownException.class, runtime::halt,
                 "已锁存的 consumer 基础设施故障必须进入 Runtime 聚合结果");
@@ -1021,7 +1046,9 @@ class DisruptorRuntimeTest {
             for (PipelineHandle<?> rawHandle : runtime.handles()) {
                 @SuppressWarnings("unchecked")
                 PipelineHandle<TestEvent> handle = (PipelineHandle<TestEvent>) rawHandle;
-                handle.publishEvent(TRANSLATOR, "blocked", 1L);
+                assertEquals(PublicationResult.PUBLISHED,
+                        handle.publishEvent(
+                                TRANSLATOR, "blocked", 1L, PUBLISH_TIMEOUT));
             }
             assertTrue(handlersEntered.await(2, TimeUnit.SECONDS));
 
@@ -1250,31 +1277,34 @@ class DisruptorRuntimeTest {
         }
 
         @Override
-        public void publishEvent(EventTranslator<TestEvent> translator) {
+        public PublicationResult tryPublishEvent(EventTranslator<TestEvent> translator) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public boolean tryPublishEvent(EventTranslator<TestEvent> translator) {
+        public PublicationResult publishEvent(
+                EventTranslator<TestEvent> translator,
+                Duration timeout) throws InterruptedException {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public <A> void publishEvent(
+        public <A> PublicationResult tryPublishEvent(
                 EventTranslatorOneArg<TestEvent, A> translator,
                 A arg0) {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public <A> boolean tryPublishEvent(
+        public <A> PublicationResult publishEvent(
                 EventTranslatorOneArg<TestEvent, A> translator,
-                A arg0) {
+                A arg0,
+                Duration timeout) throws InterruptedException {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public <A, B> void publishEvent(
+        public <A, B> PublicationResult tryPublishEvent(
                 EventTranslatorTwoArg<TestEvent, A, B> translator,
                 A arg0,
                 B arg1) {
@@ -1282,15 +1312,16 @@ class DisruptorRuntimeTest {
         }
 
         @Override
-        public <A, B> boolean tryPublishEvent(
+        public <A, B> PublicationResult publishEvent(
                 EventTranslatorTwoArg<TestEvent, A, B> translator,
                 A arg0,
-                B arg1) {
+                B arg1,
+                Duration timeout) throws InterruptedException {
             throw new UnsupportedOperationException();
         }
 
         @Override
-        public <A, B, C> void publishEvent(
+        public <A, B, C> PublicationResult tryPublishEvent(
                 EventTranslatorThreeArg<TestEvent, A, B, C> translator,
                 A arg0,
                 B arg1,
@@ -1299,11 +1330,12 @@ class DisruptorRuntimeTest {
         }
 
         @Override
-        public <A, B, C> boolean tryPublishEvent(
+        public <A, B, C> PublicationResult publishEvent(
                 EventTranslatorThreeArg<TestEvent, A, B, C> translator,
                 A arg0,
                 B arg1,
-                C arg2) {
+                C arg2,
+                Duration timeout) throws InterruptedException {
             throw new UnsupportedOperationException();
         }
 

@@ -8,6 +8,7 @@ import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -20,6 +21,7 @@ import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
+import java.time.Duration;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
@@ -31,6 +33,7 @@ import java.util.concurrent.TimeUnit;
 public class PublishPathBenchmark {
 
     private static final int BUFFER_SIZE = 65_536;
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(1);
     private static final EventTranslator<BenchmarkEvent> TRANSLATOR =
             (event, sequence) -> event.value = sequence;
 
@@ -45,8 +48,9 @@ public class PublishPathBenchmark {
     }
 
     @Benchmark
-    public void runtimeManagedPublisher(RuntimeState state) {
-        state.handle.publishEvent(TRANSLATOR);
+    public PublicationResult runtimeManagedPublisher(RuntimeState state)
+            throws InterruptedException {
+        return state.handle.publishEvent(TRANSLATOR, PUBLISH_TIMEOUT);
     }
 
     @State(Scope.Benchmark)

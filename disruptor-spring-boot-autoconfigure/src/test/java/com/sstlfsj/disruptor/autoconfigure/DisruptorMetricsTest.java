@@ -2,6 +2,7 @@ package com.sstlfsj.disruptor.autoconfigure;
 
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
@@ -39,8 +40,9 @@ class DisruptorMetricsTest {
         runtime.start();
         try {
             assertThat(running.value()).isEqualTo(1.0);
-            runtime.require("orders", TestEvent.class).publish(event -> {
-            });
+            assertThat(runtime.require("orders", TestEvent.class).publish(
+                    event -> { }, Duration.ofSeconds(2)))
+                    .isEqualTo(PublicationResult.PUBLISHED);
             assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(backlog.value()).isEqualTo(1.0);
             release.countDown();

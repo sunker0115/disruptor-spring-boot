@@ -3,7 +3,9 @@ package com.sstlfsj.disruptor.benchmark;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.core.PublicationResult;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -30,7 +32,11 @@ public final class NativeSmokeMain {
 
         runtime.start();
         try {
-            runtime.require("native-smoke", SmokeEvent.class).publishEvent(TRANSLATOR, 42L);
+            PublicationResult publication = runtime.require("native-smoke", SmokeEvent.class)
+                    .publishEvent(TRANSLATOR, 42L, Duration.ofSeconds(5));
+            if (publication != PublicationResult.PUBLISHED) {
+                throw new IllegalStateException("native smoke 发布失败：" + publication);
+            }
             if (!consumed.await(5, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("native smoke 消费超时");
             }

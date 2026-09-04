@@ -2,6 +2,7 @@ package com.sstlfsj.disruptor.example.order;
 
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -10,6 +11,7 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -34,7 +36,11 @@ public class OrderDemoRunner implements CommandLineRunner {
     public void run(String... args) throws Exception {
         log.info("==== demo1 原生菱形 DAG（order）====");
         OrderPipeline.latch = new CountDownLatch(4);
-        runtime.require("order", OrderEvent.class).publishEvent(TRANSLATOR, "A-1", 199L);
+        PublicationResult publication = runtime.require("order", OrderEvent.class)
+                .publishEvent(TRANSLATOR, "A-1", 199L, Duration.ofSeconds(5));
+        if (publication != PublicationResult.PUBLISHED) {
+            throw new IllegalStateException("order 发布失败：" + publication);
+        }
         if (!OrderPipeline.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo1 超时");
         }

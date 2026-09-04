@@ -2,6 +2,7 @@ package com.sstlfsj.disruptor.example.ingest;
 
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -10,6 +11,7 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -20,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 public class IngestDemoRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(IngestDemoRunner.class);
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);
     private static final EventTranslatorTwoArg<IngestEvent, String, Integer> TRANSLATOR =
             (event, sequence, key, value) -> {
                 event.setKey(key);
@@ -38,7 +41,11 @@ public class IngestDemoRunner implements CommandLineRunner {
         IngestPipeline.latch = new CountDownLatch(keys.size() * perKey);
         for (int seq = 0; seq < perKey; seq++) {          // 交错发布：K1#0,K2#0,K3#0,K1#1,...
             for (String key : keys) {
-                runtime.require("ingest", IngestEvent.class).publishEvent(TRANSLATOR, key, seq);
+                PublicationResult publication = runtime.require("ingest", IngestEvent.class)
+                        .publishEvent(TRANSLATOR, key, seq, PUBLISH_TIMEOUT);
+                if (publication != PublicationResult.PUBLISHED) {
+                    throw new IllegalStateException("ingest 发布失败：" + publication);
+                }
             }
         }
         if (!IngestPipeline.latch.await(5, TimeUnit.SECONDS)) {

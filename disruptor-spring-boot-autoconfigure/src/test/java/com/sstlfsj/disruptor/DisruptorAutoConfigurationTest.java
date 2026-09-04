@@ -10,6 +10,7 @@ import com.sstlfsj.disruptor.autoconfigure.DisruptorMetricsAutoConfiguration;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineHandle;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.micrometer.metrics.autoconfigure.MetricsAutoConfiguration;
@@ -31,6 +32,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -100,7 +102,8 @@ class DisruptorAutoConfigurationTest {
                             .require("native", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    assertThat(handle.tryPublishEvent(translator, "value")).isTrue();
+                    assertThat(handle.tryPublishEvent(translator, "value"))
+                            .isEqualTo(PublicationResult.PUBLISHED);
                     assertThat(consumed.await(2, TimeUnit.SECONDS)).isTrue();
                 });
     }
@@ -123,9 +126,12 @@ class DisruptorAutoConfigurationTest {
                             .require("faulty", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    handle.publishEvent(translator, "ok-1");
-                    handle.publishEvent(translator, "boom");
-                    handle.publishEvent(translator, "ok-2");
+                    assertThat(handle.publishEvent(translator, "ok-1", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
+                    assertThat(handle.publishEvent(translator, "boom", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
+                    assertThat(handle.publishEvent(translator, "ok-2", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
                     assertThat(succeeded.await(300, TimeUnit.MILLISECONDS)).isFalse();
                     assertThat(succeeded.getCount()).isEqualTo(1);
                 });
@@ -149,9 +155,12 @@ class DisruptorAutoConfigurationTest {
                             .require("faulty", TestEvent.class);
                     EventTranslatorOneArg<TestEvent, String> translator =
                             (event, sequence, value) -> event.value = value;
-                    handle.publishEvent(translator, "ok-1");
-                    handle.publishEvent(translator, "boom");
-                    handle.publishEvent(translator, "ok-2");
+                    assertThat(handle.publishEvent(translator, "ok-1", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
+                    assertThat(handle.publishEvent(translator, "boom", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
+                    assertThat(handle.publishEvent(translator, "ok-2", Duration.ofSeconds(2)))
+                            .isEqualTo(PublicationResult.PUBLISHED);
                     assertThat(succeeded.await(2, TimeUnit.SECONDS)).isTrue();
                 });
     }

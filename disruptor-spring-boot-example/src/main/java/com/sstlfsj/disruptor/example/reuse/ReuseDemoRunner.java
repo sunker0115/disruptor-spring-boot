@@ -4,6 +4,7 @@ import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineHandle;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -12,6 +13,7 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -21,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 public class ReuseDemoRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(ReuseDemoRunner.class);
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);
     private static final EventTranslatorTwoArg<ReuseEvent, String, String> WITH_COUPON =
             (event, sequence, orderId, couponCode) -> {
                 event.setOrderId(orderId);
@@ -39,9 +42,11 @@ public class ReuseDemoRunner implements CommandLineRunner {
         ReusePipeline.seen.clear();
         ReusePipeline.latch = new CountDownLatch(1 + followers);
         PipelineHandle<ReuseEvent> pipeline = runtime.require("reuse", ReuseEvent.class);
-        pipeline.publishEvent(WITH_COUPON, "A", "SAVE10");
+        requirePublished(pipeline.publishEvent(
+                WITH_COUPON, "A", "SAVE10", PUBLISH_TIMEOUT));
         for (int i = 0; i < followers; i++) {              // 后续订单只设 orderId
-            pipeline.publishEvent(WITHOUT_COUPON, "B" + i);
+            requirePublished(pipeline.publishEvent(
+                    WITHOUT_COUPON, "B" + i, PUBLISH_TIMEOUT));
         }
         if (!ReusePipeline.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo4 超时");
@@ -51,5 +56,11 @@ public class ReuseDemoRunner implements CommandLineRunner {
         log.info("[reuse] 后续订单是否读到残留 SAVE10：{}（cleanup 生效应为 false）", leaked);
         results.markDone("reuse");
         log.info("==== demo4 完成 ====");
+    }
+
+    private static void requirePublished(PublicationResult result) {
+        if (result != PublicationResult.PUBLISHED) {
+            throw new IllegalStateException("reuse 发布失败：" + result);
+        }
     }
 }

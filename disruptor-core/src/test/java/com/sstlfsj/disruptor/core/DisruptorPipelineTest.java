@@ -108,11 +108,18 @@ class DisruptorPipelineTest {
         pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
         CountDownLatch translating = new CountDownLatch(1);
         CountDownLatch releaseTranslator = new CountDownLatch(1);
-        Thread publisher = Thread.ofPlatform().start(() -> pipeline.handle().publishEvent(
-                (event, sequence) -> {
-                    translating.countDown();
-                    awaitUninterruptibly(releaseTranslator);
-                }));
+        AtomicReference<Throwable> publicationFailure = new AtomicReference<>();
+        Thread publisher = Thread.ofPlatform().start(() -> {
+            try {
+                assertEquals(PublicationResult.PUBLISHED, pipeline.handle().publishEvent(
+                        (event, sequence) -> {
+                            translating.countDown();
+                            awaitUninterruptibly(releaseTranslator);
+                        }, Duration.ofSeconds(2)));
+            } catch (Throwable failure) {
+                publicationFailure.set(failure);
+            }
+        });
         assertTrue(translating.await(2, TimeUnit.SECONDS));
 
         processor.sequence.observe();
@@ -124,6 +131,7 @@ class DisruptorPipelineTest {
         releaseTranslator.countDown();
         assertTrue(processor.sequence.awaitRead(Duration.ofSeconds(2)));
         publisher.join(2_000);
+        assertNull(publicationFailure.get());
         processor.sequence.set(0L);
 
         PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
@@ -218,12 +226,14 @@ class DisruptorPipelineTest {
                         (event, sequence, endOfBatch) -> { }))
                 .build());
         pipeline.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        assertTrue(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        assertEquals(PublicationResult.PUBLISHED,
+                pipeline.handle().tryPublishEvent((event, sequence) -> { }));
 
         pipeline.requestShutdown(ShutdownMode.GRACEFUL,
                 ShutdownDeadline.after(Duration.ofSeconds(2)));
 
-        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                pipeline.handle().tryPublishEvent((event, sequence) -> { }));
         PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
                 .get(2, TimeUnit.SECONDS);
         assertNull(terminated.failure());
@@ -249,7 +259,8 @@ class DisruptorPipelineTest {
         assertSame(firstStart, repeatedStart);
         assertTrue(firstStart.toCompletableFuture().isCompletedExceptionally());
         assertThrows(CompletionException.class, () -> firstStart.toCompletableFuture().join());
-        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                pipeline.handle().tryPublishEvent((event, sequence) -> { }));
     }
 
     @Test
@@ -273,14 +284,16 @@ class DisruptorPipelineTest {
         pipeline.requestShutdown(ShutdownMode.GRACEFUL,
                 ShutdownDeadline.after(Duration.ofSeconds(2)));
         assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
-        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                pipeline.handle().tryPublishEvent((event, sequence) -> { }));
         allowEntry.countDown();
 
         assertThrows(Exception.class, () -> start.get(2, TimeUnit.SECONDS));
         PipelineSnapshot terminated = pipeline.termination().toCompletableFuture()
                 .get(2, TimeUnit.SECONDS);
         assertNull(terminated.failure(), "正常并发关闭不能伪造基础设施故障");
-        assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }));
+        assertEquals(PublicationResult.NOT_RUNNING,
+                pipeline.handle().tryPublishEvent((event, sequence) -> { }));
     }
 
     @Test
@@ -403,14 +416,16 @@ class DisruptorPipelineTest {
                 stoppingObservedWhileGateCloseWasBlocked =
                         pipeline.snapshot().lifecycle() == PipelineLifecycle.STOPPING;
                 if (stoppingObservedWhileGateCloseWasBlocked) {
-                    assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }),
+                    assertEquals(PublicationResult.PIPELINE_FAILED,
+                            pipeline.handle().tryPublishEvent((event, sequence) -> { }),
                             "一旦可观察到 STOPPING，实际发布准入必须已经关闭");
                 }
             }
             if (!stoppingObservedWhileGateCloseWasBlocked) {
                 assertTrue(haltEntered.await(2, TimeUnit.SECONDS));
                 assertEquals(PipelineLifecycle.STOPPING, pipeline.snapshot().lifecycle());
-                assertFalse(pipeline.handle().tryPublishEvent((event, sequence) -> { }),
+                assertEquals(PublicationResult.PIPELINE_FAILED,
+                        pipeline.handle().tryPublishEvent((event, sequence) -> { }),
                         "一旦可观察到 STOPPING，实际发布准入必须已经关闭");
             }
         } finally {

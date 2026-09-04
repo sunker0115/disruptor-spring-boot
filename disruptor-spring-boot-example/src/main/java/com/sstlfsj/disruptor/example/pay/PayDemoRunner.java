@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.example.pay;
 import com.lmax.disruptor.EventTranslatorTwoArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineHandle;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import com.sstlfsj.disruptor.example.DemoResults;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -11,6 +12,7 @@ import org.springframework.boot.CommandLineRunner;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -20,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 public class PayDemoRunner implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(PayDemoRunner.class);
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);
     private static final EventTranslatorTwoArg<PayEvent, String, Long> TRANSLATOR =
             (event, sequence, payId, amount) -> {
                 event.setPayId(payId);
@@ -36,13 +39,22 @@ public class PayDemoRunner implements CommandLineRunner {
         // handler 接住，且异常之后的事件仍被处理——管道未被单次失败中断。
         PayService.latch = new CountDownLatch(3);
         PipelineHandle<PayEvent> handle = runtime.require("pay", PayEvent.class);
-        handle.publishEvent(TRANSLATOR, "P-1", 100L);
-        handle.publishEvent(TRANSLATOR, "P-BAD", -1L);
-        handle.publishEvent(TRANSLATOR, "P-2", 200L);
+        requirePublished(handle.publishEvent(
+                TRANSLATOR, "P-1", 100L, PUBLISH_TIMEOUT));
+        requirePublished(handle.publishEvent(
+                TRANSLATOR, "P-BAD", -1L, PUBLISH_TIMEOUT));
+        requirePublished(handle.publishEvent(
+                TRANSLATOR, "P-2", 200L, PUBLISH_TIMEOUT));
         if (!PayService.latch.await(5, TimeUnit.SECONDS)) {
             log.warn("demo2 超时");
         }
         results.markDone("pay");
         log.info("==== demo2 完成 ====");
+    }
+
+    private static void requirePublished(PublicationResult result) {
+        if (result != PublicationResult.PUBLISHED) {
+            throw new IllegalStateException("pay 发布失败：" + result);
+        }
     }
 }

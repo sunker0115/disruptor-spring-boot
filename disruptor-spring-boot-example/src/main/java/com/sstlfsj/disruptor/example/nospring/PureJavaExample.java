@@ -4,6 +4,7 @@ import com.lmax.disruptor.EventTranslatorOneArg;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineSettings;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.core.PublicationResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 public class PureJavaExample {
 
     private static final Logger log = LoggerFactory.getLogger(PureJavaExample.class);
+    private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);
     private static final EventTranslatorOneArg<PlainEvent, Integer> TRANSLATOR =
             (event, sequence, value) -> event.n = value;
 
@@ -46,7 +48,11 @@ public class PureJavaExample {
         runtime.start();
         try {
             for (int i = 0; i < 3; i++) {
-                runtime.require("plain", PlainEvent.class).publishEvent(TRANSLATOR, i);
+                PublicationResult publication = runtime.require("plain", PlainEvent.class)
+                        .publishEvent(TRANSLATOR, i, PUBLISH_TIMEOUT);
+                if (publication != PublicationResult.PUBLISHED) {
+                    throw new IllegalStateException("plain 发布失败：" + publication);
+                }
             }
             if (!latch.await(3, TimeUnit.SECONDS)) {
                 log.warn("[pure-java] 超时");

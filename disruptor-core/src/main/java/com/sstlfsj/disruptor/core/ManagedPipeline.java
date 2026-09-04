@@ -8,15 +8,22 @@ import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
 
 import java.time.Duration;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 /** LMAX Disruptor 与统一受监督生命周期之间的单管道适配。 */
 final class ManagedPipeline<E> implements DisruptorPipeline<E> {
+
+    private static final long PUBLICATION_RETRY_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
 
     private final String name;
     private final Class<E> eventType;
@@ -30,8 +37,11 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
     private final CompletionStage<Void> startedView = started.minimalCompletionStage();
     private final CompletableFuture<PipelineSnapshot> terminated = new CompletableFuture<>();
     private final CompletionStage<PipelineSnapshot> terminatedView = terminated.minimalCompletionStage();
+    private final Set<Thread> publicationWaiters =
+            Collections.newSetFromMap(new IdentityHashMap<>());
 
     private PublicationGate publicationGate = PublicationGate.NEW;
+    private boolean workerFailurePending;
     private boolean startRequested;
     private int activePublishers;
     private Long drainCursor;
@@ -52,7 +62,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 .shutdownTimeout(shutdownTimeout)
                 .shutdownBackend(new LmaxShutdownBackend())
                 .build();
-        threadFactory.bind(supervisor, this::closePublicationGate);
+        threadFactory.bind(supervisor, this::closePublicationGateAfterWorkerExit);
         supervisor.termination().whenComplete((workerSnapshot, failure) -> {
             if (failure != null) {
                 terminated.completeExceptionally(unwrap(failure));
@@ -137,7 +147,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         Objects.requireNonNull(deadline, "deadline 不能为空");
         Throwable preStartFailure = null;
         synchronized (lifecycleLock) {
-            publicationGate = PublicationGate.CLOSED;
+            closePublicationGateLocked();
             if (!startRequested) {
                 startRequested = true;
                 supervisor.markStarting();
@@ -171,7 +181,7 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                         supervisor.markRunning();
                         publicationGate = PublicationGate.OPEN;
                     } catch (Throwable failure) {
-                        publicationGate = PublicationGate.CLOSED;
+                        closePublicationGateLocked();
                         WorkerSnapshot current = supervisor.snapshot();
                         completionFailure = current.failure() == null
                                 ? failure
@@ -219,19 +229,106 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
                 .build();
     }
 
-    private boolean enterPublisher() {
+    private PublicationResult enterPublisher() {
         synchronized (lifecycleLock) {
-            if (publicationGate != PublicationGate.OPEN) {
-                return false;
+            if (publicationGate == PublicationGate.OPEN) {
+                activePublishers++;
+                return PublicationResult.PUBLISHED;
             }
-            activePublishers++;
-            return true;
+            if (workerFailurePending) {
+                return PublicationResult.PIPELINE_FAILED;
+            }
+        }
+        return failureResult();
+    }
+
+    private PublicationResult failureResult() {
+        return supervisor.snapshot().failure() == null
+                ? PublicationResult.NOT_RUNNING
+                : PublicationResult.PIPELINE_FAILED;
+    }
+
+    private PublicationResult publicationState() {
+        synchronized (lifecycleLock) {
+            if (workerFailurePending) {
+                return PublicationResult.PIPELINE_FAILED;
+            }
+            if (publicationGate == PublicationGate.OPEN) {
+                return null;
+            }
+        }
+        return failureResult();
+    }
+
+    private PublicationResult beforePublicationAttempt(
+            long deadlineNanos,
+            boolean allowExpiredAttempt)
+            throws InterruptedException {
+        if (Thread.interrupted()) {
+            throw new InterruptedException("等待管道 '" + name + "' 发布容量时被中断");
+        }
+        PublicationResult state = publicationState();
+        if (state != null) {
+            return state;
+        }
+        return !allowExpiredAttempt && remainingNanos(deadlineNanos) == 0L
+                ? PublicationResult.TIMED_OUT
+                : null;
+    }
+
+    private PublicationResult awaitPublicationRetry(long deadlineNanos)
+            throws InterruptedException {
+        if (Thread.interrupted()) {
+            throw new InterruptedException("等待管道 '" + name + "' 发布容量时被中断");
+        }
+        PublicationResult publicationState = publicationState();
+        if (publicationState != null) {
+            return publicationState;
+        }
+        long remaining = remainingNanos(deadlineNanos);
+        if (remaining == 0L) {
+            return PublicationResult.TIMED_OUT;
+        }
+        LockSupport.parkNanos(this, Math.min(PUBLICATION_RETRY_NANOS, remaining));
+        if (Thread.interrupted()) {
+            throw new InterruptedException("等待管道 '" + name + "' 发布容量时被中断");
+        }
+        return null;
+    }
+
+    private static long publicationDeadline(Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout 不能为空");
+        if (timeout.isNegative()) {
+            throw new IllegalArgumentException("timeout 不能为负数，实际值=" + timeout);
+        }
+        long timeoutNanos;
+        try {
+            timeoutNanos = timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            timeoutNanos = Long.MAX_VALUE;
+        }
+        long now = System.nanoTime();
+        try {
+            return Math.addExact(now, timeoutNanos);
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
         }
     }
 
-    private void enterPublisherOrThrow() {
-        if (!enterPublisher()) {
-            throw new IllegalStateException("管道 '" + name + "' 当前不接受发布");
+    private static long remainingNanos(long deadlineNanos) {
+        long remaining = deadlineNanos - System.nanoTime();
+        return remaining > 0L ? remaining : 0L;
+    }
+
+    private void registerPublicationWaiter(Thread publisher) {
+        synchronized (lifecycleLock) {
+            publicationWaiters.add(publisher);
+        }
+    }
+
+    private void unregisterPublicationWaiter(Thread publisher) {
+        synchronized (lifecycleLock) {
+            publicationWaiters.remove(publisher);
         }
     }
 
@@ -250,9 +347,25 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
 
     private void closePublicationGate() {
         synchronized (lifecycleLock) {
-            publicationGate = PublicationGate.CLOSED;
-            lifecycleLock.notifyAll();
+            closePublicationGateLocked();
         }
+    }
+
+    private void closePublicationGateAfterWorkerExit() {
+        synchronized (lifecycleLock) {
+            if (publicationGate == PublicationGate.OPEN) {
+                workerFailurePending = true;
+            }
+            closePublicationGateLocked();
+        }
+    }
+
+    private void closePublicationGateLocked() {
+        publicationGate = PublicationGate.CLOSED;
+        for (Thread waiter : publicationWaiters) {
+            LockSupport.unpark(waiter);
+        }
+        lifecycleLock.notifyAll();
     }
 
     private Throwable startupFailureFromSupervisor() {
@@ -313,101 +426,207 @@ final class ManagedPipeline<E> implements DisruptorPipeline<E> {
         }
 
         @Override
-        public void publishEvent(EventTranslator<E> translator) {
+        public PublicationResult tryPublishEvent(EventTranslator<E> translator) {
             Objects.requireNonNull(translator, "translator 不能为空");
-            enterPublisherOrThrow();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
+            }
             try {
-                ringBuffer.publishEvent(translator);
+                return ringBuffer.tryPublishEvent(translator)
+                        ? PublicationResult.PUBLISHED
+                        : PublicationResult.CAPACITY_EXHAUSTED;
             } finally {
                 exitPublisher();
             }
         }
 
         @Override
-        public boolean tryPublishEvent(EventTranslator<E> translator) {
+        public PublicationResult publishEvent(EventTranslator<E> translator, Duration timeout)
+                throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            if (!enterPublisher()) {
-                return false;
+            long deadlineNanos = publicationDeadline(timeout);
+            boolean allowExpiredAttempt = timeout.isZero();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
+            }
+            Thread publisher = Thread.currentThread();
+            registerPublicationWaiter(publisher);
+            try {
+                while (true) {
+                    PublicationResult state = beforePublicationAttempt(
+                            deadlineNanos, allowExpiredAttempt);
+                    allowExpiredAttempt = false;
+                    if (state != null) {
+                        return state;
+                    }
+                    if (ringBuffer.tryPublishEvent(translator)) {
+                        return PublicationResult.PUBLISHED;
+                    }
+                    state = awaitPublicationRetry(deadlineNanos);
+                    if (state != null) {
+                        return state;
+                    }
+                }
+            } finally {
+                unregisterPublicationWaiter(publisher);
+                exitPublisher();
+            }
+        }
+
+        @Override
+        public <A> PublicationResult tryPublishEvent(
+                EventTranslatorOneArg<E, A> translator, A arg0) {
+            Objects.requireNonNull(translator, "translator 不能为空");
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
             }
             try {
-                return ringBuffer.tryPublishEvent(translator);
+                return ringBuffer.tryPublishEvent(translator, arg0)
+                        ? PublicationResult.PUBLISHED
+                        : PublicationResult.CAPACITY_EXHAUSTED;
             } finally {
                 exitPublisher();
             }
         }
 
         @Override
-        public <A> void publishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
+        public <A> PublicationResult publishEvent(
+                EventTranslatorOneArg<E, A> translator, A arg0, Duration timeout)
+                throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            enterPublisherOrThrow();
+            long deadlineNanos = publicationDeadline(timeout);
+            boolean allowExpiredAttempt = timeout.isZero();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
+            }
+            Thread publisher = Thread.currentThread();
+            registerPublicationWaiter(publisher);
             try {
-                ringBuffer.publishEvent(translator, arg0);
+                while (true) {
+                    PublicationResult state = beforePublicationAttempt(
+                            deadlineNanos, allowExpiredAttempt);
+                    allowExpiredAttempt = false;
+                    if (state != null) {
+                        return state;
+                    }
+                    if (ringBuffer.tryPublishEvent(translator, arg0)) {
+                        return PublicationResult.PUBLISHED;
+                    }
+                    state = awaitPublicationRetry(deadlineNanos);
+                    if (state != null) {
+                        return state;
+                    }
+                }
             } finally {
+                unregisterPublicationWaiter(publisher);
                 exitPublisher();
             }
         }
 
         @Override
-        public <A> boolean tryPublishEvent(EventTranslatorOneArg<E, A> translator, A arg0) {
-            Objects.requireNonNull(translator, "translator 不能为空");
-            if (!enterPublisher()) {
-                return false;
-            }
-            try {
-                return ringBuffer.tryPublishEvent(translator, arg0);
-            } finally {
-                exitPublisher();
-            }
-        }
-
-        @Override
-        public <A, B> void publishEvent(
+        public <A, B> PublicationResult tryPublishEvent(
                 EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
             Objects.requireNonNull(translator, "translator 不能为空");
-            enterPublisherOrThrow();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
+            }
             try {
-                ringBuffer.publishEvent(translator, arg0, arg1);
+                return ringBuffer.tryPublishEvent(translator, arg0, arg1)
+                        ? PublicationResult.PUBLISHED
+                        : PublicationResult.CAPACITY_EXHAUSTED;
             } finally {
                 exitPublisher();
             }
         }
 
         @Override
-        public <A, B> boolean tryPublishEvent(
-                EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1) {
+        public <A, B> PublicationResult publishEvent(
+                EventTranslatorTwoArg<E, A, B> translator, A arg0, B arg1, Duration timeout)
+                throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            if (!enterPublisher()) {
-                return false;
+            long deadlineNanos = publicationDeadline(timeout);
+            boolean allowExpiredAttempt = timeout.isZero();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
             }
+            Thread publisher = Thread.currentThread();
+            registerPublicationWaiter(publisher);
             try {
-                return ringBuffer.tryPublishEvent(translator, arg0, arg1);
+                while (true) {
+                    PublicationResult state = beforePublicationAttempt(
+                            deadlineNanos, allowExpiredAttempt);
+                    allowExpiredAttempt = false;
+                    if (state != null) {
+                        return state;
+                    }
+                    if (ringBuffer.tryPublishEvent(translator, arg0, arg1)) {
+                        return PublicationResult.PUBLISHED;
+                    }
+                    state = awaitPublicationRetry(deadlineNanos);
+                    if (state != null) {
+                        return state;
+                    }
+                }
             } finally {
+                unregisterPublicationWaiter(publisher);
                 exitPublisher();
             }
         }
 
         @Override
-        public <A, B, C> void publishEvent(
+        public <A, B, C> PublicationResult tryPublishEvent(
                 EventTranslatorThreeArg<E, A, B, C> translator, A arg0, B arg1, C arg2) {
             Objects.requireNonNull(translator, "translator 不能为空");
-            enterPublisherOrThrow();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
+            }
             try {
-                ringBuffer.publishEvent(translator, arg0, arg1, arg2);
+                return ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2)
+                        ? PublicationResult.PUBLISHED
+                        : PublicationResult.CAPACITY_EXHAUSTED;
             } finally {
                 exitPublisher();
             }
         }
 
         @Override
-        public <A, B, C> boolean tryPublishEvent(
-                EventTranslatorThreeArg<E, A, B, C> translator, A arg0, B arg1, C arg2) {
+        public <A, B, C> PublicationResult publishEvent(
+                EventTranslatorThreeArg<E, A, B, C> translator,
+                A arg0, B arg1, C arg2, Duration timeout) throws InterruptedException {
             Objects.requireNonNull(translator, "translator 不能为空");
-            if (!enterPublisher()) {
-                return false;
+            long deadlineNanos = publicationDeadline(timeout);
+            boolean allowExpiredAttempt = timeout.isZero();
+            PublicationResult admission = enterPublisher();
+            if (admission != PublicationResult.PUBLISHED) {
+                return admission;
             }
+            Thread publisher = Thread.currentThread();
+            registerPublicationWaiter(publisher);
             try {
-                return ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2);
+                while (true) {
+                    PublicationResult state = beforePublicationAttempt(
+                            deadlineNanos, allowExpiredAttempt);
+                    allowExpiredAttempt = false;
+                    if (state != null) {
+                        return state;
+                    }
+                    if (ringBuffer.tryPublishEvent(translator, arg0, arg1, arg2)) {
+                        return PublicationResult.PUBLISHED;
+                    }
+                    state = awaitPublicationRetry(deadlineNanos);
+                    if (state != null) {
+                        return state;
+                    }
+                }
             } finally {
+                unregisterPublicationWaiter(publisher);
                 exitPublisher();
             }
         }

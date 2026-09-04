@@ -49,7 +49,9 @@ class ExceptionHandlingTest {
 
         runtime.start();
         try {
-            runtime.require("strict", TestEvent.class).publishEvent(TRANSLATOR, 1L);
+            assertEquals(PublicationResult.PUBLISHED,
+                    runtime.require("strict", TestEvent.class).publishEvent(
+                            TRANSLATOR, 1L, Duration.ofSeconds(2)));
             assertFalse(downstream.await(300, TimeUnit.MILLISECONDS), "失败槽位不得流向依赖它的下游");
         } finally {
             assertThrows(DisruptorShutdownException.class, runtime::halt,
@@ -81,8 +83,10 @@ class ExceptionHandlingTest {
         runtime.start();
         try {
             var pipeline = runtime.require("available", TestEvent.class);
-            pipeline.publishEvent(TRANSLATOR, 1L);
-            pipeline.publishEvent(TRANSLATOR, 2L);
+            assertEquals(PublicationResult.PUBLISHED,
+                    pipeline.publishEvent(TRANSLATOR, 1L, Duration.ofSeconds(2)));
+            assertEquals(PublicationResult.PUBLISHED,
+                    pipeline.publishEvent(TRANSLATOR, 2L, Duration.ofSeconds(2)));
 
             assertTrue(downstream.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(1L, 2L), seen);
