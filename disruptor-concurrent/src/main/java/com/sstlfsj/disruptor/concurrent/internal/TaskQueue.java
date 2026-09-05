@@ -35,7 +35,15 @@ interface TaskQueue {
 
     long claimedCursor();
 
-    long pending();
+    long consumerCursor();
+
+    /** 已 claim 且尚未离开 ingress 的槽数，包含 publication hole，不含 executing。 */
+    default long pending() {
+        // consumer 的 release 进度只来自已 claim 的槽；先 acquire 它，再读 claimed
+        // 保证后一次读取不能落在已观测消费进度之前，且不把 executing 计入 ingress。
+        long consumed = consumerCursor();
+        return claimedCursor() - consumed;
+    }
 
     void scanOrdinaryUnstarted(
             long claimedInclusive,

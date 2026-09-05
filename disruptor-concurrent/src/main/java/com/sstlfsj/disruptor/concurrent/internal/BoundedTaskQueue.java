@@ -165,8 +165,8 @@ final class BoundedTaskQueue implements TaskQueue {
     }
 
     @Override
-    public long pending() {
-        return claimedCursor() - consumerSequence.get();
+    public long consumerCursor() {
+        return consumerSequence.get();
     }
 
     @Override

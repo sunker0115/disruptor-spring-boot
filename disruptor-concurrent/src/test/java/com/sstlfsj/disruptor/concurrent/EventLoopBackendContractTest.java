@@ -219,6 +219,16 @@ class EventLoopBackendContractTest {
         unbounded.shutdownNow();
     }
 
+    @org.junit.jupiter.api.Test
+    void ordinaryOwnershipDoesNotAddAVolatileRunnableOutsideTheQueueSlot() {
+        long owners = java.util.Arrays.stream(EventLoopKernel.class.getDeclaredFields())
+                .filter(field -> field.getType() == Runnable.class)
+                .filter(field -> java.lang.reflect.Modifier.isVolatile(field.getModifiers()))
+                .count();
+
+        assertEquals(0, owners, "ordinary 的物理所有权只保留在槽位中");
+    }
+
     static Stream<Arguments> backends() {
         return Stream.of(
                 Arguments.of("bounded", (LoopFactory) (name, modules) -> {

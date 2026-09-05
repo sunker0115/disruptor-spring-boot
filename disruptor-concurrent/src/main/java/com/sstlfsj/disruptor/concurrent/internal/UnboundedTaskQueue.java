@@ -186,8 +186,8 @@ final class UnboundedTaskQueue implements TaskQueue {
     }
 
     @Override
-    public long pending() {
-        return claimedCursor() - consumerSequence;
+    public long consumerCursor() {
+        return consumerSequence;
     }
 
     @Override

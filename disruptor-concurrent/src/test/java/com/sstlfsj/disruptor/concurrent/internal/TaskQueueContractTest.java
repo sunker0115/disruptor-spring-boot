@@ -5,6 +5,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -34,6 +36,41 @@ class TaskQueueContractTest {
         return Stream.of(
                 new QueueFactory("bounded", () -> new BoundedTaskQueue(4_096)),
                 new QueueFactory("unbounded", () -> new UnboundedTaskQueue(64)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("queues")
+    void pendingCannotBecomeNegativeWhenConsumerAdvancesBetweenCursorReads(
+            QueueFactory factory) throws Exception {
+        TaskQueue queue = factory.create();
+        CountDownLatch claimedRead = new CountDownLatch(1);
+        CountDownLatch consumed = new CountDownLatch(1);
+        TaskQueue observed = (TaskQueue) Proxy.newProxyInstance(
+                TaskQueue.class.getClassLoader(), new Class<?>[]{TaskQueue.class},
+                (proxy, method, arguments) -> {
+                    if (method.isDefault()) {
+                        return InvocationHandler.invokeDefault(proxy, method, arguments);
+                    }
+                    Object result = method.invoke(queue, arguments);
+                    if (method.getName().equals("claimedCursor")) {
+                        claimedRead.countDown();
+                        assertTrue(consumed.await(2, TimeUnit.SECONDS));
+                    }
+                    return result;
+                });
+        try (ExecutorService observer = Executors.newSingleThreadExecutor()) {
+            Future<Long> pending = observer.submit(observed::pending);
+            try {
+                assertTrue(claimedRead.await(2, TimeUnit.SECONDS));
+                publishOrdinary(queue);
+                assertTrue(queue.poll());
+                finishCurrentOrdinary(queue);
+            } finally {
+                consumed.countDown();
+            }
+            assertEquals(0, pending.get(2, TimeUnit.SECONDS));
+        }
+        assertEquals(0, queue.pending());
     }
 
     @ParameterizedTest(name = "{0}")

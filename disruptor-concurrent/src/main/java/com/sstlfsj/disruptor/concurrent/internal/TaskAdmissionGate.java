@@ -166,6 +166,11 @@ final class TaskAdmissionGate {
         return publishers(admission.get());
     }
 
+    /** 与 leave 的 CAS 同步；即使 word 的计数值复原，volatile 读取仍获得最近的写入。 */
+    void acquireCompletedPublications() {
+        admission.get();
+    }
+
     void awaitDrained() {
         for (int spin = 0; spin < SPIN_LIMIT; spin++) {
             if (activePublishers() == 0) {

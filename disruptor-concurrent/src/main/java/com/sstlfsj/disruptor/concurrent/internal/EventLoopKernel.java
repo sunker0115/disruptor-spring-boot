@@ -75,9 +75,8 @@ public final class EventLoopKernel {
     private volatile long failed;
     private volatile long cancelled;
     private final AtomicLong returned = new AtomicLong();
-    private final AtomicBoolean parked = new AtomicBoolean();
+    private final WorkerWakeup wakeup;
     private volatile AcceptedTask<?> currentTask;
-    private volatile Runnable currentOrdinary;
     private volatile GroupLifecycleCoordinator groupOwner;
 
     private EventLoopKernel(
@@ -123,6 +122,7 @@ public final class EventLoopKernel {
         if (worker.getState() != Thread.State.NEW) {
             throw new IllegalStateException("threadFactory 必须返回尚未启动的线程：" + worker.getName());
         }
+        this.wakeup = new WorkerWakeup(gate, () -> LockSupport.unpark(worker));
         supervisor.register(worker);
         supervisor.termination().whenComplete(this::publishTermination);
     }
@@ -597,10 +597,18 @@ public final class EventLoopKernel {
                     continue;
                 }
                 executing++;
-                boolean repeat;
                 currentTask = task;
                 try {
-                    repeat = scheduled.runInvocation();
+                    boolean repeat = scheduled.runInvocation();
+                    if (task.returnToWaiting(() -> scheduled.canRearm(
+                            repeat, quiescing.get()))) {
+                        timers.add(scheduled);
+                    } else {
+                        if (repeat && !task.future().isDone()) {
+                            task.future().cancel(CancellationReason.SHUTDOWN);
+                        }
+                        physicalCompleted += terminateTask(task);
+                    }
                 } catch (Throwable failure) {
                     if (!task.future().isDone()) {
                         task.future().cancel(CancellationReason.SHUTDOWN_NOW);
@@ -610,15 +618,6 @@ public final class EventLoopKernel {
                 } finally {
                     currentTask = null;
                     executing--;
-                }
-                if (task.returnToWaiting(() -> scheduled.canRearm(
-                        repeat, quiescing.get()))) {
-                    timers.add(scheduled);
-                } else {
-                    if (repeat && !task.future().isDone()) {
-                        task.future().cancel(CancellationReason.SHUTDOWN);
-                    }
-                    physicalCompleted += terminateTask(task);
                 }
             }
             return processed;
@@ -656,7 +655,6 @@ public final class EventLoopKernel {
                             continue;
                         }
                         Runnable ordinary = queue.currentOrdinary();
-                        currentOrdinary = ordinary;
                         queue.advanceConsumer();
                         executing++;
                         try {
@@ -667,7 +665,6 @@ public final class EventLoopKernel {
                             taskExceptionHandler.handle(owner, ordinary, failure);
                         } finally {
                             executing--;
-                            currentOrdinary = null;
                             queue.terminalizeCurrentOrdinary();
                             queue.releaseCurrentSlot();
                             physicalCompleted++;
@@ -736,7 +733,7 @@ public final class EventLoopKernel {
     }
 
     private void parkUntilWork() {
-        parked.lazySet(true);
+        wakeup.prepareToPark();
         ScheduledTask<?> next = timers.peek();
         if (stopMode.get() == null
                 && cancellationMailbox.isEmpty()
@@ -751,7 +748,7 @@ public final class EventLoopKernel {
                 }
             }
         }
-        parked.lazySet(false);
+        wakeup.awake();
         if (Thread.interrupted() && stopMode.get() == null) {
             // 外部中断不是生命周期信号；清除状态后继续由 supervisor 管理。
         }
@@ -816,11 +813,10 @@ public final class EventLoopKernel {
                 } finally {
                     if (sequence >= 0) {
                         queue.publish(sequence);
-                        signalWorkerIfParked();
                     }
                 }
             } finally {
-                gate.leave(rollbackOutstanding);
+                wakeup.finishAdmission(sequence, rollbackOutstanding);
             }
             return true;
         } finally {
@@ -876,11 +872,10 @@ public final class EventLoopKernel {
                 } finally {
                     if (sequence >= 0) {
                         queue.publish(sequence);
-                        signalWorkerIfParked();
                     }
                 }
             } finally {
-                gate.leave(rollbackOutstanding);
+                wakeup.finishAdmission(sequence, rollbackOutstanding);
             }
             return task.future();
         } finally {
@@ -1021,12 +1016,6 @@ public final class EventLoopKernel {
                 task.future().cancel(true);
             }
         });
-    }
-
-    private void signalWorkerIfParked() {
-        if (parked.get()) {
-            LockSupport.unpark(worker);
-        }
     }
 
     private EventLoopSnapshot snapshot(WorkerSnapshot workerSnapshot, boolean accepting) {
