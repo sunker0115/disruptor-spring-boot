@@ -73,7 +73,7 @@
 ```java
 // --- gate 拥有容量账本(A3) ---
 final class TaskAdmissionGate {
-    static TaskAdmissionGate bounded(int capacity);   // >0 且 ≤2^31-1 fail-fast
+    static TaskAdmissionGate bounded(long capacity);  // >0 且 ≤2^31-1 fail-fast；保留 long 入参使越界可测
     static TaskAdmissionGate unbounded();
     void open(); void closeForAdmissions(); boolean isAccepting();
     boolean tryEnter();          // bounded: OPEN&&outstanding<capacity → pub++,outstanding++; unbounded: OPEN → pub++,outstanding++(AtomicLong,无上限)
@@ -98,7 +98,7 @@ interface TaskQueue {
     boolean tryStartCurrentOrdinary();                 // WAITING→RUNNING(worker 运行前)
     OrdinaryState currentOrdinaryState();              // worker 识别 scanner 已抢的 RETURNED/DISCARDED
     void terminalizeCurrentOrdinary();                 // RUNNING→TERMINAL
-    void advanceConsumer();                            // release 推进 consumerSequence(离开 ingress)
+    void advanceConsumer();                            // release 推进 consumerSequence(离开 ingress)；调用前必须先捕获当前 payload
     void releaseCurrentSlot();                         // 清槽引用 + 推进 gatingSequence(允许复用)
     long claimedCursor(); long pending();              // pending=claimedCursor-consumerSequence
     void scanOrdinaryUnstarted(long claimedInclusive, OrdinaryDisposition disp, OrdinaryClaimedSink sink);
@@ -124,7 +124,7 @@ final class AcceptedTaskRegistry {                     // tracked-only
 @FunctionalInterface interface ShutdownAction { void handle(AcceptedTask<?> task); }
 ```
 
-- [ ] **Step 1.1 gate(先写测试)** — 重写 `TaskAdmissionGateTest`:容量 off-by-one(`bounded(1)` 首个 `tryEnter()` 真、第二个假)、`leave(true)` 不泄漏(即使未 claim)、`closeForAdmissions` 后 `tryEnter` 假且 `awaitDrained` 等到 `activePublishers==0`、unbounded `tryEnter` 无容量门但 `outstanding()` 如实增长、`completeBatch` 递减、capacity `2^31` fail-fast。实现 packed 布局 `[63:62]`lifecycle/`[61:31]`outstanding/`[30:0]`pub;unbounded 用同 word 的 lifecycle+pub 加一个独立 `AtomicLong outstanding`。
+- [ ] **Step 1.1 gate(先写测试)** — 重写 `TaskAdmissionGateTest`:容量 off-by-one(`bounded(1)` 首个 `tryEnter()` 真、第二个假)、`leave(true)` 不泄漏(即使未 claim)、`closeForAdmissions` 后 `tryEnter` 假且 `awaitDrained` 等到 `activePublishers==0`、unbounded `tryEnter` 无容量门但 `outstanding()` 如实增长、`completeBatch` 递减、`bounded(1L << 31)` fail-fast、unbounded outstanding 到 `Long.MAX_VALUE` 时拒绝继续 enter 且绝不回绕为负数。实现 packed 布局 `[63:62]`lifecycle/`[61:31]`outstanding/`[30:0]`pub;unbounded 用同 word 的 lifecycle+pub 加一个独立 `AtomicLong outstanding`。
 - [ ] **Step 1.2 queue(先写测试)** — 重写 `TaskQueueContractTest`(bounded):消费前缀遇空洞停(先发 s1 留 s0 空洞→`poll` 假,补 s0 后才真)、`tryStartCurrentOrdinary` WAITING→RUNNING、`advanceConsumer` 后槽未 `releaseCurrentSlot` 则 `tryClaim` 拿不到(容量 1)、`releaseCurrentSlot` 后可复用、4×1000 多生产者每 seq 恰好消费一次、tombstone 被跳过。实现 bounded:`createMultiProducer(Cell::new, cap, new BusySpinWaitStrategy())`,`consumerSequence`/`gatingSequence` 两 `Sequence`,只 `gatingSequence` 入 `addGatingSequences`。
 - [ ] **Step 1.3 record + index(先写测试)** — 重写 `AcceptedTaskRegistryTest`:WAITING 只能被 return 或 discard 之一(互斥)、`scanForShutdown` 按 ticket 升序、RUNNING 记录被 `future.cancel(true)` 且不进 sink、周期 `returnToWaiting` 在 quiescing/expires/max/非周期返回 false。实现 `AcceptedTask`(`AtomicReference<PhysicalState>` CAS)、registry(`ConcurrentSkipListMap`)。适配 `ScheduledTask`(周期重排调 `returnToWaiting(check)`)、`CancellationMailbox`。
 - [ ] **Step 1.4 unbounded queue** — `UnboundedTaskQueue` 实现同 `TaskQueue`:分段 `Cell[]`+`long[] publishedSeq`(release/acquire 代际)、跨段 `segmentLock`(`ReentrantLock`)回收到空闲链表、超 `maxPooledSegments`(暂内部常量 8,Task 4 提为 builder 配)释放 GC、复用前清 payload/state;`TaskQueueContractTest` 无界部分(段回收、代际、双 scanner+回收无 use-after-free)。
@@ -133,8 +133,9 @@ final class AcceptedTaskRegistry {                     // tracked-only
   ```
   if (!queue.tryStartCurrentOrdinary()) { // scanner 已抢 RETURNED/DISCARDED
       queue.advanceConsumer(); queue.releaseCurrentSlot(); continue; }
+  Runnable ordinary = queue.currentOrdinary(); // 推进游标前捕获；之后不得再通过 current* 取 payload
   queue.advanceConsumer();                 // 已离 ingress(scanner 排除、pending 不含 executing)
-  try { runOrdinary(currentOrdinary()); } finally {
+  try { runOrdinary(ordinary); } finally {
       queue.terminalizeCurrentOrdinary();  // RUNNING→TERMINAL
       queue.releaseCurrentSlot();          // 清槽 + 推进 gating(才允许复用)
   }
@@ -210,34 +211,8 @@ final class TaskDispositionCoordinator {
 
 **Interfaces:** `GroupLifecycleCoordinator.isAccepting()`(单 `volatile boolean`);删 `AdmissionLease`。
 
-- [ ] **Step 1: 写失败测试(startup 无提前提交窗口,B3 具体化)**
-  ```java
-  // EventLoopGroupTest.java 追加
-  @Test
-  void childRejectsUntilGroupGloballyAccepting() throws Exception {
-      CountDownLatch startGate = new CountDownLatch(1);
-      // 一个 module,其 onStart 阻塞在 startGate,拖住 Group 整体 start
-      EventLoopModule blocking = new EventLoopModule() {
-          @Override public void onStart(EventLoop loop) throws Exception { awaitIgnoringInterrupt(startGate); }
-      };
-      // 经 EventLoopGroupBuilder 构建 2-child 有界 Group,child 携带 blocking module(用 factory)
-      DisruptorEventLoopGroup group = EventLoopGroupBuilder
-              .bounded("startup-window", /*children*/2, /*capacity*/16,
-                       (parent, childIndex) -> /*EventLoopFactory: build child with 'blocking' module*/ null)
-              .build();
-      CompletionStage<Void> starting = group.start();          // 异步,不 join;卡在 module onStart
-      EventLoop child = group.iterator().next();               // 取一个已构造 child 引用
-      assertThrows(RejectedExecutionException.class, () -> child.execute(() -> {}));  // 全局未 accepting → 拒绝
-      startGate.countDown();                                    // 放行 start
-      starting.toCompletableFuture().get(2, TimeUnit.SECONDS);  // Group 整体 RUNNING
-      CountDownLatch ran = new CountDownLatch(1);
-      child.execute(ran::countDown);
-      assertTrue(ran.await(2, TimeUnit.SECONDS));               // 现在接受
-      group.close();
-  }
-  ```
-  (executor 按 `EventLoopGroupBuilder.bounded(name,children,capacity,factory)` 与 `EventLoopFactory(parent,childIndex)` 的实际签名补全 factory;module 注入方式沿用现有 `EventLoopGroupTest` 的 child 构造约定。)
-- [ ] **Step 2: 运行验证失败** — `-Dtest=EventLoopGroupTest` → FAIL。
+- [ ] **Step 1: 冻结既有 startup 窗口契约** — 直接保留并先运行 `EventLoopGroupTest.groupGateRejectsChildrenBeforeAllModulesStartAndAfterShutdownBegins`:该测试已经通过 `EventLoopGroupBuilder.builder(name, 2, EventLoopFactory)` 为第二个 child 注入阻塞 `EventLoopModule`,覆盖 Group 整体启动完成前拒绝、启动完成后接受、关闭后再次拒绝。它是重构特征测试,不重复新增伪代码测试。
+- [ ] **Step 2: 验证结构红信号** — Task 0 的 Group ordinary JMH/分配剖析仍能观察到每任务 `AdmissionLease` 分配;源码结构检查确认 `GroupLifecycleCoordinator.AdmissionLease` 与 `tryAcquireAdmission()` 尚存在。行为特征测试此时应保持 PASS。
 - [ ] **Step 3: 实现** — `GroupLifecycleCoordinator` 用 `volatile boolean accepting`;全部 child RUNNING 后单点置真;关闭先置假再逐 child `closeForAdmissions`+各自 `awaitDrained`;`EventLoopKernel.admit` 在 `gate.tryEnter` 成功后检查 `groupOwner==null || groupOwner.isAccepting()`,否则 `leave(true)` 拒绝;删每任务 lease 及其方法。
 - [ ] **Step 4: 运行验证通过** — `-Dtest=EventLoopGroupTest,EventLoopGroupShutdownTest` → PASS。
 - [ ] **Step 5: 提交** — `git commit -m "feat(concurrent): group admission via single global accepting flag"`
