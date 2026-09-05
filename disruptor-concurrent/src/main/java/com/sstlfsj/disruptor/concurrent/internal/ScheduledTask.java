@@ -213,6 +213,21 @@ final class ScheduledTask<V> {
         return spec.scheduleMode() != ScheduleMode.ONE_SHOT;
     }
 
+    boolean canRearm(boolean invocationRequestedRearm, boolean quiescing) {
+        if (!invocationRequestedRearm || quiescing || !isPeriodic() || future.isDone()) {
+            return false;
+        }
+        ScheduledTaskSnapshot snapshot = future.snapshot();
+        if (isExpired(snapshot, clock.nanoTime())) {
+            return false;
+        }
+        if (snapshot.maxExecutions().isPresent()
+                && snapshot.executions() >= snapshot.maxExecutions().getAsInt()) {
+            return false;
+        }
+        return snapshot.lastFailure() == null || spec.continueOnFailure();
+    }
+
     private long nextTrigger(ScheduledTaskSnapshot lastRun, long completedAtNanos) throws Exception {
         return switch (spec.scheduleMode()) {
             case FIXED_RATE -> triggerNanos + toNanosSaturated(spec.period());

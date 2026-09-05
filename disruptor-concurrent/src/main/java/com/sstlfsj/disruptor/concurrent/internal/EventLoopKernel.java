@@ -70,12 +70,14 @@ public final class EventLoopKernel {
     private final AtomicBoolean quiescing = new AtomicBoolean();
     private final AtomicReference<ShutdownMode> stopMode = new AtomicReference<>();
     private final AtomicBoolean workerDrained = new AtomicBoolean();
-    private final AtomicLong executing = new AtomicLong();
-    private final AtomicLong completed = new AtomicLong();
-    private final AtomicLong failed = new AtomicLong();
-    private final AtomicLong cancelled = new AtomicLong();
+    private volatile long executing;
+    private volatile long completed;
+    private volatile long failed;
+    private volatile long cancelled;
     private final AtomicLong returned = new AtomicLong();
+    private final AtomicBoolean parked = new AtomicBoolean();
     private volatile AcceptedTask<?> currentTask;
+    private volatile Runnable currentOrdinary;
     private volatile GroupLifecycleCoordinator groupOwner;
 
     private EventLoopKernel(
@@ -248,18 +250,12 @@ public final class EventLoopKernel {
 
     public boolean tryExecute(Runnable command) {
         Objects.requireNonNull(command, "command 不能为空");
-        return submitOrdinary(command, () -> {
-            command.run();
-            return null;
-        }, true) != null;
+        return admitOrdinary(command);
     }
 
     public void execute(Runnable command) {
         Objects.requireNonNull(command, "command 不能为空");
-        if (submitOrdinary(command, () -> {
-            command.run();
-            return null;
-        }, true) == null) {
+        if (!admitOrdinary(command)) {
             throw rejected();
         }
     }
@@ -270,10 +266,21 @@ public final class EventLoopKernel {
 
     public <T> Future<T> submit(Runnable task, T result) {
         Objects.requireNonNull(task, "task 不能为空");
-        EventLoopFutureTask<T> future = submitOrdinary(task, () -> {
-            task.run();
-            return result;
-        }, false);
+        EventLoopFutureTask<T> future = admitTracked(TaskType.TRACKED,
+                (sequence, acceptedAt) -> {
+                    EventLoopFutureTask<T> createdFuture = new EventLoopFutureTask<>(
+                            () -> {
+                                task.run();
+                                return result;
+                            }, clock, initialSnapshot(sequence, acceptedAt), this::inEventLoop);
+                    AcceptedTask<T> accepted = AcceptedTask.<T>builder()
+                            .acceptedSequence(sequence)
+                            .shutdownNowReturnValue(task)
+                            .future(createdFuture)
+                            .build();
+                    bindCancellation(accepted);
+                    return accepted;
+                });
         if (future == null) {
             throw rejected();
         }
@@ -282,11 +289,14 @@ public final class EventLoopKernel {
 
     public <T> Future<T> submit(Callable<T> task) {
         Objects.requireNonNull(task, "task 不能为空");
-        EventLoopFutureTask<T> future = admit((sequence, acceptedAt) -> {
+        EventLoopFutureTask<T> future = admitTracked(TaskType.TRACKED, (sequence, acceptedAt) -> {
             EventLoopFutureTask<T> createdFuture = new EventLoopFutureTask<>(
                     task, clock, initialSnapshot(sequence, acceptedAt), this::inEventLoop);
-            AcceptedTask<T> accepted = new AcceptedTask<>(
-                    sequence, createdFuture, createdFuture, null, false);
+            AcceptedTask<T> accepted = AcceptedTask.<T>builder()
+                    .acceptedSequence(sequence)
+                    .shutdownNowReturnValue(createdFuture)
+                    .future(createdFuture)
+                    .build();
             bindCancellation(accepted);
             return accepted;
         });
@@ -374,10 +384,11 @@ public final class EventLoopKernel {
         Objects.requireNonNull(deadline, "deadline 不能为空");
         gate.closeForAdmissions();
         publishStartupFailure(new StartupAbortedException(name));
-        awaitAdmissionsUninterruptibly();
-        List<Runnable> notStarted = registry.sweepShutdownNow();
+        gate.awaitDrained();
+        List<Runnable> notStarted = returnUnstarted();
         returned.addAndGet(notStarted.size());
         supervisor.requestShutdown(ShutdownMode.IMMEDIATE, deadline);
+        worker.interrupt();
         LockSupport.unpark(worker);
         return notStarted;
     }
@@ -388,9 +399,13 @@ public final class EventLoopKernel {
         gate.closeForAdmissions();
         publishStartupFailure(new StartupAbortedException(name));
         if (mode == ShutdownMode.IMMEDIATE) {
-            registry.cancelAll(CancellationReason.SHUTDOWN_NOW);
+            gate.awaitDrained();
+            discardUnstarted();
         }
         supervisor.requestShutdown(mode, deadline);
+        if (mode == ShutdownMode.IMMEDIATE) {
+            worker.interrupt();
+        }
         LockSupport.unpark(worker);
     }
 
@@ -485,10 +500,16 @@ public final class EventLoopKernel {
     }
 
     void stopWorker(ShutdownMode mode) {
+        if (mode == ShutdownMode.IMMEDIATE) {
+            discardUnstarted();
+        }
         stopMode.accumulateAndGet(mode, (current, requested) ->
                 current == ShutdownMode.IMMEDIATE || requested == ShutdownMode.IMMEDIATE
                         ? ShutdownMode.IMMEDIATE
                         : ShutdownMode.GRACEFUL);
+        if (mode == ShutdownMode.IMMEDIATE) {
+            worker.interrupt();
+        }
         LockSupport.unpark(worker);
     }
 
@@ -512,14 +533,21 @@ public final class EventLoopKernel {
 
     private boolean processCancellations() {
         boolean processed = false;
+        int physicalCompleted = 0;
         AcceptedTask<?> task;
-        while ((task = cancellationMailbox.poll()) != null) {
-            processed = true;
-            if (task.scheduled() && timers.remove(task.scheduledTask())) {
-                terminateTask(task);
+        try {
+            while ((task = cancellationMailbox.poll()) != null) {
+                processed = true;
+                if (task.scheduled() && timers.remove(task.scheduledTask())) {
+                    physicalCompleted += terminateTask(task);
+                }
+            }
+            return processed;
+        } finally {
+            if (physicalCompleted != 0) {
+                gate.completeBatch(physicalCompleted);
             }
         }
-        return processed;
     }
 
     private boolean cancelWaitingPeriodicTasks() {
@@ -527,161 +555,212 @@ public final class EventLoopKernel {
             return false;
         }
         boolean changed = false;
+        int physicalCompleted = 0;
         List<ScheduledTask<?>> retained = new ArrayList<>(timers.size());
         ScheduledTask<?> scheduled;
-        while ((scheduled = timers.poll()) != null) {
-            AcceptedTask<?> task = scheduled.acceptedTask();
-            if (scheduled.isPeriodic()) {
-                registry.cancelWaiting(task, CancellationReason.SHUTDOWN);
-                terminateTask(task);
-                changed = true;
-            } else {
-                retained.add(scheduled);
+        try {
+            while ((scheduled = timers.poll()) != null) {
+                AcceptedTask<?> task = scheduled.acceptedTask();
+                if (scheduled.isPeriodic()) {
+                    if (task.markCancelledWaiting()) {
+                        task.future().cancel(CancellationReason.SHUTDOWN);
+                    }
+                    physicalCompleted += terminateTask(task);
+                    changed = true;
+                } else {
+                    retained.add(scheduled);
+                }
+            }
+            retained.forEach(timers::add);
+            return changed;
+        } finally {
+            if (physicalCompleted != 0) {
+                gate.completeBatch(physicalCompleted);
             }
         }
-        retained.forEach(timers::add);
-        return changed;
     }
 
     private boolean processDueTimers() throws Throwable {
         boolean processed = false;
-        for (int count = 0; count < maxTimerBatchSize; count++) {
-            ScheduledTask<?> scheduled = timers.peek();
-            if (scheduled == null || !scheduled.isDue(clock.nanoTime())) {
-                break;
-            }
-            timers.poll();
-            AcceptedTask<?> task = scheduled.acceptedTask();
-            if (!task.tryStart()) {
-                terminateTask(task);
-                processed = true;
-                continue;
-            }
-            processed = true;
-            executing.incrementAndGet();
-            boolean repeat;
-            currentTask = task;
-            try {
-                repeat = scheduled.runInvocation();
-            } finally {
-                executing.decrementAndGet();
-            }
-            if (repeat && !quiescing.get() && task.returnToWaiting()) {
-                timers.add(scheduled);
-            } else {
-                if (repeat && !task.future().isDone()) {
-                    task.future().cancel(CancellationReason.SHUTDOWN);
-                }
-                terminateTask(task);
-            }
-            currentTask = null;
-        }
-        return processed;
-    }
-
-    private boolean processCommands() {
-        boolean processed = false;
-        for (int count = 0; count < maxCommandBatchSize; count++) {
-            AcceptedTask<?> task = queue.poll();
-            if (task == null) {
-                break;
-            }
-            processed = true;
-            if (task.state() != AcceptedTask.PhysicalState.WAITING
-                    || task.future().isDone()) {
-                terminateTask(task);
-                continue;
-            }
-            if (task.scheduled()) {
-                if (quiescing.get() && task.scheduledTask().isPeriodic()) {
-                    registry.cancelWaiting(task, CancellationReason.SHUTDOWN);
-                    terminateTask(task);
-                    continue;
-                }
-                timers.add(task.scheduledTask());
-                if (task.scheduledTask().isDue(clock.nanoTime())) {
+        int physicalCompleted = 0;
+        try {
+            for (int count = 0; count < maxTimerBatchSize; count++) {
+                ScheduledTask<?> scheduled = timers.peek();
+                if (scheduled == null || !scheduled.isDue(clock.nanoTime())) {
                     break;
                 }
-                continue;
+                timers.poll();
+                AcceptedTask<?> task = scheduled.acceptedTask();
+                processed = true;
+                if (!task.tryStart()) {
+                    physicalCompleted += terminateTask(task);
+                    continue;
+                }
+                executing++;
+                boolean repeat;
+                currentTask = task;
+                try {
+                    repeat = scheduled.runInvocation();
+                } catch (Throwable failure) {
+                    if (!task.future().isDone()) {
+                        task.future().cancel(CancellationReason.SHUTDOWN_NOW);
+                    }
+                    physicalCompleted += terminateTask(task);
+                    throw failure;
+                } finally {
+                    currentTask = null;
+                    executing--;
+                }
+                if (task.returnToWaiting(() -> scheduled.canRearm(
+                        repeat, quiescing.get()))) {
+                    timers.add(scheduled);
+                } else {
+                    if (repeat && !task.future().isDone()) {
+                        task.future().cancel(CancellationReason.SHUTDOWN);
+                    }
+                    physicalCompleted += terminateTask(task);
+                }
             }
-            runOrdinary(task);
+            return processed;
+        } finally {
+            if (physicalCompleted != 0) {
+                gate.completeBatch(physicalCompleted);
+            }
         }
-        return processed;
     }
 
-    private void runOrdinary(AcceptedTask<?> task) {
-        if (!task.tryStart()) {
-            terminateTask(task);
-            return;
-        }
-        executing.incrementAndGet();
-        currentTask = task;
+    private boolean processCommands() throws Throwable {
+        boolean processed = false;
+        int physicalCompleted = 0;
         try {
-            task.future().run();
-        } finally {
-            executing.decrementAndGet();
-        }
-        Throwable taskFailure = task.future().failure();
-        if (task.reportFailure() && taskFailure != null) {
-            try {
-                taskExceptionHandler.handle(owner, task.originalRunnable(), taskFailure);
-            } finally {
-                terminateTask(task);
-                currentTask = null;
+            for (int count = 0; count < maxCommandBatchSize; count++) {
+                if (!queue.poll()) {
+                    break;
+                }
+                processed = true;
+                switch (queue.currentType()) {
+                    case TOMBSTONE -> {
+                        queue.advanceConsumer();
+                        queue.releaseCurrentSlot();
+                    }
+                    case ORDINARY -> {
+                        if (!queue.tryStartCurrentOrdinary()) {
+                            OrdinaryState state = queue.currentOrdinaryState();
+                            queue.advanceConsumer();
+                            queue.releaseCurrentSlot();
+                            if (state == OrdinaryState.RETURNED
+                                    || state == OrdinaryState.DISCARDED) {
+                                cancelled++;
+                            }
+                            physicalCompleted++;
+                            continue;
+                        }
+                        Runnable ordinary = queue.currentOrdinary();
+                        currentOrdinary = ordinary;
+                        queue.advanceConsumer();
+                        executing++;
+                        try {
+                            ordinary.run();
+                            completed++;
+                        } catch (Throwable failure) {
+                            failed++;
+                            taskExceptionHandler.handle(owner, ordinary, failure);
+                        } finally {
+                            executing--;
+                            currentOrdinary = null;
+                            queue.terminalizeCurrentOrdinary();
+                            queue.releaseCurrentSlot();
+                            physicalCompleted++;
+                        }
+                    }
+                    case TRACKED -> {
+                        AcceptedTask<?> task = queue.currentRecord();
+                        queue.advanceConsumer();
+                        queue.releaseCurrentSlot();
+                        if (task.future().isDone() || !task.tryStart()) {
+                            physicalCompleted += terminateTask(task);
+                            continue;
+                        }
+                        executing++;
+                        currentTask = task;
+                        try {
+                            task.future().run();
+                        } finally {
+                            currentTask = null;
+                            executing--;
+                        }
+                        physicalCompleted += terminateTask(task);
+                    }
+                    case SCHEDULE -> {
+                        AcceptedTask<?> task = queue.currentRecord();
+                        queue.advanceConsumer();
+                        queue.releaseCurrentSlot();
+                        if (task.state() != AcceptedTask.PhysicalState.WAITING
+                                || task.future().isDone()) {
+                            physicalCompleted += terminateTask(task);
+                            continue;
+                        }
+                        ScheduledTask<?> scheduled = task.scheduledTask();
+                        if (quiescing.get() && scheduled.isPeriodic()) {
+                            if (task.markCancelledWaiting()) {
+                                task.future().cancel(CancellationReason.SHUTDOWN);
+                            }
+                            physicalCompleted += terminateTask(task);
+                            continue;
+                        }
+                        timers.add(scheduled);
+                        if (scheduled.isDue(clock.nanoTime())) {
+                            return true;
+                        }
+                    }
+                }
             }
-            return;
+            return processed;
+        } finally {
+            if (physicalCompleted != 0) {
+                gate.completeBatch(physicalCompleted);
+            }
         }
-        terminateTask(task);
-        currentTask = null;
     }
 
     private void publishDrainFact() {
         if (!quiescing.get()) {
             return;
         }
-        workerDrained.set(gate.activeAdmissions() == 0
+        workerDrained.set(gate.activePublishers() == 0
                 && queue.pending() == 0
                 && timers.isEmpty()
                 && cancellationMailbox.isEmpty()
-                && executing.get() == 0
+                && executing == 0
                 && registry.size() == 0);
     }
 
     private void parkUntilWork() {
+        parked.lazySet(true);
         ScheduledTask<?> next = timers.peek();
-        if (next == null) {
-            LockSupport.park(this);
-        } else {
-            long remaining = next.triggerNanos() - clock.nanoTime();
-            if (remaining > 0) {
-                LockSupport.parkNanos(this, remaining);
+        if (stopMode.get() == null
+                && cancellationMailbox.isEmpty()
+                && !queue.poll()
+                && (next == null || !next.isDue(clock.nanoTime()))) {
+            if (next == null) {
+                LockSupport.park(this);
+            } else {
+                long remaining = next.triggerNanos() - clock.nanoTime();
+                if (remaining > 0) {
+                    LockSupport.parkNanos(this, remaining);
+                }
             }
         }
+        parked.lazySet(false);
         if (Thread.interrupted() && stopMode.get() == null) {
             // 外部中断不是生命周期信号；清除状态后继续由 supervisor 管理。
         }
     }
 
-    private <T> EventLoopFutureTask<T> submitOrdinary(
-            Runnable original,
-            Callable<T> callable,
-            boolean reportFailure) {
-        Objects.requireNonNull(original, "original 不能为空");
-        Objects.requireNonNull(callable, "callable 不能为空");
-        return admit((sequence, acceptedAt) -> {
-            EventLoopFutureTask<T> future = new EventLoopFutureTask<>(
-                    callable, clock, initialSnapshot(sequence, acceptedAt), this::inEventLoop);
-            AcceptedTask<T> task = new AcceptedTask<>(
-                    sequence, original, future, null, reportFailure);
-            bindCancellation(task);
-            return task;
-        });
-    }
-
     private <V> EventLoopScheduledFuture<V> submitScheduled(
             ScheduledTaskSpec<V> spec,
             Runnable original) {
-        EventLoopFutureTask<V> future = admit((sequence, acceptedAt) -> {
+        EventLoopFutureTask<V> future = admitTracked(TaskType.SCHEDULE, (sequence, acceptedAt) -> {
             AtomicReference<Runnable> originalRef = new AtomicReference<>();
             ScheduledTask<V> scheduled = new ScheduledTask<>(
                     sequence,
@@ -693,8 +772,12 @@ public final class EventLoopKernel {
             EventLoopFutureTask<V> createdFuture = scheduled.future();
             Runnable originalRunnable = original == null ? createdFuture : original;
             originalRef.set(originalRunnable);
-            AcceptedTask<V> task = new AcceptedTask<>(
-                    sequence, originalRunnable, createdFuture, scheduled, false);
+            AcceptedTask<V> task = AcceptedTask.<V>builder()
+                    .acceptedSequence(sequence)
+                    .shutdownNowReturnValue(originalRunnable)
+                    .future(createdFuture)
+                    .scheduledTask(scheduled)
+                    .build();
             scheduled.bind(task);
             bindCancellation(task);
             return task;
@@ -705,40 +788,101 @@ public final class EventLoopKernel {
         return future;
     }
 
-    private <T> EventLoopFutureTask<T> admit(TaskFactory<T> factory) {
+    private boolean admitOrdinary(Runnable command) {
+        GroupLifecycleCoordinator.AdmissionLease ownerLease = acquireOwnerAdmission();
+        if (groupOwner != null && ownerLease == null) {
+            return false;
+        }
+        try {
+            if (!gate.tryEnter()) {
+                return false;
+            }
+            boolean rollbackOutstanding = true;
+            long sequence = -1;
+            try {
+                try {
+                    try {
+                        sequence = queue.tryClaim();
+                        if (sequence < 0) {
+                            return false;
+                        }
+                        queue.writeOrdinary(sequence, command);
+                        rollbackOutstanding = false;
+                    } finally {
+                        if (sequence >= 0 && rollbackOutstanding) {
+                            queue.writeTombstone(sequence);
+                        }
+                    }
+                } finally {
+                    if (sequence >= 0) {
+                        queue.publish(sequence);
+                        signalWorkerIfParked();
+                    }
+                }
+            } finally {
+                gate.leave(rollbackOutstanding);
+            }
+            return true;
+        } finally {
+            if (ownerLease != null) {
+                ownerLease.close();
+            }
+        }
+    }
+
+    private <T> EventLoopFutureTask<T> admitTracked(
+            TaskType type,
+            TaskFactory<T> factory) {
+        if (type != TaskType.TRACKED && type != TaskType.SCHEDULE) {
+            throw new IllegalArgumentException("tracked 准入类型非法：" + type);
+        }
+        Objects.requireNonNull(factory, "factory 不能为空");
         GroupLifecycleCoordinator.AdmissionLease ownerLease = acquireOwnerAdmission();
         if (groupOwner != null && ownerLease == null) {
             return null;
         }
         try {
-            AdmissionToken token = gate.tryAcquire();
-            if (token == null) {
+            if (!gate.tryEnter()) {
                 return null;
             }
-            TaskReservation reservation = queue.tryReserve();
-            if (reservation == null) {
-                token.abort();
-                return null;
-            }
+            boolean rollbackOutstanding = true;
+            long sequence = -1;
             AcceptedTask<T> task = null;
             boolean registered = false;
             try {
-                long acceptedAt = clock.nanoTime();
-                task = factory.create(reservation.sequence(), acceptedAt);
-                registry.register(task, token);
-                registered = true;
-                reservation.publish(task);
-                token.commit();
-                LockSupport.unpark(worker);
-                return task.future();
-            } catch (Throwable failure) {
-                reservation.abort();
-                if (registered) {
-                    registry.rollback(task);
+                try {
+                    try {
+                        sequence = queue.tryClaim();
+                        if (sequence < 0) {
+                            return null;
+                        }
+                        task = factory.create(sequence, clock.nanoTime());
+                        registry.register(task);
+                        registered = true;
+                        if (type == TaskType.TRACKED) {
+                            queue.writeTracked(sequence, task);
+                        } else {
+                            queue.writeSchedule(sequence, task);
+                        }
+                        rollbackOutstanding = false;
+                    } finally {
+                        if (sequence >= 0 && rollbackOutstanding) {
+                            if (registered) {
+                                registry.terminalizeAndRemove(task);
+                            }
+                            queue.writeTombstone(sequence);
+                        }
+                    }
+                } finally {
+                    if (sequence >= 0) {
+                        queue.publish(sequence);
+                        signalWorkerIfParked();
+                    }
                 }
-                token.abort();
-                throw failure;
+            } finally {
+                gate.leave(rollbackOutstanding);
             }
+            return task.future();
         } finally {
             if (ownerLease != null) {
                 ownerLease.close();
@@ -752,7 +896,7 @@ public final class EventLoopKernel {
     }
 
     private boolean acceptingTasks() {
-        if (!gate.accepting()) {
+        if (!gate.isAccepting()) {
             return false;
         }
         GroupLifecycleCoordinator current = groupOwner;
@@ -778,55 +922,110 @@ public final class EventLoopKernel {
         });
     }
 
-    private void terminateTask(AcceptedTask<?> task) {
-        if (!registry.terminate(task)) {
-            return;
+    private int terminateTask(AcceptedTask<?> task) {
+        if (!task.terminate()) {
+            return 0;
         }
+        registry.remove(task);
         switch (task.future().snapshot().outcome()) {
-            case SUCCEEDED -> completed.incrementAndGet();
-            case FAILED -> failed.incrementAndGet();
-            case CANCELLED -> cancelled.incrementAndGet();
+            case SUCCEEDED -> completed++;
+            case FAILED -> failed++;
+            case CANCELLED -> cancelled++;
             case WAITING, RUNNING -> {
                 task.future().cancel(CancellationReason.SHUTDOWN_NOW);
-                cancelled.incrementAndGet();
+                cancelled++;
             }
         }
+        return 1;
     }
 
     private void cancelAndClearRetainedTasks() {
-        registry.cancelAll(CancellationReason.SHUTDOWN_NOW);
+        gate.awaitDrained();
+        discardUnstarted();
+        int physicalCompleted = 0;
         AcceptedTask<?> running = currentTask;
         if (running != null) {
             running.future().cancel(CancellationReason.SHUTDOWN_NOW);
-            terminateTask(running);
+            physicalCompleted += terminateTask(running);
             currentTask = null;
         }
         ScheduledTask<?> scheduled;
         while ((scheduled = timers.poll()) != null) {
-            terminateTask(scheduled.acceptedTask());
+            physicalCompleted += terminateTask(scheduled.acceptedTask());
         }
-        AcceptedTask<?> task;
-        while ((task = queue.poll()) != null) {
-            terminateTask(task);
+        while (queue.poll()) {
+            TaskType type = queue.currentType();
+            if (type == TaskType.ORDINARY) {
+                if (queue.tryStartCurrentOrdinary()) {
+                    queue.terminalizeCurrentOrdinary();
+                } else {
+                    cancelled++;
+                }
+                queue.advanceConsumer();
+                queue.releaseCurrentSlot();
+                physicalCompleted++;
+            } else if (type == TaskType.TOMBSTONE) {
+                queue.advanceConsumer();
+                queue.releaseCurrentSlot();
+            } else {
+                AcceptedTask<?> task = queue.currentRecord();
+                queue.advanceConsumer();
+                queue.releaseCurrentSlot();
+                if (task.tryDiscard()) {
+                    task.future().cancel(CancellationReason.SHUTDOWN_NOW);
+                }
+                physicalCompleted += terminateTask(task);
+            }
         }
         while (cancellationMailbox.poll() != null) {
             // 任务已由 timer/queue/running 路径完成物理清理。
         }
-        workerDrained.set(registry.size() == 0 && gate.activeAdmissions() == 0);
+        registry.scanForShutdown(task -> {
+            if (task.tryDiscard()) {
+                task.future().cancel(CancellationReason.SHUTDOWN_NOW);
+            }
+        });
+        if (physicalCompleted != 0) {
+            gate.completeBatch(physicalCompleted);
+        }
+        workerDrained.set(registry.size() == 0 && gate.activePublishers() == 0);
     }
 
-    private void awaitAdmissionsUninterruptibly() {
-        boolean interrupted = false;
-        while (true) {
-            try {
-                gate.awaitAdmissions(ShutdownDeadline.unbounded());
-                break;
-            } catch (InterruptedException ignored) {
-                interrupted = true;
+    private List<Runnable> returnUnstarted() {
+        List<SequencedRunnable> claimed = new ArrayList<>();
+        long frozen = queue.claimedCursor();
+        queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.RETURN,
+                (sequence, original) -> claimed.add(new SequencedRunnable(sequence, original)));
+        registry.scanForShutdown(task -> {
+            if (task.tryReturn()) {
+                task.future().cancel(CancellationReason.SHUTDOWN_NOW);
+                claimed.add(new SequencedRunnable(
+                        task.acceptedSequence(), task.shutdownNowReturnValue()));
+            } else if (task.state() == AcceptedTask.PhysicalState.RUNNING) {
+                task.future().cancel(true);
             }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
+        });
+        claimed.sort((left, right) -> Long.compare(left.sequence(), right.sequence()));
+        return claimed.stream().map(SequencedRunnable::task).toList();
+    }
+
+    private void discardUnstarted() {
+        long frozen = queue.claimedCursor();
+        queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.DISCARD,
+                (sequence, original) -> {
+                });
+        registry.scanForShutdown(task -> {
+            if (task.tryDiscard()) {
+                task.future().cancel(CancellationReason.SHUTDOWN_NOW);
+            } else if (task.state() == AcceptedTask.PhysicalState.RUNNING) {
+                task.future().cancel(true);
+            }
+        });
+    }
+
+    private void signalWorkerIfParked() {
+        if (parked.get()) {
+            LockSupport.unpark(worker);
         }
     }
 
@@ -840,10 +1039,10 @@ public final class EventLoopKernel {
                 .outstandingTasks(gate.outstanding())
                 .ingressPendingTasks(queue.pending())
                 .scheduledPendingTasks(timers.size())
-                .executingTasks(executing.get())
-                .completedTasks(completed.get())
-                .failedTasks(failed.get())
-                .cancelledTasks(cancelled.get())
+                .executingTasks(executing)
+                .completedTasks(completed)
+                .failedTasks(failed)
+                .cancelledTasks(cancelled)
                 .shutdownNowReturnedTasks(returned.get())
                 .allocatedQueueSegments(queue.allocatedSegments())
                 .failure(workerSnapshot.failure())
@@ -925,6 +1124,9 @@ public final class EventLoopKernel {
     @FunctionalInterface
     private interface TaskFactory<T> {
         AcceptedTask<T> create(long sequence, long acceptedAtNanos);
+    }
+
+    private record SequencedRunnable(long sequence, Runnable task) {
     }
 
     private static final class StartupAbortedException extends IllegalStateException {

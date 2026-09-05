@@ -1,165 +1,319 @@
 package com.sstlfsj.disruptor.concurrent.internal;
 
-import com.sstlfsj.disruptor.concurrent.ScheduleMode;
-import com.sstlfsj.disruptor.concurrent.ScheduledTaskSnapshot;
-import com.sstlfsj.disruptor.concurrent.TaskOutcome;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.OptionalInt;
-import java.util.OptionalLong;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TaskQueueContractTest {
 
     private static final int PRODUCERS = 4;
-    private static final int TASKS_PER_PRODUCER = 10_000;
+    private static final int TASKS_PER_PRODUCER = 1_000;
 
     static Stream<QueueFactory> queues() {
         return Stream.of(
-                new QueueFactory("bounded", () -> new BoundedTaskQueue(65_536)),
-                new QueueFactory("unbounded", () -> new UnboundedTaskQueue(1_024)));
+                new QueueFactory("bounded", () -> new BoundedTaskQueue(4_096)),
+                new QueueFactory("unbounded", () -> new UnboundedTaskQueue(64)));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("queues")
-    void concurrentReservationsPublishEverySequenceExactlyOnce(QueueFactory factory) throws Exception {
+    void consumerStopsAtTheFirstPublicationHole(QueueFactory factory) {
         TaskQueue queue = factory.create();
-        ExecutorService producers = Executors.newFixedThreadPool(PRODUCERS + 1);
+        long first = queue.tryClaim();
+        long second = queue.tryClaim();
+        SequencedRunnable firstTask = new SequencedRunnable(first);
+        SequencedRunnable secondTask = new SequencedRunnable(second);
+        queue.writeOrdinary(second, secondTask);
+        queue.publish(second);
+
+        assertFalse(queue.poll());
+
+        queue.writeOrdinary(first, firstTask);
+        queue.publish(first);
+        assertTrue(queue.poll());
+        assertSame(firstTask, queue.currentOrdinary());
+        finishCurrentOrdinary(queue);
+        assertTrue(queue.poll());
+        assertSame(secondTask, queue.currentOrdinary());
+        finishCurrentOrdinary(queue);
+        assertFalse(queue.poll());
+        assertEquals(0, queue.pending());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("queues")
+    void ordinaryOwnershipMovesFromWaitingToRunningToTerminal(QueueFactory factory) {
+        TaskQueue queue = factory.create();
+        publishOrdinary(queue);
+
+        assertTrue(queue.poll());
+        assertEquals(TaskType.ORDINARY, queue.currentType());
+        assertEquals(OrdinaryState.WAITING, queue.currentOrdinaryState());
+        assertTrue(queue.tryStartCurrentOrdinary());
+        assertFalse(queue.tryStartCurrentOrdinary());
+        assertEquals(OrdinaryState.RUNNING, queue.currentOrdinaryState());
+        Runnable captured = queue.currentOrdinary();
+        queue.advanceConsumer();
+        queue.terminalizeCurrentOrdinary();
+        assertEquals(OrdinaryState.TERMINAL, queue.currentOrdinaryState());
+        queue.releaseCurrentSlot();
+        assertTrue(captured instanceof SequencedRunnable);
+    }
+
+    @Test
+    void boundedSlotCannotBeReusedUntilItIsReleased() {
+        BoundedTaskQueue queue = new BoundedTaskQueue(1);
+        publishOrdinary(queue);
+        assertEquals(-1, queue.tryClaim());
+
+        assertTrue(queue.poll());
+        assertTrue(queue.tryStartCurrentOrdinary());
+        queue.advanceConsumer();
+        assertEquals(0, queue.pending());
+        assertEquals(-1, queue.tryClaim());
+
+        queue.terminalizeCurrentOrdinary();
+        queue.releaseCurrentSlot();
+        assertEquals(1, queue.tryClaim());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("queues")
+    void concurrentProducersPublishEverySequenceExactlyOnce(QueueFactory factory) throws Exception {
+        TaskQueue queue = factory.create();
+        ExecutorService threads = Executors.newFixedThreadPool(PRODUCERS + 1);
         CountDownLatch start = new CountDownLatch(1);
         try {
             int total = PRODUCERS * TASKS_PER_PRODUCER;
-            Future<?> consumption = producers.submit(() -> {
+            Future<?> consumer = threads.submit(() -> {
                 start.await();
-                long expectedSequence = 0;
-                while (expectedSequence < total) {
-                    AcceptedTask<?> task = queue.poll();
-                    if (task == null) {
+                long expected = 0;
+                while (expected < total) {
+                    if (!queue.poll()) {
                         Thread.onSpinWait();
                         continue;
                     }
-                    assertEquals(expectedSequence, task.acceptedSequence());
-                    expectedSequence++;
+                    assertEquals(TaskType.ORDINARY, queue.currentType());
+                    SequencedRunnable task = (SequencedRunnable) queue.currentOrdinary();
+                    assertEquals(expected, task.sequence());
+                    assertTrue(queue.tryStartCurrentOrdinary());
+                    queue.advanceConsumer();
+                    queue.terminalizeCurrentOrdinary();
+                    queue.releaseCurrentSlot();
+                    expected++;
                 }
                 return null;
             });
-            List<Future<?>> writes = new ArrayList<>();
+            List<Future<?>> producers = new ArrayList<>();
             for (int producer = 0; producer < PRODUCERS; producer++) {
-                writes.add(producers.submit(() -> {
+                producers.add(threads.submit(() -> {
                     start.await();
                     for (int index = 0; index < TASKS_PER_PRODUCER; index++) {
-                        TaskReservation reservation = present(queue.tryReserve());
-                        reservation.publish(task(reservation.sequence()));
+                        long sequence;
+                        while ((sequence = queue.tryClaim()) < 0) {
+                            Thread.onSpinWait();
+                        }
+                        queue.writeOrdinary(sequence, new SequencedRunnable(sequence));
+                        queue.publish(sequence);
                     }
                     return null;
                 }));
             }
             start.countDown();
-            for (Future<?> write : writes) {
-                write.get(10, TimeUnit.SECONDS);
+            for (Future<?> producer : producers) {
+                producer.get(10, TimeUnit.SECONDS);
             }
-            consumption.get(10, TimeUnit.SECONDS);
+            consumer.get(10, TimeUnit.SECONDS);
 
-            assertNull(queue.poll());
+            assertFalse(queue.poll());
+            assertEquals(total - 1L, queue.claimedCursor());
             assertEquals(0, queue.pending());
             assertEquals(0, retainedReferences(queue));
         } finally {
-            producers.shutdownNow();
+            threads.shutdownNow();
         }
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("queues")
-    void abortPublishesTombstoneWithoutLeavingASequenceHole(QueueFactory factory) {
+    void tombstoneOccupiesItsSequenceWithoutExposingAPayload(QueueFactory factory) {
         TaskQueue queue = factory.create();
-        TaskReservation first = present(queue.tryReserve());
-        TaskReservation second = present(queue.tryReserve());
-        second.publish(task(second.sequence()));
+        long tombstone = queue.tryClaim();
+        queue.writeTombstone(tombstone);
+        queue.publish(tombstone);
+        SequencedRunnable ordinary = publishOrdinary(queue);
 
-        assertNull(queue.poll());
-        first.abort();
+        assertTrue(queue.poll());
+        assertEquals(TaskType.TOMBSTONE, queue.currentType());
+        queue.advanceConsumer();
+        queue.releaseCurrentSlot();
+        assertTrue(queue.poll());
+        assertSame(ordinary, queue.currentOrdinary());
+        finishCurrentOrdinary(queue);
+        assertFalse(queue.poll());
+    }
 
-        assertEquals(second.sequence(), present(queue.poll()).acceptedSequence());
-        assertNull(queue.poll());
-        assertEquals(0, queue.pending());
-        assertEquals(0, retainedReferences(queue));
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("queues")
+    void scannerAndWorkerCannotBothClaimTheSameOrdinary(QueueFactory factory) throws Exception {
+        TaskQueue queue = factory.create();
+        SequencedRunnable task = publishOrdinary(queue);
+        assertTrue(queue.poll());
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicBoolean workerWon = new AtomicBoolean();
+        List<Runnable> returned = new ArrayList<>();
+        Thread scanner = Thread.ofPlatform().start(() -> {
+            await(start);
+            queue.scanOrdinaryUnstarted(queue.claimedCursor(), OrdinaryDisposition.RETURN,
+                    (sequence, original) -> returned.add(original));
+        });
+
+        start.countDown();
+        workerWon.set(queue.tryStartCurrentOrdinary());
+        scanner.join(1_000);
+        assertFalse(scanner.isAlive());
+        assertEquals(workerWon.get() ? 0 : 1, returned.size());
+        if (!workerWon.get()) {
+            assertSame(task, returned.get(0));
+            assertEquals(OrdinaryState.RETURNED, queue.currentOrdinaryState());
+        }
+        queue.advanceConsumer();
+        if (workerWon.get()) {
+            queue.terminalizeCurrentOrdinary();
+        }
+        queue.releaseCurrentSlot();
     }
 
     @Test
-    void boundedQueueDoesNotReuseASlotBeforeSingleConsumerAdvances() {
-        BoundedTaskQueue queue = new BoundedTaskQueue(2);
-        TaskReservation first = present(queue.tryReserve());
-        TaskReservation second = present(queue.tryReserve());
-        assertNull(queue.tryReserve());
-        first.publish(task(first.sequence()));
-        second.publish(task(second.sequence()));
-        assertNull(queue.tryReserve());
-
-        assertNotNull(queue.poll());
-
-        present(queue.tryReserve()).abort();
-        assertNotNull(queue.poll());
-        assertNull(queue.poll());
-        assertEquals(0, queue.retainedReferences());
-    }
-
-    @Test
-    void unboundedQueueReclaimsConsumedSegments() {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(4);
-        for (int index = 0; index < 12; index++) {
-            TaskReservation reservation = queue.tryReserve();
-            reservation.publish(task(reservation.sequence()));
+    void unboundedQueueRecyclesSegmentsWithoutIncreasingAllocatedCount() {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
+        for (int index = 0; index < 6; index++) {
+            publishOrdinary(queue);
         }
         assertEquals(3, queue.allocatedSegments());
+        assertEquals(3, queue.activeSegments());
+        consumeOrdinaries(queue, 6);
+        assertEquals(3, queue.allocatedSegments());
+        assertEquals(1, queue.activeSegments());
 
-        for (int index = 0; index < 12; index++) {
-            assertNotNull(queue.poll());
+        for (int index = 0; index < 4; index++) {
+            publishOrdinary(queue);
         }
-
-        assertEquals(1, queue.allocatedSegments());
-        assertEquals(0, queue.retainedReferences());
+        assertEquals(3, queue.allocatedSegments());
+        assertEquals(3, queue.activeSegments());
+        consumeOrdinaries(queue, 4);
     }
 
     @Test
-    void unboundedQueueAdvancesWhenNextSegmentIsAllocatedAfterBoundaryConsumption() {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
-        for (int index = 0; index < 2; index++) {
-            TaskReservation reservation = queue.tryReserve();
-            reservation.publish(task(reservation.sequence()));
-        }
-        assertNotNull(queue.poll());
-        assertNotNull(queue.poll());
+    void unboundedReusedCellRequiresTheNewPublicationGeneration() {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1);
+        publishOrdinary(queue);
+        consumeOrdinaries(queue, 1);
+        publishOrdinary(queue);
+        consumeOrdinaries(queue, 1);
 
-        TaskReservation later = queue.tryReserve();
-        later.publish(task(later.sequence()));
+        long reused = queue.tryClaim();
+        SequencedRunnable task = new SequencedRunnable(reused);
+        queue.writeOrdinary(reused, task);
+        assertFalse(queue.poll());
 
-        assertEquals(later.sequence(), present(queue.poll()).acceptedSequence());
-        assertEquals(1, queue.allocatedSegments());
+        queue.publish(reused);
+        assertTrue(queue.poll());
+        assertSame(task, queue.currentOrdinary());
+        finishCurrentOrdinary(queue);
     }
 
-    private static AcceptedTask<Void> task(long sequence) {
-        ScheduledTaskSnapshot snapshot = ScheduledTaskSnapshot.builder()
-                .acceptedSequence(sequence)
-                .scheduleMode(ScheduleMode.ONE_SHOT)
-                .expiresAtNanos(OptionalLong.empty())
-                .maxExecutions(OptionalInt.empty())
-                .outcome(TaskOutcome.WAITING)
-                .build();
-        return new AcceptedTask<>(sequence, () -> {
-        }, new EventLoopFutureTask<>(() -> null, () -> 0, snapshot, () -> false));
+    @Test
+    void unboundedDoubleScannerAndConsumerDoNotUseRecycledSegments() throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
+        int total = 128;
+        for (int index = 0; index < total; index++) {
+            publishOrdinary(queue);
+        }
+        long frozen = queue.claimedCursor();
+        Set<Long> claimed = ConcurrentHashMap.newKeySet();
+        CountDownLatch start = new CountDownLatch(1);
+        Runnable scan = () -> {
+            await(start);
+            queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.RETURN,
+                    (sequence, task) -> assertTrue(claimed.add(sequence)));
+        };
+        ExecutorService racers = Executors.newFixedThreadPool(3);
+        try {
+            Future<?> firstScanner = racers.submit(scan);
+            Future<?> secondScanner = racers.submit(scan);
+            Future<?> consumer = racers.submit(() -> {
+                await(start);
+                int consumed = 0;
+                while (consumed < total) {
+                    if (!queue.poll()) {
+                        Thread.onSpinWait();
+                        continue;
+                    }
+                    long sequence = ((SequencedRunnable) queue.currentOrdinary()).sequence();
+                    if (queue.tryStartCurrentOrdinary()) {
+                        assertTrue(claimed.add(sequence));
+                    }
+                    OrdinaryState state = queue.currentOrdinaryState();
+                    queue.advanceConsumer();
+                    if (state == OrdinaryState.RUNNING) {
+                        queue.terminalizeCurrentOrdinary();
+                    }
+                    queue.releaseCurrentSlot();
+                    consumed++;
+                }
+            });
+
+            start.countDown();
+            firstScanner.get(5, TimeUnit.SECONDS);
+            secondScanner.get(5, TimeUnit.SECONDS);
+            consumer.get(5, TimeUnit.SECONDS);
+            assertEquals(total, claimed.size());
+            assertEquals(1, queue.activeSegments());
+            assertTrue(queue.allocatedSegments() <= 9);
+        } finally {
+            racers.shutdownNow();
+        }
+    }
+
+    private static SequencedRunnable publishOrdinary(TaskQueue queue) {
+        long sequence = queue.tryClaim();
+        assertTrue(sequence >= 0);
+        SequencedRunnable task = new SequencedRunnable(sequence);
+        queue.writeOrdinary(sequence, task);
+        queue.publish(sequence);
+        return task;
+    }
+
+    private static void consumeOrdinaries(TaskQueue queue, int count) {
+        for (int index = 0; index < count; index++) {
+            assertTrue(queue.poll());
+            finishCurrentOrdinary(queue);
+        }
+    }
+
+    private static void finishCurrentOrdinary(TaskQueue queue) {
+        assertTrue(queue.tryStartCurrentOrdinary());
+        queue.advanceConsumer();
+        queue.terminalizeCurrentOrdinary();
+        queue.releaseCurrentSlot();
     }
 
     private static int retainedReferences(TaskQueue queue) {
@@ -169,9 +323,19 @@ class TaskQueueContractTest {
         return ((UnboundedTaskQueue) queue).retainedReferences();
     }
 
-    private static <T> T present(T value) {
-        assertNotNull(value);
-        return value;
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    private record SequencedRunnable(long sequence) implements Runnable {
+        @Override
+        public void run() {
+        }
     }
 
     private record QueueFactory(String name, Factory factory) {

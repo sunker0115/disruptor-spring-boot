@@ -226,6 +226,32 @@ class EventLoopShutdownTest {
         assertEquals(0, terminated.executingTasks());
     }
 
+    @Test
+    void shutdownNowReturnsQueuedOrdinaryButNeverTheRunningOrdinary() throws Exception {
+        DisruptorEventLoop loop = runningLoop("ordinary-shutdown-race", 8);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Runnable running = () -> {
+            entered.countDown();
+            awaitIgnoringInterrupt(release);
+        };
+        NamedRunnable queued = new NamedRunnable("queued");
+        loop.execute(running);
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        loop.execute(queued);
+
+        List<Runnable> returned = loop.shutdownNow();
+
+        assertEquals(List.of(queued), returned);
+        assertFalse(returned.contains(running));
+        release.countDown();
+        EventLoopSnapshot terminated = loop.termination().toCompletableFuture()
+                .get(2, TimeUnit.SECONDS);
+        assertEquals(1, terminated.completedTasks());
+        assertEquals(1, terminated.cancelledTasks());
+        assertEquals(1, terminated.shutdownNowReturnedTasks());
+    }
+
     private static DisruptorEventLoop runningLoop(String name, int capacity) throws Exception {
         DisruptorEventLoop loop = EventLoopBuilder.bounded(name, capacity)
                 .shutdownTimeout(Duration.ofSeconds(2))

@@ -1,15 +1,73 @@
 package com.sstlfsj.disruptor.concurrent.internal;
 
-/** 多生产者保留/发布、单消费者轮询的唯一可替换内核边界。 */
+/** 多生产者 claim/publish、单消费者消费以及关闭扫描的物理存储边界。 */
 interface TaskQueue {
 
-    TaskReservation tryReserve();
+    long tryClaim();
 
-    AcceptedTask<?> poll();
+    void writeOrdinary(long sequence, Runnable task);
+
+    void writeTracked(long sequence, AcceptedTask<?> record);
+
+    void writeSchedule(long sequence, AcceptedTask<?> record);
+
+    void writeTombstone(long sequence);
+
+    void publish(long sequence);
+
+    boolean poll();
+
+    TaskType currentType();
+
+    Runnable currentOrdinary();
+
+    AcceptedTask<?> currentRecord();
+
+    boolean tryStartCurrentOrdinary();
+
+    OrdinaryState currentOrdinaryState();
+
+    void terminalizeCurrentOrdinary();
+
+    void advanceConsumer();
+
+    void releaseCurrentSlot();
+
+    long claimedCursor();
 
     long pending();
 
-    long remainingCapacity();
+    void scanOrdinaryUnstarted(
+            long claimedInclusive,
+            OrdinaryDisposition disposition,
+            OrdinaryClaimedSink sink);
 
     int allocatedSegments();
+
+    int activeSegments();
+}
+
+enum TaskType {
+    ORDINARY,
+    TRACKED,
+    SCHEDULE,
+    TOMBSTONE
+}
+
+enum OrdinaryState {
+    WAITING,
+    RUNNING,
+    RETURNED,
+    DISCARDED,
+    TERMINAL
+}
+
+enum OrdinaryDisposition {
+    RETURN,
+    DISCARD
+}
+
+@FunctionalInterface
+interface OrdinaryClaimedSink {
+    void accept(long sequence, Runnable original);
 }

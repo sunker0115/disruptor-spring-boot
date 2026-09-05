@@ -1,58 +1,49 @@
 package com.sstlfsj.disruptor.concurrent.internal;
 
+import lombok.Builder;
+
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** accepted 任务的 registry 记录，将 Future 终态与物理清理分离。 */
+/** tracked/scheduled 任务的独立物理所有权记录。 */
 final class AcceptedTask<V> {
 
     enum PhysicalState {
         WAITING,
         RUNNING,
-        CANCELLED_WAITING,
         RETURNED,
+        DISCARDED,
+        CANCELLED_WAITING,
         TERMINAL
     }
 
     private final long acceptedSequence;
-    private final Runnable originalRunnable;
+    private final Runnable shutdownNowReturnValue;
     private final EventLoopFutureTask<V> future;
     private final ScheduledTask<V> scheduledTask;
-    private final boolean reportFailure;
-    private final AtomicReference<PhysicalState> state = new AtomicReference<>(PhysicalState.WAITING);
+    private final AtomicReference<PhysicalState> state =
+            new AtomicReference<>(PhysicalState.WAITING);
     private final AtomicBoolean cancellationQueued = new AtomicBoolean();
 
-    AcceptedTask(
+    @Builder
+    private AcceptedTask(
             long acceptedSequence,
-            Runnable originalRunnable,
-            EventLoopFutureTask<V> future) {
-        this(acceptedSequence, originalRunnable, future, null, false);
-    }
-
-    AcceptedTask(
-            long acceptedSequence,
-            Runnable originalRunnable,
+            Runnable shutdownNowReturnValue,
             EventLoopFutureTask<V> future,
-            ScheduledTask<V> scheduledTask,
-            boolean reportFailure) {
+            ScheduledTask<V> scheduledTask) {
         if (acceptedSequence < 0) {
             throw new IllegalArgumentException("acceptedSequence 不能为负数");
         }
         this.acceptedSequence = acceptedSequence;
-        this.originalRunnable = Objects.requireNonNull(originalRunnable,
-                "originalRunnable 不能为空");
+        this.shutdownNowReturnValue = Objects.requireNonNull(
+                shutdownNowReturnValue, "shutdownNowReturnValue 不能为空");
         this.future = Objects.requireNonNull(future, "future 不能为空");
         this.scheduledTask = scheduledTask;
-        this.reportFailure = reportFailure;
     }
 
     long acceptedSequence() {
         return acceptedSequence;
-    }
-
-    Runnable originalRunnable() {
-        return originalRunnable;
     }
 
     EventLoopFutureTask<V> future() {
@@ -67,32 +58,40 @@ final class AcceptedTask<V> {
         return scheduledTask != null;
     }
 
-    boolean reportFailure() {
-        return reportFailure;
-    }
-
-    PhysicalState state() {
-        return state.get();
+    Runnable shutdownNowReturnValue() {
+        return shutdownNowReturnValue;
     }
 
     boolean tryStart() {
         return state.compareAndSet(PhysicalState.WAITING, PhysicalState.RUNNING);
     }
 
-    boolean returnToWaiting() {
-        return state.compareAndSet(PhysicalState.RUNNING, PhysicalState.WAITING);
-    }
-
-    boolean markCancelledWaiting() {
-        return state.compareAndSet(PhysicalState.WAITING, PhysicalState.CANCELLED_WAITING);
-    }
-
     boolean tryReturn() {
         return state.compareAndSet(PhysicalState.WAITING, PhysicalState.RETURNED);
     }
 
+    boolean tryDiscard() {
+        return state.compareAndSet(PhysicalState.WAITING, PhysicalState.DISCARDED);
+    }
+
+    boolean markCancelledWaiting() {
+        return state.compareAndSet(
+                PhysicalState.WAITING, PhysicalState.CANCELLED_WAITING);
+    }
+
+    boolean returnToWaiting(RearmCheck check) {
+        Objects.requireNonNull(check, "check 不能为空");
+        return state.get() == PhysicalState.RUNNING
+                && check.canRearm()
+                && state.compareAndSet(PhysicalState.RUNNING, PhysicalState.WAITING);
+    }
+
     boolean terminate() {
         return state.getAndSet(PhysicalState.TERMINAL) != PhysicalState.TERMINAL;
+    }
+
+    PhysicalState state() {
+        return state.get();
     }
 
     boolean markCancellationQueued() {
@@ -102,4 +101,9 @@ final class AcceptedTask<V> {
     void clearCancellationQueued() {
         cancellationQueued.set(false);
     }
+}
+
+@FunctionalInterface
+interface RearmCheck {
+    boolean canRearm();
 }

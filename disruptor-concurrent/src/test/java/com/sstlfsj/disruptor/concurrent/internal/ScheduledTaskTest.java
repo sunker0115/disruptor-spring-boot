@@ -175,8 +175,13 @@ class ScheduledTaskTest {
     @Test
     void acceptedTaskSeparatesFutureOutcomeFromPhysicalCleanup() {
         EventLoopFutureTask<Void> future = future(8);
-        AcceptedTask<Void> accepted = new AcceptedTask<>(8, () -> {
-        }, future);
+        Runnable command = () -> {
+        };
+        AcceptedTask<Void> accepted = AcceptedTask.<Void>builder()
+                .acceptedSequence(8)
+                .shutdownNowReturnValue(command)
+                .future(future)
+                .build();
 
         assertTrue(accepted.tryStart());
         assertTrue(future.cancel(CancellationReason.FUTURE_CANCELLED_INTERRUPT));
@@ -189,8 +194,13 @@ class ScheduledTaskTest {
 
     @Test
     void cancellationMailboxKeepsAtMostOnePendingNodePerTask() {
-        AcceptedTask<Void> accepted = new AcceptedTask<>(9, () -> {
-        }, future(9));
+        Runnable command = () -> {
+        };
+        AcceptedTask<Void> accepted = AcceptedTask.<Void>builder()
+                .acceptedSequence(9)
+                .shutdownNowReturnValue(command)
+                .future(future(9))
+                .build();
         CancellationMailbox mailbox = new CancellationMailbox();
 
         assertTrue(mailbox.offer(accepted));
