@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -13,12 +14,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class TaskQueueContractTest {
@@ -241,6 +245,40 @@ class TaskQueueContractTest {
     }
 
     @Test
+    void unboundedDelayedProducerLookupIsProtectedBySegmentLifecycleLock() throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1);
+        publishOrdinary(queue);
+        long delayed = queue.tryClaim();
+        SequencedRunnable delayedTask = new SequencedRunnable(delayed);
+        SequencedRunnable aheadTask = publishOrdinary(queue);
+        ReentrantLock lifecycleLock = segmentLifecycleLock(queue);
+        ExecutorService producer = Executors.newSingleThreadExecutor();
+        CountDownLatch writeStarted = new CountDownLatch(1);
+        try {
+            Future<?> delayedWrite;
+            lifecycleLock.lock();
+            try {
+                delayedWrite = producer.submit(() -> {
+                    writeStarted.countDown();
+                    queue.writeOrdinary(delayed, delayedTask);
+                });
+                assertTrue(writeStarted.await(1, TimeUnit.SECONDS));
+                Future<?> blockedWrite = delayedWrite;
+                assertThrows(TimeoutException.class,
+                        () -> blockedWrite.get(200, TimeUnit.MILLISECONDS));
+            } finally {
+                lifecycleLock.unlock();
+            }
+            delayedWrite.get(1, TimeUnit.SECONDS);
+            queue.publish(delayed);
+            consumeOrdinaries(queue, 3);
+            assertEquals(2, aheadTask.sequence());
+        } finally {
+            producer.shutdownNow();
+        }
+    }
+
+    @Test
     void unboundedDoubleScannerAndConsumerDoNotUseRecycledSegments() throws Exception {
         UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
         int total = 128;
@@ -321,6 +359,13 @@ class TaskQueueContractTest {
             return bounded.retainedReferences();
         }
         return ((UnboundedTaskQueue) queue).retainedReferences();
+    }
+
+    private static ReentrantLock segmentLifecycleLock(UnboundedTaskQueue queue)
+            throws ReflectiveOperationException {
+        Field field = UnboundedTaskQueue.class.getDeclaredField("segmentLock");
+        field.setAccessible(true);
+        return (ReentrantLock) field.get(queue);
     }
 
     private static void await(CountDownLatch latch) {

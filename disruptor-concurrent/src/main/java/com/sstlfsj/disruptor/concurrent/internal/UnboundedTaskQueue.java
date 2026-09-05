@@ -276,9 +276,6 @@ final class UnboundedTaskQueue implements TaskQueue {
         if (observedTail.id == targetId) {
             return observedTail;
         }
-        if (observedTail.id > targetId) {
-            return findFromHead(targetId);
-        }
         segmentLock.lock();
         try {
             Segment current = tail;
@@ -289,18 +286,18 @@ final class UnboundedTaskQueue implements TaskQueue {
                 tail = current;
                 activeSegments.incrementAndGet();
             }
-            return current;
+            return current.id == targetId ? current : findFromHeadLocked(targetId);
         } finally {
             segmentLock.unlock();
         }
     }
 
-    private Segment findFromHead(long targetId) {
+    private Segment findFromHeadLocked(long targetId) {
         Segment segment = head;
         while (segment.id < targetId) {
             segment = segment.next;
             if (segment == null) {
-                return segmentForClaim(targetId << segmentShift);
+                throw new IllegalStateException("claim sequence 对应的 segment 不存在");
             }
         }
         if (segment.id != targetId) {
