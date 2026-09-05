@@ -3,7 +3,7 @@
 [![CI](https://github.com/sunker0115/disruptor-spring-boot/actions/workflows/ci.yml/badge.svg)](https://github.com/sunker0115/disruptor-spring-boot/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-基于 [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) 原生 API 的 Spring Boot Starter。
+基于 [LMAX Disruptor](https://github.com/LMAX-Exchange/disruptor) 原生 API 的 Spring Boot Starter，并提供受监督的单线程执行与调度模块 `disruptor-concurrent`。
 
 项目托管管道构建、命名注册、配置合并、发布准入和完整关闭流程。事件拓扑、处理器、异常处理、回放与自定义处理器仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
 
@@ -13,6 +13,7 @@
 
 - 希望在 Spring Boot 中声明多条命名 Disruptor 管道，并由容器统一管理生命周期；
 - 需要保留 `RingBuffer`、原生拓扑 DSL、自定义 `EventProcessor`、rewind 等完整能力；
+- 需要有界或显式无界的 `EventLoop`、固定 `EventLoopGroup`、高级调度和协作取消；
 - 业务愿意显式处理事件复用、背压和消费失败等 Disruptor 原生语义。
 
 项目不提供持久化队列、跨进程消息传输、自动重试、消费者健康恢复或业务失败补偿。需要这些能力时，应由业务系统或消息中间件承担。
@@ -116,6 +117,65 @@ ringBuffer.publishEvent(TRANSLATOR, orderId, amount);
 
 同一管道可以混用两种入口，但只要存在原生发布者，整条管道的无损关闭就依赖应用先停止这些原生生产者。`unsafe` 指生命周期绕过 Runtime，并不表示 RingBuffer API 本身不安全。
 
+## 单线程执行与调度
+
+`disruptor-concurrent` 不由 Starter 强制传递，按需显式引入：
+
+```xml
+<dependency>
+    <groupId>com.sstlfsj</groupId>
+    <artifactId>disruptor-concurrent</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+Spring 应用显式声明根 `EventLoop` 或 `EventLoopGroup` Bean。自动配置只负责这些根对象的生命周期、健康和指标，不创建隐藏全局实例：
+
+```java
+@Bean(destroyMethod = "")
+DisruptorEventLoop orders() {
+    return EventLoopBuilder.bounded("orders", 1024).build();
+}
+
+@Bean(destroyMethod = "")
+DisruptorEventLoopGroup workers() {
+    return EventLoopGroupBuilder.bounded("workers", 4, 1024).build();
+}
+```
+
+Spring 会在全部 module 和 worker 就绪后开放提交入口。纯 Java 使用时必须先等待显式启动完成：
+
+```java
+EventLoop loop = EventLoopBuilder.unbounded("commands", 1024).build();
+loop.start().toCompletableFuture().join();
+Future<Order> future = loop.submit(() -> loadOrder(orderId));
+```
+
+高级调度通过不可变 `ScheduledTaskSpec` 表达上下文、动态延迟、执行次数、失败策略、优先级与取消令牌：
+
+```java
+TaskContext context = TaskContext.empty().with(ORDER_ID, orderId);
+CancellationSource cancellation = new CancellationSource();
+
+EventLoopScheduledFuture<Void> future = loop.schedule(
+        ScheduledTaskSpec.<Void>builder()
+                .context(context)
+                .task(current -> {
+                    refresh(current.get(ORDER_ID));
+                    return null;
+                })
+                .scheduleMode(ScheduleMode.DYNAMIC_DELAY)
+                .dynamicDelay(lastRun -> Duration.ofSeconds(lastRun.executions()))
+                .maxExecutions(5)
+                .priority(10)
+                .cancellationToken(cancellation)
+                .build());
+```
+
+`group.next()` 轮询选择 child，`group.select(affinityKey)` 对同一 key 固定选择同一 child。Group 是 child 的唯一生命周期 owner：业务可以向 child 提交和查询，但不能直接对 child 调用 `start`、`shutdown`、`shutdownNow` 或 `requestShutdown`。
+
+标准 `shutdown()` 使用无界 graceful deadline，会保留已接受的一次性延迟任务并取消周期任务；`shutdownNow()` 返回由本次调用取得所有权的未开始原始任务，并尽力中断正在执行的任务。需要有界运维窗口时使用 `requestShutdown(mode, ShutdownDeadline.after(timeout))`，最后通过 `termination()` 或 `awaitTermination` 等待真实线程退出。Java 无法强停忽略中断的用户代码，因此 deadline 到期不会伪造 terminated。
+
 ## 配置
 
 ```yaml
@@ -138,6 +198,10 @@ disruptor:
       error-strategy: HALT
   metrics:
     enabled: true
+  concurrent:
+    enabled: true
+    lifecycle-phase: -2147483648
+    shutdown-timeout: 10s
 ```
 
 | 属性 | 默认值 | 说明 |
@@ -151,6 +215,9 @@ disruptor:
 | `disruptor.defaults.daemon-threads` | `false` | 消费线程是否为 daemon 线程 |
 | `disruptor.defaults.error-strategy` | `HALT` | 默认消费异常策略 |
 | `disruptor.metrics.enabled` | `true` | classpath 存在 Micrometer 时是否注册指标 |
+| `disruptor.concurrent.enabled` | `true` | 是否托管显式声明的 concurrent 根 Bean |
+| `disruptor.concurrent.lifecycle-phase` | `Integer.MIN_VALUE` | concurrent 根对象的 Spring 生命周期阶段 |
+| `disruptor.concurrent.shutdown-timeout` | `10s` | 全部 concurrent 根对象共享的关闭时间边界 |
 
 每个 `disruptor.pipelines.<name>` 可以覆盖 buffer、producer、wait strategy、daemon thread 和 error strategy。最终优先级为：
 
@@ -217,6 +284,8 @@ classpath 同时存在 Micrometer 和 `MeterRegistry` 时，自动注册以下 G
 
 指标只在采集时读取原生状态，不包装发布或消费热路径。
 
+存在 `disruptor-concurrent` 时，还会按 event loop 注册准入、worker、任务、调度和队列 Gauge；bounded 公开剩余容量，unbounded 公开已分配 segment 数。存在 Boot Health 时，基础设施失败为 `DOWN`，未运行或关闭中的根对象为 `OUT_OF_SERVICE`；单个任务的业务失败计数不会把基础设施判为 `DOWN`。
+
 ## 纯 Java 用法
 
 `disruptor-core` 不依赖 Spring：
@@ -243,7 +312,7 @@ try {
 
 ## 示例与验证
 
-- `disruptor-spring-boot-example`：原生菱形 DAG、分片、异常处理、事件清理、背压和纯 Java 示例；
+- `disruptor-spring-boot-example`：原生菱形 DAG、分片、异常处理、事件清理、背压、concurrent 与纯 Java 示例；
 - `disruptor-spring-boot-tutorial`：并发 HTTP 请求经有界单入口线程串行发布的撮合 Web 教程；
 - `disruptor-benchmarks`：原生实例、受管发布与 `unsafeRingBuffer()` 的 JMH 发布路径对比。
 
@@ -270,13 +339,14 @@ bash disruptor-spring-boot-tutorial/demo.sh
 | 模块 | 职责 |
 | --- | --- |
 | `disruptor-core` | 纯 Java 管道定义、运行时句柄、注册表和生命周期 |
-| `disruptor-spring-boot-autoconfigure` | 属性绑定、自动配置、Spring 生命周期和 Micrometer 指标 |
+| `disruptor-concurrent` | 有界/无界 EventLoop、调度、取消、Group 与事实快照 |
+| `disruptor-spring-boot-autoconfigure` | 两套运行时的属性、生命周期、健康与可选指标装配 |
 | `disruptor-spring-boot-starter` | 面向使用方的依赖聚合模块 |
 | `disruptor-spring-boot-example` | 核心能力示例 |
 | `disruptor-spring-boot-tutorial` | 单生产者、单撮合消费者的 Web 业务教程 |
 | `disruptor-benchmarks` | JMH 基准 |
 
-维护者可阅读[架构设计](docs/disruptor-architecture-design.md)。
+维护者可阅读[架构设计](docs/disruptor-architecture-design.md)与固定参考 commit 的 [Commons 能力事实矩阵](docs/commons-capability-matrix.md)。
 
 ## 开源与发布
 

@@ -360,41 +360,9 @@ public interface EventLoopModule {
 
 ## Commons 源码能力矩阵
 
-下表以当前参考仓 Java 实现源码为准。`ScheduledTaskBuilder` 虽声明私有 `SCHEDULE_DYNAMIC_DELAY` 和 public `priority` 字段，但没有可用 dynamic-delay builder 入口；`ScheduledPromiseTask.setNextRunTime` 只区分 fixed-rate 与“其它”，`compareToExplicitly` 也不读取 priority，`AbstractEventLoop.schedule(builder)` 没有把 priority 复制到任务。因此这两项不是参考 Java 运行时已生效能力，而是本项目增强。
+最终事实矩阵见[Commons 能力事实矩阵](../../commons-capability-matrix.md)。该文档固定参考 commit `5c831c06`，分别审计 Java `Disruptor` 与 `Commons-Concurrent`，并为每一项记录参考源码、本项目落点和测试证据。
 
-| 参考能力或行为 | 本项目落点 | 判定 |
-| --- | --- | --- |
-| EventLoop、标准 Executor/Scheduler | `EventLoop` + `SupervisedScheduledExecutor` | 覆盖，并增加真实监督终止 |
-| 固定 EventLoopGroup、chooser、affinity key | `EventLoopGroup.next/select` | 覆盖；child 生命周期所有权更严格 |
-| one-shot、fixed-rate、fixed-delay | JDK 方法 + `ScheduledTaskSpec` | 覆盖 |
-| dynamic-delay | `ScheduledTaskSpec.dynamicDelay` | 增强；参考 Java 常量不可从 builder 选择，运行时未实现独立计算 |
-| priority | timer 排序 `trigger -> priority -> acceptedSequence` | 增强；参考 Java 字段未进入任务和比较器 |
-| timeout、count limit、caught exception | expires、maxExecutions、continueOnFailure | 覆盖；使用显式不可变字段而非位标志 |
-| CancelToken、原因、监听、解注册 | `CancellationToken/Source/Registration` | 覆盖，并明确线程、晚注册、异常和物理解注册 |
-| `cancelAfter` 隐藏 GlobalEventLoop | 显式传入 scheduler 的 `cancelAfter` | 项目级替代；不保留隐藏全局状态 |
-| `IContext/MiniContext` | `TaskContext + ContextCallable` | 覆盖；显式传播，不读 ThreadLocal |
-| 未完成 Future 的同 loop 阻塞保护 | Future/get、await、invoke、close guard | 覆盖 |
-| lazy start：首次提交自动起线程 | 显式 `start()` 后才开放 gate | 不复制；避免 module 未就绪却已 accepted |
-| parent 引用 | `EventLoop.parent()` | 覆盖 |
-| EventLoopFactory | Group `EventLoopFactory(parent, childIndex)` | 覆盖 |
-| `TaskOptions.LOCAL_ORDER` 同 loop 绕入口 | 所有任务统一 accepted sequence | 不复制；绕入口会破坏全序与有界容量 |
-| `IEventLoopAgent` 完整主循环阶段 | module start/stop + opportunistic update；周期 tick 显式 schedule | 项目级替代，不宣称 tick 等价 |
-| early/update/late module phases | 一个业务调度任务内部显式编排阶段 | 项目级替代 |
-| ComponentId、依赖解析和数组索引 | Spring/应用 DI 与业务自己的索引 | 不复制通用组件框架 |
-| module 运行时不可增删 | builder 冻结 module 列表 | 覆盖 |
-| 用户事件、handler、原始 sequence | `disruptor-core` topology 与 `unsafeRingBuffer` | 项目级覆盖，不塞进 Runnable 槽 |
-| 自研 IFuture/IPromise/ICompletionStage | JDK Future、CompletionStage、CompletableFuture | 项目级替代，不兼容 API |
-| Future 只读视图、转发、组合器 | 只读 termination stage、JDK CompletionStage/CompletableFuture | 项目级替代 |
-| 立即执行器、Executor 适配 | `Runnable::run` 和 JDK ExecutorService | 标准 API 替代 |
-| stackless cancel/timeout、FutureLogger | 标准异常 + SLF4J handler | 项目级替代，不复制异常类型 |
-| 有界 RingBuffer 与无界 event sequencer | 两个 `TaskQueue` 后端、一个 kernel | 覆盖 |
-| shutdownNow 固定空列表 | accepted registry 返回未开始原始 Runnable | 增强，修正 JDK 契约退化 |
-| 自定义拒绝策略 | 明确 `RejectedExecutionException` 与 `tryExecute` | 有意收窄；不提供 CallerRuns/静默丢弃 |
-| 任务对象池 | 默认不池化，先以 JMH/GC 事实决定 | 不复制；避免跨生命周期复用状态错误 |
-| WatcherMgr | 模块内集合、取消监听或 JDK Flow | 项目级替代 |
-| GlobalEventLoop | Spring Bean 或应用显式 owner | 不复制隐藏单例 |
-
-矩阵中的“项目级替代”和“不复制”是最终边界，不是待补缺口。性能在 JMH 数据产生前不宣称优于或等于 Commons。
+其中 dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline 与精确启动回滚属于本项目增强。自研 Future、ComponentId/Agent phases、WatcherMgr、LOCAL_ORDER、任务池和 GlobalEventLoop 是标准 API 替代或明确不复制的边界，不是待补缺口。性能只由 JMH 结果陈述，不从功能矩阵推导。
 
 ## Spring Boot 4.1 集成
 

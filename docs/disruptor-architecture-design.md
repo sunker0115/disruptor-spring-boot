@@ -20,8 +20,9 @@
 - 引入 Starter 并声明 `PipelineSpec` Bean 后即可由 Spring 托管管道；
 - 保留 LMAX Disruptor 的原生拓扑、处理器和扩展能力；
 - 统一命名注册、配置合并、发布准入、启动回滚和有界关闭；
+- 提供与管道共享监督内核的有界/无界 EventLoop、调度与固定 Group；
 - 受管发布不使用反射或动态代理，高级场景保留原生零代理逃生口；
-- 纯 Java 与 Spring Boot 使用同一个核心运行时。
+- 纯 Java 与 Spring Boot 使用相同的 core/concurrent 运行时。
 
 ### 非目标
 
@@ -29,6 +30,8 @@
 - 不提供持久化、跨进程传输、自动重试、失败补偿或消费者自动恢复；
 - 不推断业务事件字段，也不自动清理复用槽位；
 - 不把生命周期状态包装成消费者健康状态；
+- 不兼容 Commons 自研 Future、组件框架或二进制 API；
+- 不创建隐藏的全局 EventLoop；
 - 不在核心模块中引入 Spring 或 Micrometer。
 
 Maven Central 发布、签名、CI、许可证和社区治理属于开源工程，不属于运行时架构，但在公开发布前必须单独完成。
@@ -59,33 +62,27 @@ Maven Central 发布、签名、CI、许可证和社区治理属于开源工程�
 ## 模块与依赖边界
 
 ```text
-业务代码
-  ├─ PipelineSpec<E>
-  ├─ EventFactory<E>
-  ├─ EventHandler / RewindableEventHandler / EventProcessor
-  └─ 原生 topology 回调
-          │
-          ▼
-disruptor-core
-  ├─ PipelineSpec 与 PipelineSettings 合并
-  ├─ Disruptor<E> 构建
-  ├─ ManagedPipeline 发布准入与线程跟踪
-  ├─ 名称注册与类型校验
-  └─ Runtime 级关闭编排与总截止时间
-          │
-          ▼
-disruptor-spring-boot-autoconfigure
-  ├─ 收集 PipelineSpec Bean
-  ├─ 解析默认配置与命名覆盖
-  ├─ SmartLifecycle 委托
-  └─ 可选 Micrometer Gauge
-          │
-          ▼
-disruptor-spring-boot-starter
-  └─ 面向使用方聚合依赖
+                       业务代码
+                 ┌────────┴────────┐
+                 │                 │
+       PipelineSpec / topology   EventLoop / Group
+                 │                 │
+                 ▼                 ▼
+          disruptor-core ◀── disruptor-concurrent
+                 │          （有界/无界同一 kernel）
+                 └────────┬────────┘
+                          ▼
+          disruptor-spring-boot-autoconfigure
+          ├─ core Runtime 生命周期与配置
+          ├─ concurrent 根 owner 生命周期
+          └─ 可选 Health / Micrometer 快照适配
+                          │
+                          ▼
+          disruptor-spring-boot-starter
+          （不传递 disruptor-concurrent）
 ```
 
-`disruptor-core` 只依赖 Disruptor 与 SLF4J。自动配置模块可以依赖 Spring Boot，并把 Micrometer 保持为可选依赖。示例、教程和基准模块不进入 Starter 的传递依赖。
+`disruptor-core` 提供 `SupervisedLifecycle`、`WorkerSupervisor`、`ShutdownDeadline` 以及管道运行时；`disruptor-concurrent` 直接依赖 core、LMAX 与 SLF4J，不依赖 Spring。有界与无界只替换 `TaskQueue` 后端，准入、注册表、调度、取消、生命周期与 worker 循环只有一个 `EventLoopKernel` 实现。autoconfigure 将 concurrent、Boot Health 和 Micrometer 都保持为 optional；Starter 不强制引入 concurrent。示例、教程和基准模块不进入 Starter 的传递依赖。
 
 ## 核心模型
 
@@ -154,11 +151,11 @@ Runtime 使用名称索引管道。同一事件类型允许对应多条管道：
 状态机为：
 
 ```text
-NEW → STARTING → RUNNING → QUIESCING → STOPPING → STOPPED
+NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED
  │                 │                         ▲
  └──── halt() ─────┴─────────────────────────┘
 
-STOPPED ── start() ──> IllegalStateException
+TERMINATED ── start() ──> IllegalStateException
 ```
 
 `isRunning()` 只表示 Runtime 处于 `RUNNING` 状态，不探测每个消费者线程是否存活。
@@ -174,12 +171,28 @@ STOPPED ── start() ──> IllegalStateException
 - 排空完成后调用上游 `halt()`，并等待 Runtime 跟踪的消费线程真正退出；
 - 全部管道共享一个 Runtime 级截止时间，关闭耗时不随管道数量线性累加；
 - 单条管道排空超时或停止失败时强制 `halt`、中断仍存活线程，并继续关闭其它管道；
-- Runtime 最终进入 `STOPPED`；只要存在未排空、停止失败或线程未退出，就抛出聚合 `DisruptorShutdownException`；
+- Runtime 最终进入 `TERMINATED`；只要存在未排空、停止失败或线程未退出，就抛出聚合 `DisruptorShutdownException`；
 - `isRunning()` 在 `QUIESCING` 开始时立即变为 `false`，且状态读取不被长时间关闭过程阻塞；它仍不是消费者健康检查。
 
 “排空”只保证消费链末端 gating sequence 越过目标游标。自定义 processor 若提前推进 sequence，或 handler 内部再启动 fire-and-forget 副作用，这些外部工作不属于 Runtime 能证明完成的范围。
 
 命名管道是彼此独立的生命周期单元，关闭协议不推断跨管道依赖。需要保证级联处理完整性的阶段应放在同一条 Disruptor topology 中；handler 向另一条受管管道继续发布的场景必须由应用先停止上游并自行编排关闭顺序，否则全局进入 `QUIESCING` 后下游发布会被拒绝。
+
+### 监督生命周期内核
+
+管道、EventLoop 与 Group 使用同一组阶段：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED`。`start()` 成功的含义是启动登记已经封口、全部 worker 与 module 已完成启动、内部启动 token 已归零且公开 gate 已开放，不以“线程已创建”冒充 ready。
+
+`ShutdownDeadline` 是同一次关闭广播的身份对象。正常提交要求启动落定、全部 child stage 完成且 token 清零；超时提交只等待已经接受广播的参与者归还 token，随后冻结原 outcome。迟到 rollback 只补充会话事实并继续后台收敛，不能重开广播、替换首因或伪造 termination。
+
+### EventLoop 与 Group
+
+`EventLoop` 同时实现 JDK `ScheduledExecutorService` 和项目的 `SupervisedScheduledExecutor`。bounded 后端用 LMAX RingBuffer，容量口径是尚未物理清理的全部 accepted 任务，包括入口、timer 和 executing；unbounded 后端使用分段 MPSC 队列并在消费后清除引用。两者共享 accepted sequence，因此立即任务和零延迟任务保持一个本地全序，timer 与 command 通过有限批次互相让行。
+
+高级 `ScheduledTaskSpec` 以不可变字段表达 one-shot、fixed-rate、fixed-delay、dynamic-delay、expires、max executions、continue-on-failure、priority、显式 `TaskContext` 与 `CancellationToken`。Future 终态和物理任务状态分离：取消可以先完成 Future，但 bounded permit 只在任务引用从 queue/timer/执行路径真正清除后释放。
+
+`EventLoopGroup` 拥有固定 child 集合，提供轮询 `next()` 与稳定 `select(affinityKey)`。Group gate 先于 child gate 获取准入 token，使组级关闭能冻结新任务并等待在途选择完成。child 生命周期只能由 Group 操作；任一 child 基础设施失败会以同一 deadline fail-stop 全组，Group termination 只在全部 child 真实终止后完成。
+
+标准 `shutdown()` 使用无界 graceful deadline：保留已接受的一次性延迟任务，取消周期任务。`shutdownNow()` 通过 accepted registry CAS 返回本次取得所有权的未开始原始任务，并尽力中断 running task；它不等待用户任务退出。Spring、Group 与运维使用显式共享的有界 deadline，到期后单调升级 immediate，但仍等待线程真实退出。
 
 ## 配置模型
 
@@ -258,6 +271,10 @@ Bean 回退条件彼此独立：
 
 `DisruptorLifecycle` 实现 `SmartLifecycle`，默认 phase 为 `Integer.MIN_VALUE`，使管道尽早启动、尽晚停止。它显式实现 `stop(Runnable)`：Runtime 只有在排空、halt 和线程等待完成后才返回，因此正常 callback 不会早于消费线程退出；即使关闭抛出聚合异常，也会在 `finally` 中执行 callback，避免 Spring 生命周期处理器继续等待。
 
+classpath 存在 `disruptor-concurrent` 且应用声明 `SupervisedScheduledExecutor` 根 Bean 时，`DisruptorConcurrentLifecycle` 才装配。它过滤公开为 Bean 的 Group child，只管理 standalone loop 与 Group 根对象；启动失败会以同一有界 deadline 回滚全部根对象，关闭 callback 只在全部根对象真实 termination 后执行。自动配置不创建业务 EventLoop 或全局单例。
+
+concurrent 的配置面只有 `disruptor.concurrent.enabled`、`lifecycle-phase` 和 `shutdown-timeout`。Health 与 Metrics 是独立条件层：缺少 Boot Health 或 Micrometer 时，基础生命周期仍能装配。
+
 自动配置模块生成：
 
 - `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`；
@@ -275,6 +292,8 @@ Micrometer classpath、`MeterRegistry` Bean 和 `disruptor.metrics.enabled=true`
 
 Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runtime.running` 是生命周期状态，`backlog` 是基于 cursor 与最小 gating sequence 的近似值，两者都不是消费者健康检查。
 
+concurrent 指标同样只读取 `EventLoopSnapshot`/`EventLoopGroupSnapshot`，覆盖 gate、worker、任务结果、调度积压和队列事实。健康判断只看基础设施：存在首个 worker/module failure 为 `DOWN`，全部根对象 RUNNING 且接受任务为 `UP`，其余状态为 `OUT_OF_SERVICE`；业务任务失败计数不改变基础设施健康。
+
 ## 验证策略
 
 单元测试与集成测试使用真实 Disruptor，覆盖：
@@ -289,6 +308,9 @@ Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runt
 - 配置覆盖、非法配置、未知命名配置和零管道；
 - 自动配置开关、自定义 Bean 回退、AOT 元数据与可选 Micrometer；
 - 指标在启动、积压、排空和停止阶段的变化；
+- bounded/unbounded queue 与 EventLoop 同一契约、Group 所有权和 fail-stop；
+- JDK 调度、dynamic-delay、priority、取消、阻塞保护和 shutdownNow 返回值；
+- concurrent 生命周期、Health、Metrics 的独立条件装配与 callback 时序；
 - example 与 tutorial 的真实端到端流程，以及 tutorial 并发 HTTP 请求的单生产者串行化。
 
 全仓验证命令：
@@ -297,13 +319,15 @@ Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runt
 mvn test
 ```
 
-性能验证使用 `disruptor-benchmarks` 中的 JMH 基准，对比原生实例、受管发布和 `unsafeRingBuffer()` 三条路径。性能结论必须记录硬件、JVM、参数、预热和测量配置；普通单测不设置易受机器噪声影响的吞吐阈值。
+性能验证使用 `disruptor-benchmarks` 中的 JMH 基准，对比原生 LMAX、core 受管发布、bounded/unbounded EventLoop 与 JDK 单线程 executor；可选 profile 对比固定参考 commit 的 Commons EventLoop。性能结论必须记录硬件、JVM、参数、预热和测量配置；普通单测不设置易受机器噪声影响的吞吐阈值。
 
 ## 演进约束
 
 - 新能力优先暴露原生 Disruptor 入口，不复制上游 API；
 - 新配置必须具有明确默认值、优先级和失败语义；
 - 修改生命周期、发布准入或异常策略时，必须先补真实并发行为测试；
+- bounded/unbounded 不得分叉 kernel、调度或生命周期语义；
+- Group child 不得出现第二个生命周期 owner；
 - 公开 API 的破坏性变更需要在发布说明中明确记录；
 - README 只保留使用者开始使用所需内容，内部取舍和不变量写入本文；
 - 文档中的版本、默认值、命令和模块名必须能由当前仓库验证。

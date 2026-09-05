@@ -18,6 +18,10 @@
             <artifactId>disruptor-spring-boot-starter</artifactId>
         </dependency>
         <dependency>
+            <groupId>com.sstlfsj</groupId>
+            <artifactId>disruptor-concurrent</artifactId>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
