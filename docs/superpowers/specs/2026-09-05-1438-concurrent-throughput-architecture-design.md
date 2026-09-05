@@ -197,14 +197,14 @@ try {                                     // 最外层:保证 leave 永不跳过
   } finally {
     if seq >= 0:                          // 只有真正 claim 了才发布,claimed 槽恒发布,绝不留 hole
         ringBuffer.publish(seq)
-        if worker.parked: LockSupport.unpark(worker)   // 任何 publish(含 tombstone)都条件唤醒
   }
 } finally {
-    leave: packed CAS —— activePublishers--; 若 rollbackOutstanding 同一 CAS 内 outstanding--   // 不可跳过
+  leave: packed CAS —— activePublishers--; 若 rollbackOutstanding 同一 CAS 内 outstanding--   // 不可跳过
+  if worker.parked: LockSupport.unpark(worker)          // leave 完成后再读 parked；任何 publish(含 tombstone)都条件唤醒
 }
 ```
 
-- 三层嵌套 `finally` 保证 `publish(seq)` 与 `leave()` 各处于不可跳过层("处于 finally"不等于其内后续语句不被异常中断);
+- 三层嵌套 `finally` 保证 `publish(seq)` 与 `leave()` 各处于不可跳过层("处于 finally"不等于其内后续语句不被异常中断); signal 必须位于 `leave()` 完成之后;
   回滚清理 API(`terminalizeAndRemove`、tombstone 字段写)定义为 **no-throw**;`leave()` 是最外层不可绕过操作。
 - `leave` 是否回滚 `outstanding` **只看 `rollbackOutstanding`,不看 `seq>=0`**;`tryNext()` 抛异常(seq=-1)时仍回滚容量,
   不泄漏。`seq>=0` 只决定是否写 tombstone 与 publish。unbounded 的 outstanding 回滚同理走独立 64 位计数器。
@@ -244,10 +244,13 @@ worker 主循环保留四段结构(语义不动):cancellation mailbox → 到期
 
 ### 4.7 唤醒协议(条件 unpark)
 
-worker 空转判定(park 前设 `parked` 后重读 queue/mailbox/时钟/最早 trigger 再决定):入口有**连续已发布**任务、mailbox
+worker 空转判定采用显式 publication 握手:worker 先以 volatile `set(true)` 宣告睡眠,再对 admission word 做 acquire 读取,然后重读 queue/mailbox/时钟/最早 trigger;
+入口有**连续已发布**任务、mailbox
 非空、或 timer **已到期** → 不 park;只有未来 timer → `parkNanos(nextTrigger − now)`;完全无 timer → 无限 park。("timer
-非空"不等于不 park:一年后的 timer 只应 parkNanos 到 trigger,不能持续 spin。)醒后 `lazySet(parked=false)`。生产者仅在
-`parked==true` 时 unpark;shutdown、更早 timer 登记、cancellation 无条件 unpark。消除丢唤醒窗口,不做固定毫秒轮询。
+非空"不等于不 park:一年后的 timer 只应 parkNanos 到 trigger,不能持续 spin。)醒后 `lazySet(parked=false)`。生产者的顺序为
+`publish → gate.leave` 完成 → 读取 `parked`;仅在 `parked==true` 时 unpark。若生产者先完成 leave,worker 的 admission acquire
+可见 publication;若 worker 先宣告睡眠,生产者读取 true 并 unpark。shutdown、更早 timer 登记、cancellation 无条件 unpark。
+消除丢唤醒窗口,不做固定毫秒轮询。
 
 ### 4.8 关闭:core 权威 + 从属 TaskDispositionCoordinator
 
