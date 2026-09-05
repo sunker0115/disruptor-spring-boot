@@ -48,7 +48,6 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.2.0</version>
                 <executions>
                     <execution>
                         <id>clear-profile-dependent-classes</id>
@@ -68,7 +67,6 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.6.1</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
@@ -116,7 +114,6 @@
                 <dependency>
                     <groupId>cn.wjybxx.commons</groupId>
                     <artifactId>commons-concurrent</artifactId>
-                    <version>2.0.0</version>
                 </dependency>
             </dependencies>
             <build>
@@ -124,7 +121,6 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-antrun-plugin</artifactId>
-                        <version>3.2.0</version>
                         <executions>
                             <execution>
                                 <id>verify-commons-reference</id>
@@ -151,7 +147,6 @@
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>build-helper-maven-plugin</artifactId>
-                        <version>3.6.1</version>
                         <executions>
                             <execution>
                                 <id>add-commons-benchmark-source</id>

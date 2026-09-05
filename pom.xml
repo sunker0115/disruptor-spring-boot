@@ -20,14 +20,18 @@
 
     <properties>
         <!-- 唯一版本号真源：改这一处即改全仓（Maven CI-friendly，配合 flatten-maven-plugin 发布时展开为真实版本） -->
-        <revision>1.0.0</revision>
+        <revision>2.0.0-SNAPSHOT</revision>
         <maven.compiler.release>21</maven.compiler.release>
         <flatten-maven-plugin.version>1.7.0</flatten-maven-plugin.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <spring-boot.version>4.1.0</spring-boot.version>
         <disruptor.version>4.0.0</disruptor.version>
+        <commons.version>2.0.0</commons.version>
         <jmh.version>1.37</jmh.version>
+        <build-helper-maven-plugin.version>3.6.1</build-helper-maven-plugin.version>
+        <maven-antrun-plugin.version>3.2.0</maven-antrun-plugin.version>
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
+        <maven-shade-plugin.version>3.6.1</maven-shade-plugin.version>
         <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
     </properties>
 
@@ -57,6 +61,11 @@
                 <artifactId>jmh-generator-annprocess</artifactId>
                 <version>${jmh.version}</version>
             </dependency>
+            <dependency>
+                <groupId>cn.wjybxx.commons</groupId>
+                <artifactId>commons-concurrent</artifactId>
+                <version>${commons.version}</version>
+            </dependency>
             <!-- 内部模块，子模块相互引用不用写版本 -->
             <dependency>
                 <groupId>com.sstlfsj</groupId>
@@ -85,6 +94,16 @@
         <pluginManagement>
             <plugins>
                 <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>build-helper-maven-plugin</artifactId>
+                    <version>${build-helper-maven-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-antrun-plugin</artifactId>
+                    <version>${maven-antrun-plugin.version}</version>
+                </plugin>
+                <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>${maven-compiler-plugin.version}</version>
@@ -94,8 +113,18 @@
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>${maven-shade-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>${maven-surefire-plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
                 </plugin>
             </plugins>
         </pluginManagement>

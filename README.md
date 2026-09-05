@@ -7,7 +7,7 @@
 
 项目托管管道构建、命名注册、配置合并、发布准入和完整关闭流程。事件拓扑、处理器、异常处理、回放与自定义处理器仍使用 Disruptor 4.0 API，不引入另一套功能不完整的注解或 DAG DSL。
 
-当前仓库是 `1.0.0` 开发版本，尚未发布到 Maven Central。使用前需要先在本地构建并安装。
+当前仓库是 `2.0.0-SNAPSHOT` 开发版本，尚未发布到 Maven Central。使用前需要先在本地构建并安装。
 
 ## 适用场景
 
@@ -43,7 +43,7 @@ mvn clean install
 <dependency>
     <groupId>com.sstlfsj</groupId>
     <artifactId>disruptor-spring-boot-starter</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0-SNAPSHOT</version>
 </dependency>
 ```
 
@@ -125,7 +125,7 @@ ringBuffer.publishEvent(TRANSLATOR, orderId, amount);
 <dependency>
     <groupId>com.sstlfsj</groupId>
     <artifactId>disruptor-concurrent</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0-SNAPSHOT</version>
 </dependency>
 ```
 
