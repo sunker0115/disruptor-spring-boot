@@ -1,2 +1,5 @@
 com.sstlfsj.disruptor.autoconfigure.DisruptorAutoConfiguration
 com.sstlfsj.disruptor.autoconfigure.DisruptorMetricsAutoConfiguration
+com.sstlfsj.disruptor.autoconfigure.DisruptorConcurrentAutoConfiguration
+com.sstlfsj.disruptor.autoconfigure.DisruptorConcurrentHealthAutoConfiguration
+com.sstlfsj.disruptor.autoconfigure.DisruptorConcurrentMetricsAutoConfiguration
