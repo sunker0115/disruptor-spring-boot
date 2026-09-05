@@ -50,7 +50,7 @@
 | 有界 RingBuffer 与无界 event sequencer | `RingBufferEventSequencer`、`MpUnboundedEventSequencer` | `BoundedTaskQueue`/`UnboundedTaskQueue` 两后端、唯一 `EventLoopKernel`；`EventLoopBackendContractTest` | 覆盖运行场景 |
 | `shutdownNow()` 固定返回空列表 | `DisruptorEventLoop.shutdownNow` 第 394–398 行 | accepted registry CAS 返回未开始原始 Runnable；`EventLoopShutdownTest` | 增强，符合 JDK 契约 |
 | 自定义拒绝策略 | `RejectedExecutionHandlers` | `RejectedExecutionException` 与非抛出 `tryExecute` | 有意收窄；不提供 CallerRuns 或静默丢弃 |
-| 任务对象池 | `ScheduledPromiseTask.POOL` | 默认不池化；先由 JMH/GC 事实决定是否值得引入 | 不复制；避免跨生命周期复用状态 |
+| 任务对象池 | `ScheduledPromiseTask.POOL` | 默认不池化；`docs/disruptor-concurrent-verification.md` 的 JMH/GC 已量化普通提交约 757–792 B/op 的分配成本 | 不复制原池化实现；已确认性能退化，后续须在不放松关闭/所有权契约下重构任务表示 |
 | WatcherMgr | `WatcherMgr`、`SimpleWatcherMgr` | module 内集合、取消监听或 JDK Flow | 项目级替代 |
 | GlobalEventLoop | `GlobalEventLoop` | Spring Bean 或应用显式 owner | 不复制隐藏单例 |
 | Group 失败收敛与共享 deadline | `DefaultEventLoopGroup` 聚合 child termination，但没有组级首因/deadline 协议 | `GroupLifecycleCoordinator`；`EventLoopGroupShutdownTest` 覆盖 child fail-stop、deadline 身份和真实终止 | 增强 |
@@ -59,6 +59,6 @@
 
 ## 结论
 
-本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。
+本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约；当前 JMH 已确认普通 EventLoop 提交的吞吐和分配率弱于 Commons，不能把功能覆盖表述为性能持平。
 
 未复制项集中在 Commons 自身生态抽象：自研 Future API、ComponentId/Agent phases、WatcherMgr、LOCAL_ORDER 快路、任务池和 GlobalEventLoop。它们分别由 JDK/Spring/业务显式编排替代，或因破坏本项目全序、容量和所有权不变量而明确排除。因此“完整覆盖”指场景能力闭合，不表示包名、类型或调用点兼容。

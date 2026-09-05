@@ -10,12 +10,16 @@
     </parent>
     <artifactId>disruptor-benchmarks</artifactId>
 
-    <description>JMH：对比原生 Disruptor 与 DisruptorRuntime 构建后的发布路径。</description>
+    <description>JMH：对比原生 Disruptor、托管运行时与 EventLoop 的单生产者提交路径。</description>
 
     <dependencies>
         <dependency>
             <groupId>com.sstlfsj</groupId>
             <artifactId>disruptor-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.sstlfsj</groupId>
+            <artifactId>disruptor-concurrent</artifactId>
         </dependency>
         <dependency>
             <groupId>org.openjdk.jmh</groupId>
@@ -26,5 +30,145 @@
             <artifactId>jmh-generator-annprocess</artifactId>
             <scope>provided</scope>
         </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
+
+    <build>
+        <finalName>benchmarks</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.2.0</version>
+                <executions>
+                    <execution>
+                        <id>clear-profile-dependent-classes</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <delete dir="${project.build.outputDirectory}"/>
+                                <delete dir="${project.build.directory}/generated-sources/annotations"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.6.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/versions/*/module-info.class</exclude>
+                                        <exclude>logback-test.xml</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.sstlfsj.disruptor.benchmark.BenchmarkMain</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>commons-baseline</id>
+            <properties>
+                <commons.reference.directory>/Users/sunke/dev/ai-project/commons</commons.reference.directory>
+                <commons.reference.commit>5c831c06afed35dd23b666c902e5ce212ff22487</commons.reference.commit>
+                <commons.concurrent.sha256>092b61b98875714f82bdf952b91369d4cca39ca29cdbf15cb55f0085ba22cbaa</commons.concurrent.sha256>
+                <commons.base.sha256>84040c8fa896ad2c4ad710f2d169476bcfe09e64b4a6df0f98c8fa5239751678</commons.base.sha256>
+                <commons.disruptor.sha256>e66abdce2da8e6b04567a5a9fcf753cdeadfe4aa72861978ea4323c2190e67db</commons.disruptor.sha256>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>cn.wjybxx.commons</groupId>
+                    <artifactId>commons-concurrent</artifactId>
+                    <version>2.0.0</version>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.2.0</version>
+                        <executions>
+                            <execution>
+                                <id>verify-commons-reference</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <exec executable="sh" failonerror="true">
+                                            <arg value="${project.basedir}/verify-commons-baseline.sh"/>
+                                            <arg value="${commons.reference.directory}"/>
+                                            <arg value="${commons.reference.commit}"/>
+                                            <arg value="${settings.localRepository}"/>
+                                            <arg value="${commons.concurrent.sha256}"/>
+                                            <arg value="${commons.base.sha256}"/>
+                                            <arg value="${commons.disruptor.sha256}"/>
+                                        </exec>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.1</version>
+                        <executions>
+                            <execution>
+                                <id>add-commons-benchmark-source</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>add-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/commons/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
