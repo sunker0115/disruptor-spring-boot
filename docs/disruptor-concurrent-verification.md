@@ -13,13 +13,13 @@
 mvn clean verify
 ```
 
-8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 272 个测试，0 failure、
+8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 273 个测试，0 failure、
 0 error、0 skipped：
 
 | 模块 | 测试数 |
 | --- | ---: |
 | `disruptor-core` | 131 |
-| `disruptor-concurrent` | 97 |
+| `disruptor-concurrent` | 98 |
 | `disruptor-benchmarks` | 3 |
 | `disruptor-spring-boot-autoconfigure` | 30 |
 | `disruptor-spring-boot-example` | 2 |
@@ -40,7 +40,7 @@ mvn clean verify
 | accepted registry 精确冻结等待/运行/取消/返回/终态所有权 | `AcceptedTaskRegistryTest` 全组、`EventLoopShutdownTest.shutdownNowReturnsWaitingOriginalRunnablesInAcceptedOrder` | 通过 |
 | `schedule(0)` 与普通提交保持 accepted 顺序；同 trigger 按 priority/sequence | `EventLoopSchedulingTest.zeroDelayScheduleAcceptedBeforeExecuteAlwaysRunsFirst`、`sameTriggerUsesPriorityThenAcceptedSequence` | 通过 |
 | command/timer 两侧都有批次公平 | `EventLoopSchedulingTest.boundedBatchesPreventTimersAndCommandsFromStarvingEachOther` | 通过 |
-| one-shot、fixed-rate、fixed-delay、dynamic-delay、expires、次数上限和继续失败 | `EventLoopSchedulingTest` 8 项、`ScheduledTaskTest` 9 项 | 通过 |
+| one-shot、fixed-rate、fixed-delay、dynamic-delay、expires、次数上限、继续失败和重调度快照原子发布 | `EventLoopSchedulingTest` 8 项、`ScheduledTaskTest` 10 项 | 通过 |
 | 显式不可变 context，不捕获 ThreadLocal | `TaskContextTest`、`ConcurrentExampleTest` | 通过 |
 | 取消首次获胜，覆盖早晚监听、同步/异步、解注册、异常和显式 scheduler | `CancellationSourceTest` 8 项 | 通过 |
 | 同 loop 未完成 Future/get、await、invoke、close 不允许阻塞 | `EventLoopBlockingGuardTest.rejectsEveryBlockingPathFromOwnerLoopButAllowsCompletedFutureRead` | 通过 |

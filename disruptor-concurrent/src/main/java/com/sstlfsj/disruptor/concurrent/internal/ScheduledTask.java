@@ -130,10 +130,12 @@ final class ScheduledTask<V> {
             future.cancel(CancellationReason.EXPIRED);
             return false;
         }
-        future.updateNonTerminal(before.toBuilder()
+        if (!future.updateNonTerminal(before.toBuilder()
                 .started(true)
                 .outcome(TaskOutcome.RUNNING)
-                .build());
+                .build())) {
+            return false;
+        }
 
         V value = null;
         Throwable invocationFailure = null;
@@ -173,16 +175,17 @@ final class ScheduledTask<V> {
             return false;
         }
 
-        future.updateNonTerminal(lastRun);
         if (invocationFailure != null) {
             continuedFailureHandler.accept(invocationFailure);
         }
         if (spec.maxExecutions() != null && executions >= spec.maxExecutions()) {
+            future.updateNonTerminal(lastRun);
             future.cancel(CancellationReason.MAX_EXECUTIONS);
             return false;
         }
         long completedAtNanos = clock.nanoTime();
         if (isExpired(lastRun, completedAtNanos)) {
+            future.updateNonTerminal(lastRun);
             future.cancel(CancellationReason.EXPIRED);
             return false;
         }
@@ -196,10 +199,9 @@ final class ScheduledTask<V> {
                     .build());
             return false;
         }
-        future.updateNonTerminal(lastRun.toBuilder()
+        return future.updateNonTerminal(lastRun.toBuilder()
                 .triggerNanos(triggerNanos)
                 .build());
-        return true;
     }
 
     int compareTo(ScheduledTask<?> other) {

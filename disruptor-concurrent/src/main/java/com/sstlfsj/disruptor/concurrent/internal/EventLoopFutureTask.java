@@ -55,15 +55,17 @@ final class EventLoopFutureTask<V> extends FutureTask<V>
         }
     }
 
-    void updateNonTerminal(ScheduledTaskSnapshot nextSnapshot) {
+    boolean updateNonTerminal(ScheduledTaskSnapshot nextSnapshot) {
         Objects.requireNonNull(nextSnapshot, "nextSnapshot 不能为空");
         if (nextSnapshot.outcome().isTerminal()) {
             throw new IllegalArgumentException("updateNonTerminal 不接收终态快照");
         }
         synchronized (completionLock) {
-            if (!super.isDone()) {
-                snapshot = nextSnapshot;
+            if (super.isDone()) {
+                return false;
             }
+            snapshot = nextSnapshot;
+            return true;
         }
     }
 

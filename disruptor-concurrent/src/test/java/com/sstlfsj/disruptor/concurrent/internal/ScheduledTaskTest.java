@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -62,6 +63,30 @@ class ScheduledTaskTest {
 
         assertTrue(task.runInvocation());
         assertEquals(12, task.triggerNanos());
+    }
+
+    @Test
+    void reschedulePublishesExecutionAndNextTriggerInOneSnapshot() {
+        ManualNanoClock clock = new ManualNanoClock(5);
+        AtomicReference<ScheduledTask<Void>> taskReference = new AtomicReference<>();
+        AtomicReference<ScheduledTaskSnapshot> duringReschedule = new AtomicReference<>();
+        ScheduledTask<Void> task = new ScheduledTask<>(4, ScheduledTaskSpec.<Void>builder()
+                .task(context -> null)
+                .scheduleMode(ScheduleMode.DYNAMIC_DELAY)
+                .dynamicDelay(lastRun -> {
+                    duringReschedule.set(taskReference.get().future().snapshot());
+                    return Duration.ofNanos(7);
+                })
+                .build(), clock.nanoTime(), clock);
+        taskReference.set(task);
+
+        assertTrue(task.runInvocation());
+
+        assertEquals(TaskOutcome.RUNNING, duringReschedule.get().outcome());
+        assertEquals(0, duringReschedule.get().executions());
+        assertEquals(TaskOutcome.WAITING, task.future().snapshot().outcome());
+        assertEquals(1, task.future().snapshot().executions());
+        assertEquals(12, task.future().snapshot().triggerNanos());
     }
 
     @Test
