@@ -3,6 +3,8 @@ package com.sstlfsj.disruptor.concurrent.internal;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -309,6 +311,122 @@ class TaskQueueContractTest {
             assertEquals(2, aheadTask.sequence());
         } finally {
             producer.shutdownNow();
+        }
+    }
+
+    @ParameterizedTest(name = "producers = {0}")
+    @ValueSource(ints = {1, 2, 4, 8})
+    void reversePublicationAcrossSegmentsSurvivesHeadAdvanceAndReuse(int producerCount)
+            throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(4, 8);
+        ExecutorService producers = Executors.newFixedThreadPool(producerCount);
+        try {
+            for (int round = 0; round < 16; round++) {
+                // 已发布前缀允许 head 前进；下一段首槽由落后 producer 持有。
+                long prefix = queue.claimedCursor() + 1;
+                for (int index = 0; index < 4; index++) {
+                    publishOrdinary(queue);
+                }
+                long hole = prefix + 4;
+                CountDownLatch start = new CountDownLatch(1);
+                CountDownLatch laterPublished = new CountDownLatch(producerCount);
+                CountDownLatch resumeHole = new CountDownLatch(1);
+                List<Future<?>> publications = new ArrayList<>();
+                for (int producer = 0; producer < producerCount; producer++) {
+                    publications.add(producers.submit(() -> {
+                        assertTrue(start.await(2, TimeUnit.SECONDS));
+                        long[] claims = new long[8];
+                        for (int index = 0; index < claims.length; index++) {
+                            claims[index] = queue.tryClaim();
+                        }
+                        boolean holdsHole = false;
+                        for (int index = claims.length - 1; index >= 0; index--) {
+                            long sequence = claims[index];
+                            if (sequence == hole) {
+                                holdsHole = true;
+                            } else {
+                                queue.writeOrdinary(sequence, new SequencedRunnable(sequence));
+                                queue.publish(sequence);
+                            }
+                        }
+                        laterPublished.countDown();
+                        if (holdsHole) {
+                            assertTrue(resumeHole.await(2, TimeUnit.SECONDS));
+                            queue.writeOrdinary(hole, new SequencedRunnable(hole));
+                            queue.publish(hole);
+                        }
+                        return null;
+                    }));
+                }
+                start.countDown();
+                try {
+                    assertTrue(laterPublished.await(2, TimeUnit.SECONDS));
+                    consumeOrdinaries(queue, 4);
+                    assertFalse(queue.poll(), "不能越过已跨段发布的首个 hole");
+                    assertEquals(hole - 1, queue.consumerCursor());
+                    assertEquals(producerCount * 2, queue.segmentSnapshot().active(),
+                            "head 必须已越过前缀段，落后 producer 的目标段仍在链上");
+                } finally {
+                    resumeHole.countDown();
+                }
+                for (Future<?> publication : publications) {
+                    publication.get(2, TimeUnit.SECONDS);
+                }
+                for (long sequence = hole; sequence < hole + producerCount * 8L; sequence++) {
+                    assertTrue(queue.poll());
+                    assertEquals(sequence, ((SequencedRunnable) queue.currentOrdinary()).sequence());
+                    assertEquals(OrdinaryState.WAITING, queue.currentOrdinaryState());
+                    finishCurrentOrdinary(queue);
+                }
+                assertFalse(queue.poll());
+                assertEquals(0, queue.pending());
+                assertEquals(0, queue.retainedReferences());
+                assertEquals(1, queue.segmentSnapshot().active());
+                assertTrue(queue.segmentSnapshot().allocated() <= 9);
+            }
+        } finally {
+            producers.shutdownNow();
+            assertTrue(producers.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OrdinaryState.class, names = {"RETURNED", "DISCARDED", "TERMINAL"})
+    void reusedGenerationCannotExposeOldOwnershipOrPayload(OrdinaryState oldState) {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 1);
+        for (int generation = 0; generation < 16; generation++) {
+            long sequence = queue.tryClaim();
+            assertFalse(queue.poll(), "旧代 publication 不得冒充本代");
+            SequencedRunnable task = new SequencedRunnable(sequence);
+            queue.writeOrdinary(sequence, task);
+            assertFalse(queue.poll(), "写入 payload 不等于发布");
+            queue.publish(sequence);
+            if (oldState != OrdinaryState.TERMINAL) {
+                List<Runnable> claimed = new ArrayList<>();
+                queue.scanOrdinaryUnstarted(sequence,
+                        oldState == OrdinaryState.RETURNED
+                                ? OrdinaryDisposition.RETURN : OrdinaryDisposition.DISCARD,
+                        (claimedSequence, original) -> {
+                            assertEquals(sequence, claimedSequence);
+                            claimed.add(original);
+                        });
+                assertEquals(List.of(task), claimed);
+            }
+            assertTrue(queue.poll());
+            assertSame(task, queue.currentOrdinary());
+            if (oldState == OrdinaryState.TERMINAL) {
+                assertTrue(queue.tryStartCurrentOrdinary());
+                queue.terminalizeCurrentOrdinary();
+            } else {
+                assertFalse(queue.tryStartCurrentOrdinary());
+            }
+            assertEquals(oldState, queue.currentOrdinaryState());
+            queue.advanceConsumer();
+            queue.releaseCurrentSlot();
+            assertFalse(queue.poll());
+            assertEquals(0, queue.retainedReferences());
+            assertTrue(queue.segmentSnapshot().allocated() <= 2,
+                    "固定池必须在多代间重复使用段");
         }
     }
 

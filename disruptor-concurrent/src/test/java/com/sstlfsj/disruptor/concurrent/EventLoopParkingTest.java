@@ -2,16 +2,55 @@ package com.sstlfsj.disruptor.concurrent;
 
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.management.ManagementFactory;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EventLoopParkingTest {
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"bounded", "unbounded"})
+    void spuriousUnparkRechecksWorkAndDoesNotLoseTheNextPublication(String backend)
+            throws Exception {
+        AtomicReference<Thread> worker = new AtomicReference<>();
+        EventLoop loop = (backend.equals("bounded")
+                ? EventLoopBuilder.bounded("spurious-parking", 8)
+                : EventLoopBuilder.unbounded("spurious-parking", 8))
+                .threadFactory(command -> {
+                    Thread thread = Thread.ofPlatform().name("spurious-parking-worker")
+                            .unstarted(command);
+                    worker.set(thread);
+                    return thread;
+                }).build();
+        try {
+            loop.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            var threads = ManagementFactory.getThreadMXBean();
+            for (int round = 0; round < 16; round++) {
+                await(() -> worker.get().getState() == Thread.State.WAITING);
+                long previousWaits = threads.getThreadInfo(worker.get().threadId()).getWaitedCount();
+                LockSupport.unpark(worker.get());
+                // 等待次数增长证明发生了新一轮 park，不能误把旧 WAITING 当作已复查。
+                await(() -> worker.get().getState() == Thread.State.WAITING
+                        && threads.getThreadInfo(worker.get().threadId()).getWaitedCount() > previousWaits);
+                assertEquals(round, loop.snapshot().completedTasks());
+                assertTrue(loop.submit(loop::inEventLoop).get(2, TimeUnit.SECONDS));
+            }
+            await(() -> worker.get().getState() == Thread.State.WAITING);
+            assertEquals(16, loop.snapshot().completedTasks());
+            assertEquals(0, loop.snapshot().outstandingTasks());
+        } finally {
+            loop.shutdownNow();
+            loop.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
 
     @ParameterizedTest(name = "{0}, future timer = {1}")
     @CsvSource({"bounded, false", "unbounded, false", "bounded, true", "unbounded, true"})
