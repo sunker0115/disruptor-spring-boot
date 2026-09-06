@@ -71,7 +71,16 @@ final class AcceptedTask<V> {
     }
 
     boolean tryDiscard() {
-        return state.compareAndSet(PhysicalState.WAITING, PhysicalState.DISCARDED);
+        while (true) {
+            PhysicalState current = state.get();
+            if (current != PhysicalState.WAITING
+                    && current != PhysicalState.CANCELLED_WAITING) {
+                return false;
+            }
+            if (state.compareAndSet(current, PhysicalState.DISCARDED)) {
+                return true;
+            }
+        }
     }
 
     boolean markCancelledWaiting() {

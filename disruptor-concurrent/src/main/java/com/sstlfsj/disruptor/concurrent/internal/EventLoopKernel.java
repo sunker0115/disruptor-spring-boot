@@ -69,6 +69,9 @@ public final class EventLoopKernel {
     private final AtomicBoolean startupOutcomeClaimed = new AtomicBoolean();
     private final AtomicBoolean quiescing = new AtomicBoolean();
     private final AtomicReference<ShutdownMode> stopMode = new AtomicReference<>();
+    private final TaskDispositionCoordinator disposition = new TaskDispositionCoordinator();
+    private final AtomicBoolean discardExecutionStarted = new AtomicBoolean();
+    private final CompletableFuture<Void> discardExecution = new CompletableFuture<>();
     private final AtomicBoolean workerDrained = new AtomicBoolean();
     private volatile long executing;
     private volatile long completed;
@@ -123,6 +126,11 @@ public final class EventLoopKernel {
             throw new IllegalStateException("threadFactory 必须返回尚未启动的线程：" + worker.getName());
         }
         this.wakeup = new WorkerWakeup(gate, () -> LockSupport.unpark(worker));
+        disposition.completion().whenComplete((ignored, failure) -> {
+            if (failure != null) {
+                reportDispositionFailure(unwrap(failure));
+            }
+        });
         supervisor.register(worker);
         supervisor.termination().whenComplete(this::publishTermination);
     }
@@ -384,13 +392,26 @@ public final class EventLoopKernel {
         Objects.requireNonNull(deadline, "deadline 不能为空");
         gate.closeForAdmissions();
         publishStartupFailure(new StartupAbortedException(name));
-        gate.awaitDrained();
-        List<Runnable> notStarted = returnUnstarted();
-        returned.addAndGet(notStarted.size());
-        supervisor.requestShutdown(ShutdownMode.IMMEDIATE, deadline);
-        worker.interrupt();
-        LockSupport.unpark(worker);
-        return notStarted;
+        boolean returning = disposition.tryBeginReturning();
+        try {
+            supervisor.requestShutdown(ShutdownMode.IMMEDIATE, deadline);
+            if (!returning) {
+                return List.of();
+            }
+            gate.awaitDrained();
+            List<Runnable> notStarted = returnUnstarted();
+            returned.addAndGet(notStarted.size());
+            disposition.completeReturned();
+            return notStarted;
+        } catch (Throwable failure) {
+            if (returning) {
+                disposition.failReturningToDiscarding(failure);
+                startDiscardExecution();
+            }
+            throw failure;
+        } finally {
+            LockSupport.unpark(worker);
+        }
     }
 
     public void requestShutdown(ShutdownMode mode, ShutdownDeadline deadline) {
@@ -398,14 +419,7 @@ public final class EventLoopKernel {
         Objects.requireNonNull(deadline, "deadline 不能为空");
         gate.closeForAdmissions();
         publishStartupFailure(new StartupAbortedException(name));
-        if (mode == ShutdownMode.IMMEDIATE) {
-            gate.awaitDrained();
-            discardUnstarted();
-        }
         supervisor.requestShutdown(mode, deadline);
-        if (mode == ShutdownMode.IMMEDIATE) {
-            worker.interrupt();
-        }
         LockSupport.unpark(worker);
     }
 
@@ -476,6 +490,10 @@ public final class EventLoopKernel {
             supervisor.fail(primaryFailure);
         } finally {
             gate.closeForAdmissions();
+            if (stopMode.get() != ShutdownMode.GRACEFUL) {
+                disposition.tryBeginDiscarding();
+            }
+            awaitTaskDisposition();
             cancelAndClearRetainedTasks();
             Throwable stopFailure = modulesStarted || modules.startedCount() > 0
                     ? modules.stop(owner, primaryFailure)
@@ -500,21 +518,24 @@ public final class EventLoopKernel {
     }
 
     void stopWorker(ShutdownMode mode) {
-        if (mode == ShutdownMode.IMMEDIATE) {
-            discardUnstarted();
-        }
+        gate.closeForAdmissions();
         stopMode.accumulateAndGet(mode, (current, requested) ->
                 current == ShutdownMode.IMMEDIATE || requested == ShutdownMode.IMMEDIATE
                         ? ShutdownMode.IMMEDIATE
                         : ShutdownMode.GRACEFUL);
         if (mode == ShutdownMode.IMMEDIATE) {
+            disposition.tryBeginDiscarding();
             worker.interrupt();
         }
         LockSupport.unpark(worker);
+        if (mode == ShutdownMode.IMMEDIATE
+                && disposition.state() == TaskDispositionCoordinator.State.DISCARDING) {
+            startDiscardExecution();
+        }
     }
 
     private void runLoop() throws Throwable {
-        while (stopMode.get() == null) {
+        while (canProcessTasks()) {
             boolean didWork = processCancellations();
             if (quiescing.get()) {
                 didWork |= cancelWaitingPeriodicTasks();
@@ -536,7 +557,7 @@ public final class EventLoopKernel {
         int physicalCompleted = 0;
         AcceptedTask<?> task;
         try {
-            while ((task = cancellationMailbox.poll()) != null) {
+            while (canProcessTasks() && (task = cancellationMailbox.poll()) != null) {
                 processed = true;
                 if (task.scheduled() && timers.remove(task.scheduledTask())) {
                     physicalCompleted += terminateTask(task);
@@ -559,7 +580,7 @@ public final class EventLoopKernel {
         List<ScheduledTask<?>> retained = new ArrayList<>(timers.size());
         ScheduledTask<?> scheduled;
         try {
-            while ((scheduled = timers.poll()) != null) {
+            while (canProcessTasks() && (scheduled = timers.poll()) != null) {
                 AcceptedTask<?> task = scheduled.acceptedTask();
                 if (scheduled.isPeriodic()) {
                     if (task.markCancelledWaiting()) {
@@ -585,6 +606,9 @@ public final class EventLoopKernel {
         int physicalCompleted = 0;
         try {
             for (int count = 0; count < maxTimerBatchSize; count++) {
+                if (!canProcessTasks()) {
+                    break;
+                }
                 ScheduledTask<?> scheduled = timers.peek();
                 if (scheduled == null || !scheduled.isDue(clock.nanoTime())) {
                     break;
@@ -601,7 +625,7 @@ public final class EventLoopKernel {
                 try {
                     boolean repeat = scheduled.runInvocation();
                     if (task.returnToWaiting(() -> scheduled.canRearm(
-                            repeat, quiescing.get()))) {
+                            repeat, quiescing.get() || !canProcessTasks()))) {
                         timers.add(scheduled);
                     } else {
                         if (repeat && !task.future().isDone()) {
@@ -633,7 +657,7 @@ public final class EventLoopKernel {
         int physicalCompleted = 0;
         try {
             for (int count = 0; count < maxCommandBatchSize; count++) {
-                if (!queue.poll()) {
+                if (!canProcessTasks() || !queue.poll()) {
                     break;
                 }
                 processed = true;
@@ -645,6 +669,7 @@ public final class EventLoopKernel {
                     case ORDINARY -> {
                         if (!queue.tryStartCurrentOrdinary()) {
                             OrdinaryState state = queue.currentOrdinaryState();
+                            awaitTaskDisposition();
                             queue.advanceConsumer();
                             queue.releaseCurrentSlot();
                             if (state == OrdinaryState.RETURNED
@@ -732,10 +757,15 @@ public final class EventLoopKernel {
                 && registry.size() == 0);
     }
 
+    private boolean canProcessTasks() {
+        return stopMode.get() == null
+                && disposition.state() == TaskDispositionCoordinator.State.NONE;
+    }
+
     private void parkUntilWork() {
         wakeup.prepareToPark();
         ScheduledTask<?> next = timers.peek();
-        if (stopMode.get() == null
+        if (canProcessTasks()
                 && cancellationMailbox.isEmpty()
                 && !queue.poll()
                 && (next == null || !next.isDue(clock.nanoTime()))) {
@@ -918,6 +948,9 @@ public final class EventLoopKernel {
     }
 
     private int terminateTask(AcceptedTask<?> task) {
+        if (task.state() != AcceptedTask.PhysicalState.RUNNING) {
+            awaitTaskDisposition();
+        }
         if (!task.terminate()) {
             return 0;
         }
@@ -936,7 +969,6 @@ public final class EventLoopKernel {
 
     private void cancelAndClearRetainedTasks() {
         gate.awaitDrained();
-        discardUnstarted();
         int physicalCompleted = 0;
         AcceptedTask<?> running = currentTask;
         if (running != null) {
@@ -951,11 +983,7 @@ public final class EventLoopKernel {
         while (queue.poll()) {
             TaskType type = queue.currentType();
             if (type == TaskType.ORDINARY) {
-                if (queue.tryStartCurrentOrdinary()) {
-                    queue.terminalizeCurrentOrdinary();
-                } else {
-                    cancelled++;
-                }
+                cancelled++;
                 queue.advanceConsumer();
                 queue.releaseCurrentSlot();
                 physicalCompleted++;
@@ -966,20 +994,17 @@ public final class EventLoopKernel {
                 AcceptedTask<?> task = queue.currentRecord();
                 queue.advanceConsumer();
                 queue.releaseCurrentSlot();
-                if (task.tryDiscard()) {
-                    task.future().cancel(CancellationReason.SHUTDOWN_NOW);
-                }
                 physicalCompleted += terminateTask(task);
             }
         }
         while (cancellationMailbox.poll() != null) {
             // 任务已由 timer/queue/running 路径完成物理清理。
         }
-        registry.scanForShutdown(task -> {
-            if (task.tryDiscard()) {
-                task.future().cancel(CancellationReason.SHUTDOWN_NOW);
-            }
-        });
+        List<AcceptedTask<?>> retained = new ArrayList<>();
+        registry.scanForShutdown(retained::add);
+        for (AcceptedTask<?> task : retained) {
+            physicalCompleted += terminateTask(task);
+        }
         if (physicalCompleted != 0) {
             gate.completeBatch(physicalCompleted);
         }
@@ -1005,17 +1030,95 @@ public final class EventLoopKernel {
     }
 
     private void discardUnstarted() {
+        gate.awaitDrained();
         long frozen = queue.claimedCursor();
         queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.DISCARD,
                 (sequence, original) -> {
                 });
         registry.scanForShutdown(task -> {
-            if (task.tryDiscard()) {
+            if (task.tryDiscard()
+                    || task.state() == AcceptedTask.PhysicalState.DISCARDED
+                    || task.state() == AcceptedTask.PhysicalState.RETURNED) {
                 task.future().cancel(CancellationReason.SHUTDOWN_NOW);
             } else if (task.state() == AcceptedTask.PhysicalState.RUNNING) {
                 task.future().cancel(true);
             }
         });
+    }
+
+    private void startDiscardExecution() {
+        if (!discardExecutionStarted.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Thread.ofVirtual().name(name + "-task-disposition").start(() -> {
+                try {
+                    discardUnstarted();
+                    disposition.completeDiscarded();
+                    discardExecution.complete(null);
+                } catch (Throwable failure) {
+                    reportDispositionFailure(failure);
+                    discardExecution.completeExceptionally(failure);
+                } finally {
+                    LockSupport.unpark(worker);
+                }
+            });
+        } catch (Throwable failure) {
+            reportDispositionFailure(failure);
+            discardExecution.completeExceptionally(failure);
+            LockSupport.unpark(worker);
+        }
+    }
+
+    private void awaitTaskDisposition() {
+        boolean interrupted = Thread.interrupted();
+        try {
+            while (!disposition.isTerminal()) {
+                if (disposition.state() == TaskDispositionCoordinator.State.NONE) {
+                    return;
+                }
+                if (disposition.state() == TaskDispositionCoordinator.State.RETURNING) {
+                    interrupted |= Thread.interrupted();
+                    if (disposition.state() == TaskDispositionCoordinator.State.RETURNING) {
+                        LockSupport.park(disposition);
+                    }
+                    continue;
+                }
+                startDiscardExecution();
+                try {
+                    discardUnstarted();
+                    disposition.completeDiscarded();
+                } catch (Throwable failure) {
+                    reportDispositionFailure(failure);
+                    awaitDiscardExecution();
+                    if (!disposition.isTerminal()) {
+                        discardUnstarted();
+                        disposition.completeDiscarded();
+                    }
+                }
+            }
+            if (discardExecutionStarted.get()) {
+                // 取消回调也必须完成，避免物理清理后又向 mailbox 写入引用。
+                awaitDiscardExecution();
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void awaitDiscardExecution() {
+        try {
+            discardExecution.join();
+        } catch (CompletionException ignored) {
+            // 执行者已上报 supervisor；worker 仍接管未完成的物理处置。
+        }
+    }
+
+    private void reportDispositionFailure(Throwable failure) {
+        supervisor.fail(failure);
+        reportOwnerFailure(failure);
     }
 
     private EventLoopSnapshot snapshot(WorkerSnapshot workerSnapshot, boolean accepting) {

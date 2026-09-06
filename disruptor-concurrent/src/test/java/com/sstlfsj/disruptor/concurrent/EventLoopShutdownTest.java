@@ -7,8 +7,10 @@ import com.sstlfsj.disruptor.core.WorkerSupervisor;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +25,82 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EventLoopShutdownTest {
+
+    @Test
+    void concurrentShutdownNowDoesNotSplitReturnedSet() throws Exception {
+        var callers = Executors.newFixedThreadPool(2);
+        try {
+            for (int attempt = 0; attempt < 40; attempt++) {
+                DisruptorEventLoop loop = runningLoop("concurrent-now-" + attempt, 64);
+                CountDownLatch entered = new CountDownLatch(1);
+                CountDownLatch release = new CountDownLatch(1);
+                CountDownLatch start = new CountDownLatch(1);
+                try {
+                    loop.execute(() -> {
+                        entered.countDown();
+                        awaitIgnoringInterrupt(release);
+                    });
+                    assertTrue(entered.await(2, TimeUnit.SECONDS));
+                    List<Runnable> queued = new ArrayList<>();
+                    for (int i = 0; i < 20; i++) {
+                        Runnable task = new NamedRunnable("queued-" + i);
+                        queued.add(task);
+                        loop.execute(task);
+                    }
+                    Future<List<Runnable>> first = callers.submit(() -> {
+                        start.await();
+                        return loop.shutdownNow();
+                    });
+                    Future<List<Runnable>> second = callers.submit(() -> {
+                        start.await();
+                        return loop.shutdownNow();
+                    });
+                    start.countDown();
+                    List<Runnable> a = first.get(2, TimeUnit.SECONDS);
+                    List<Runnable> b = second.get(2, TimeUnit.SECONDS);
+                    List<Runnable> union = new ArrayList<>(a);
+                    union.addAll(b);
+
+                    assertEquals(20, union.size());
+                    assertTrue(a.isEmpty() || b.isEmpty(), "返回集合必须由一个调用方完整取得");
+                    assertEquals(queued, union);
+                } finally {
+                    start.countDown();
+                    release.countDown();
+                    loop.shutdownNow();
+                    assertTrue(loop.awaitTermination(2, TimeUnit.SECONDS));
+                }
+            }
+        } finally {
+            callers.shutdownNow();
+            assertTrue(callers.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void stuckWorkerStillCancelsQueuedFutureOnImmediateDeadline() throws Exception {
+        DisruptorEventLoop loop = runningLoop("stuck", 16);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            loop.execute(() -> {
+                entered.countDown();
+                awaitIgnoringInterrupt(release);
+            });
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            Future<?> queued = loop.submit(() -> { });
+
+            loop.requestShutdown(ShutdownMode.IMMEDIATE,
+                    ShutdownDeadline.after(Duration.ofMillis(100)));
+
+            awaitCondition(queued::isCancelled);
+            assertFalse(loop.isTerminated());
+        } finally {
+            release.countDown();
+            loop.shutdownNow();
+            assertTrue(loop.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
 
     @Test
     void shutdownUsesUnboundedDeadlineAndRunsAcceptedFutureOneShot() throws Exception {

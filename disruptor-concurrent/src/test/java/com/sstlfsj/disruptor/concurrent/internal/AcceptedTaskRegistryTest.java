@@ -35,6 +35,15 @@ class AcceptedTaskRegistryTest {
     }
 
     @Test
+    void immediateDiscardTakesOwnershipFromCancelledWaiting() {
+        AcceptedTask<Void> task = task(3, new NamedRunnable("cancelled"));
+        assertTrue(task.markCancelledWaiting());
+
+        assertTrue(task.tryDiscard());
+        assertEquals(AcceptedTask.PhysicalState.DISCARDED, task.state());
+    }
+
+    @Test
     void shutdownScanVisitsTrackedTasksInAdmissionTicketOrder() {
         AcceptedTaskRegistry registry = new AcceptedTaskRegistry();
         registry.register(task(7, new NamedRunnable("seven")));
