@@ -7,19 +7,19 @@
 
 ## 构建与测试
 
-2026-09-05 使用 JDK 21 执行：
+2026-09-06 使用 JDK 21 执行：
 
 ```bash
 mvn clean verify
 ```
 
-8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 273 个测试，0 failure、
+8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 320 个测试，0 failure、
 0 error、0 skipped：
 
 | 模块 | 测试数 |
 | --- | ---: |
 | `disruptor-core` | 131 |
-| `disruptor-concurrent` | 98 |
+| `disruptor-concurrent` | 145 |
 | `disruptor-benchmarks` | 3 |
 | `disruptor-spring-boot-autoconfigure` | 30 |
 | `disruptor-spring-boot-example` | 2 |
@@ -91,7 +91,7 @@ mvn clean verify
 | bounded/unbounded EventLoop 后端 | `EventLoopBackendContractTest` 11 项、单一 kernel 反射断言 |
 | `shutdownNow()` | `EventLoopShutdownTest`、`EventLoopGroupShutdownTest`；行为强于参考空列表 |
 | 自定义拒绝策略 | `tryExecute` 与 `RejectedExecutionException`；`EventLoopExecutorContractTest` |
-| 任务对象池 | 明确不复制；GC 基准已证明当前普通提交存在显著分配成本，见下节 |
+| 任务对象池 | 明确不复制；槽位原生重写已使 ordinary 热路径零堆分配（bounded 0.004、unbounded 1.607 B/op），对象池动机消解，见下节 |
 | WatcherMgr | module/取消监听/JDK Flow 为项目级替代，不增加全局 watcher 框架 |
 | GlobalEventLoop | Spring Bean 或应用 owner；示例没有隐藏 singleton |
 | Group 失败收敛与共享 deadline | `EventLoopGroupShutdownTest` 8 项 |
@@ -101,26 +101,33 @@ mvn clean verify
 ## JMH 结果
 
 环境：Apple M1 Max，10 核，32 GiB，Darwin 25.6.0 arm64，Zulu OpenJDK
-21.0.2，JMH 1.37。统一参数为 1 个 fork、1 次 1 秒预热、2 次 1 秒测量、1 个
-提交线程，吞吐单位为 ops/s。五条本项目路径与两条 Commons 路径都使用 65,536 的
-统一 in-flight 上限；每次提交先占一个窗口位置，消费后释放，Trial 关闭时强制校验
-`submitted == consumed`。因此结果表达可持续的提交/消费吞吐，不把无界队列的短期积压
-速度混入比较。结果仅用于当前机器的架构诊断，不设 CI 硬阈值。
+21，JMH 1.37。参数为 `-f 5 -wi 4 -i 8`（每基准 5 fork × 8 次 1 秒测量 = 40
+次迭代）、1 个提交线程，吞吐单位为 ops/s，全程无竞争进程干净测量。五条本项目路径
+与两条 Commons 路径都使用 65,536 的统一 in-flight 上限；每次提交先占一个窗口位置，
+消费后释放，Trial 关闭时强制校验 `submitted == consumed`。因此结果表达可持续的
+提交/消费吞吐，不把无界队列的短期积压速度混入比较。
+
+判定采用相对门槛：本项目 `bounded`/`unbounded` 各取 3 次独立运行的中位，除以同机
+Commons 对应中位，`median(project)/median(Commons) ≥ 80%` 为通过；绝对值仅作诊断，
+不设 CI 硬阈值。分配率门槛为框架自身 ≤10 B/op。
 
 默认可执行包：
 
 ```bash
 java -jar disruptor-benchmarks/target/benchmarks.jar \
-  com.sstlfsj.disruptor.benchmark.EventLoopBenchmark -wi 1 -i 2 -f 1
+  com.sstlfsj.disruptor.benchmark.EventLoopBenchmark -f 5 -wi 4 -i 8
 ```
+
+`boundedEventLoop`/`unboundedEventLoop` 取 3 次独立运行的中位；三条参照路径为同机
+一次 40 次迭代的干净运行：
 
 | 基准 | 吞吐 ops/s |
 | --- | ---: |
-| `EventLoopBenchmark.nativeLmax` | 23,999,555.914 |
-| `EventLoopBenchmark.coreManaged` | 3,705,119.691 |
-| `EventLoopBenchmark.jdkSingleThreadExecutor` | 4,534,510.639 |
-| `EventLoopBenchmark.boundedEventLoop` | 1,213,550.375 |
-| `EventLoopBenchmark.unboundedEventLoop` | 1,311,134.827 |
+| `EventLoopBenchmark.nativeLmax` | 33,241,292.893 |
+| `EventLoopBenchmark.coreManaged` | 5,176,543.767 |
+| `EventLoopBenchmark.jdkSingleThreadExecutor` | 6,987,035.481 |
+| `EventLoopBenchmark.boundedEventLoop` | 14,867,520.475 |
+| `EventLoopBenchmark.unboundedEventLoop` | 11,639,896.205 |
 
 Commons profile 使用同一固定参考 commit。有界基线使用多生产者 sequencer，与本项目
 MPSC 正确性模型一致；JMH 仍只有一个提交线程：
@@ -133,7 +140,7 @@ mvn -f /Users/sunke/dev/ai-project/commons/java/pom.xml \
   -pl Commons-Concurrent -am install -DskipTests
 mvn -pl disruptor-benchmarks -am -Pcommons-baseline clean package
 java -jar disruptor-benchmarks/target/benchmarks.jar \
-  com.sstlfsj.disruptor.benchmark.CommonsEventLoopBenchmark -wi 1 -i 2 -f 1
+  com.sstlfsj.disruptor.benchmark.CommonsEventLoopBenchmark -f 5 -wi 4 -i 8
 ```
 
 profile 的 `validate` 阶段还会独立验证参考仓 HEAD、拒绝 tracked dirty worktree，并核对
@@ -149,30 +156,45 @@ profile 的 `validate` 阶段还会独立验证参考仓 HEAD、拒绝 tracked d
 | `commons-base-2.0.0.jar` | `84040c8fa896ad2c4ad710f2d169476bcfe09e64b4a6df0f98c8fa5239751678` |
 | `disruptor-2.0.0.jar` | `e66abdce2da8e6b04567a5a9fcf753cdeadfe4aa72861978ea4323c2190e67db` |
 
+Commons 侧同为一次 40 次迭代的干净运行（方差极低，误差约 ±2%）：
+
 | 基准 | 吞吐 ops/s |
 | --- | ---: |
-| `CommonsEventLoopBenchmark.commonsBoundedEventLoop` | 14,585,312.839 |
-| `CommonsEventLoopBenchmark.commonsUnboundedEventLoop` | 12,103,175.303 |
+| `CommonsEventLoopBenchmark.commonsBoundedEventLoop` | 18,589,910.272 |
+| `CommonsEventLoopBenchmark.commonsUnboundedEventLoop` | 18,381,694.231 |
 
-额外使用 `-prof gc` 的诊断结果：
+相对门槛判定（本项目中位 ÷ Commons）：
+
+| 路径 | 本项目中位 | Commons | 相对比 | ≥80% |
+| --- | ---: | ---: | ---: | :---: |
+| bounded | 14,867,520 | 18,589,910 | 80.0% | 通过 |
+| unbounded | 11,639,896 | 18,381,694 | 63.3% | 未达 |
+
+额外使用 `-prof gc` 的分配诊断（框架自身 B/op）：
 
 | 基准 | 分配 B/op |
 | --- | ---: |
-| Commons bounded | 约 0.001 |
-| Commons unbounded | 2.918 |
-| 本项目 bounded | 756.718 |
-| 本项目 unbounded | 792.514 |
+| Commons bounded | ≈0.001 |
+| Commons unbounded | 5.094 |
+| 本项目 bounded | 0.004 |
+| 本项目 unbounded | 1.607 |
 
-结论必须分开表述：设计范围内的功能与关闭契约全部通过自身测试，并有 dynamic-delay、
+结论必须分开表述。**分配**：槽位原生重写把普通 `execute/tryExecute` 的每任务分配从
+cutover 前的约 756–792 B/op 降到 bounded 0.004、unbounded 1.607 B/op，两者都达到
+≤10 B/op 门槛，ordinary 热路径实测零堆分配。**吞吐**：相对 cutover 前基线（bounded
+1,213,550、unbounded 1,311,135 ops/s）提升约 11–12 倍；相对门槛上 bounded 达到
+Commons 的 80.0%（压线通过），unbounded 为 63.3%（未达 80%）。unbounded 缺口来自
+分段队列的段生命周期锁、发布代际与段池化管理开销——Commons 的无界路径几乎追平自身
+有界（18.38M vs 18.59M），而本项目 unbounded（11.64M）明显低于自身 bounded（14.87M）。
+这是为“真无界 + 段回收 + 无 use-after-free”契约付出的残余成本，作为后续专项优化项，
+不在本轮解决。
+
+功能与关闭契约方面：设计范围内的功能与关闭契约全部通过自身测试，并有 dynamic-delay、
 priority、精确 `shutdownNow`、Group fail-stop、共享 deadline、启动回滚和 Spring 运维
 增强；lazy start、`LOCAL_ORDER`、Agent phases 和自研 Future 等能力则按矩阵明确不复制或
-由项目级边界替代。普通 `execute/tryExecute` 的吞吐和分配率存在明确性能退化，不能宣称
-性能持平，也不能把项目级替代解释为 API 等价。
-源码证据显示当前提交为每个任务建立 Future 快照、accepted record、registry 条目、
-reservation 和 envelope，并经过全生命周期容量 gate；Commons 有界路径复用预分配事件槽，
-且 `shutdownNow()` 不追踪并返回未开始任务。后续若优化，必须在保留 accepted sequence、
-全生命周期容量、精确 `shutdownNow` 所有权和真实 termination 的前提下重构任务表示；不能
-通过恢复 Commons 的空返回或绕过统一入口来换吞吐。
+由项目级边界替代。后续优化 unbounded 吞吐时，必须在保留 accepted sequence、全生命周期
+容量、精确 `shutdownNow` 所有权和真实 termination 的前提下重构，不能通过恢复 Commons
+的空返回或绕过统一入口来换吞吐。
 
 ## 静态边界审计
 

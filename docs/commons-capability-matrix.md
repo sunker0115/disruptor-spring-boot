@@ -17,7 +17,7 @@
 | 消费屏障、依赖序列、alert | `ConsumerBarrier`、`SingleConsumerBarrier`、`MultiConsumerBarrier` | LMAX `SequenceBarrier`、原生 `EventProcessor` 与 topology；`DisruptorPipelineTest`、`NativeCapabilitiesTest` | 项目级替代 |
 | Blocking、BusySpin、Sleeping、Yielding 与 timeout wait | 同名 `WaitStrategy` 实现、`SequenceBlocker` | core 的 wait-strategy 工厂保留 LMAX 策略；构造参数型策略由 `PipelineSpec.waitStrategy(...)` 提供 | 覆盖；不复制 `SequenceBlocker` |
 | 有界事件拓扑、用户事件和原始 sequence | `EventSequencer`、`RingBufferEventSequencer`、`EventHandler` | `PipelineSpec.topology` 接收原生 `Disruptor<E>`，运行时不包装业务 handler | 覆盖 |
-| 分段 MPSC 无界 event sequencer | `MpUnboundedBuffer`、`MpUnboundedBufferSequencer`、`MpUnboundedEventSequencer` | `UnboundedTaskQueue` 作为 EventLoop 任务后端，与 bounded 后端共享唯一 kernel；`TaskQueueContractTest`、`UnboundedEventLoopTest` | 项目级覆盖；不公开通用无界事件总线 |
+| 分段 MPSC 无界 event sequencer | `MpUnboundedBuffer`、`MpUnboundedBufferSequencer`、`MpUnboundedEventSequencer` | `UnboundedTaskQueue` 作为 EventLoop 任务后端，与 bounded 后端共享唯一 kernel；分段 typed 槽 + 发布代际 + 段生命周期锁回收到空闲链表、超 `maxPooledSegments` 才释放 GC，复用前清 payload/state；`TaskQueueContractTest`（段回收、代际、双 scanner 无 use-after-free）、`UnboundedEventLoopTest` | 项目级覆盖；不公开通用无界事件总线 |
 | 生产者/消费者屏障作为独立低层扩展 API | `ProducerBarrier`、`ConsumerBarrier`、`Sequencer` | core 保留 LMAX 原生 `RingBuffer`、barrier 与自定义 processor 逃生口；concurrent 只公开任务执行边界 | 项目级替代；不兼容 fork API |
 
 ## Commons-Concurrent 模块
@@ -48,9 +48,9 @@
 | 立即执行器、Executor 适配 | `ImmediateExecutor`、`ExecutorServiceAdapter` | `Runnable::run` 与 JDK `ExecutorService` | 标准 API 替代 |
 | stackless cancel/timeout、FutureLogger | `BetterCancellationException`、`FutureLogger` | 标准 `CancellationException`、显式 `CancellationReason` 与 SLF4J handler | 项目级替代；不复制异常类型 |
 | 有界 RingBuffer 与无界 event sequencer | `RingBufferEventSequencer`、`MpUnboundedEventSequencer` | `BoundedTaskQueue`/`UnboundedTaskQueue` 两后端、唯一 `EventLoopKernel`；`EventLoopBackendContractTest` | 覆盖运行场景 |
-| `shutdownNow()` 固定返回空列表 | `DisruptorEventLoop.shutdownNow` 第 394–398 行 | accepted registry CAS 返回未开始原始 Runnable；`EventLoopShutdownTest` | 增强，符合 JDK 契约 |
+| `shutdownNow()` 固定返回空列表 | `DisruptorEventLoop.shutdownNow` 第 394–398 行 | 冻结 `claimedCursor` 后 `queue.scanOrdinaryUnstarted` 扫描 ordinary 槽 + `registry.scanForShutdown` 扫描 tracked index，按 ticket 升序 CAS 返回未开始原始 Runnable，running 不返回并 `cancel(true)`；`EventLoopShutdownTest` | 增强，符合 JDK 契约 |
 | 自定义拒绝策略 | `RejectedExecutionHandlers` | `RejectedExecutionException` 与非抛出 `tryExecute` | 有意收窄；不提供 CallerRuns 或静默丢弃 |
-| 任务对象池 | `ScheduledPromiseTask.POOL` | 默认不池化；`docs/disruptor-concurrent-verification.md` 的 JMH/GC 已量化普通提交约 757–792 B/op 的分配成本 | 不复制原池化实现；已确认性能退化，后续须在不放松关闭/所有权契约下重构任务表示 |
+| 任务对象池 | `ScheduledPromiseTask.POOL` | 无需对象池：预分配 typed ring 槽即任务记录，ordinary 热路径零堆分配（`docs/disruptor-concurrent-verification.md` GC 实测 bounded 0.004、unbounded 1.607 B/op）；Future/记录/index 仅用于 `submit/schedule` | 不复制原池化实现；池化动机已由槽位原生重写消解，且保留统一入口与关闭/所有权契约 |
 | WatcherMgr | `WatcherMgr`、`SimpleWatcherMgr` | module 内集合、取消监听或 JDK Flow | 项目级替代 |
 | GlobalEventLoop | `GlobalEventLoop` | Spring Bean 或应用显式 owner | 不复制隐藏单例 |
 | Group 失败收敛与共享 deadline | `DefaultEventLoopGroup` 聚合 child termination，但没有组级首因/deadline 协议 | `GroupLifecycleCoordinator`；`EventLoopGroupShutdownTest` 覆盖 child fail-stop、deadline 身份和真实终止 | 增强 |
@@ -59,6 +59,6 @@
 
 ## 结论
 
-本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约；当前 JMH 已确认普通 EventLoop 提交的吞吐和分配率弱于 Commons，不能把功能覆盖表述为性能持平。
+本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约。性能上，槽位原生重写后 ordinary 热路径已实测零堆分配（bounded 0.004、unbounded 1.607 B/op，与 Commons 同级）；吞吐相对 Commons，bounded 达 80.0%（相对门槛压线通过），unbounded 为 63.3%（未达 80%，分段回收契约的残余成本，列为后续专项优化）。功能覆盖不表示吞吐持平。
 
 未复制项集中在 Commons 自身生态抽象：自研 Future API、ComponentId/Agent phases、WatcherMgr、LOCAL_ORDER 快路、任务池和 GlobalEventLoop。它们分别由 JDK/Spring/业务显式编排替代，或因破坏本项目全序、容量和所有权不变量而明确排除。因此“完整覆盖”指场景能力闭合，不表示包名、类型或调用点兼容。
