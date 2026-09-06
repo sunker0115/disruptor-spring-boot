@@ -7,6 +7,7 @@ import com.sstlfsj.disruptor.concurrent.CancellationSource;
 import com.sstlfsj.disruptor.concurrent.DisruptorEventLoop;
 import com.sstlfsj.disruptor.concurrent.DisruptorEventLoopGroup;
 import com.sstlfsj.disruptor.concurrent.EventLoopScheduledFuture;
+import com.sstlfsj.disruptor.example.DemoResults;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -15,6 +16,8 @@ import java.time.Duration;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import org.springframework.boot.CommandLineRunner;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -70,6 +73,21 @@ class ConcurrentExampleTest {
             assertThat(workers.termination().toCompletableFuture()).isCompleted();
             assertThat(workers).allMatch(child -> child.isTerminated());
         });
+    }
+
+    @Test
+    void springRunnerCompletesTheDocumentedConcurrentPath() throws Exception {
+        Class<?> runnerType = Class.forName(
+                "com.sstlfsj.disruptor.example.concurrent.ConcurrentDemoRunner");
+        contextRunner
+                .withBean(DemoResults.class)
+                .withBean(runnerType)
+                .run(context -> {
+                    CommandLineRunner runner = (CommandLineRunner) context.getBean(runnerType);
+                    runner.run();
+
+                    assertThat(context.getBean(DemoResults.class).isDone("concurrent")).isTrue();
+                });
     }
 
     private static void awaitAtLeast(AtomicInteger actual, int expected) {
