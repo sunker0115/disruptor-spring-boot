@@ -180,19 +180,19 @@ TERMINATED ── start() ──> IllegalStateException
 
 ### 监督生命周期内核
 
-管道、EventLoop 与 Group 使用同一组阶段：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED`。`start()` 成功的含义是启动登记已经封口、全部 worker 与 module 已完成启动、内部启动 token 已归零且公开 gate 已开放，不以“线程已创建”冒充 ready。
+管道、EventLoop 与 Group 使用同一组阶段：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED`。`start()` 成功的含义是启动登记已经封口、全部 worker 与 module 已完成启动、内部启动登记计数已归零且公开 gate 已开放，不以“线程已创建”冒充 ready。
 
-`ShutdownDeadline` 是同一次关闭广播的身份对象。正常提交要求启动落定、全部 child stage 完成且 token 清零；超时提交只等待已经接受广播的参与者归还 token，随后冻结原 outcome。迟到 rollback 只补充会话事实并继续后台收敛，不能重开广播、替换首因或伪造 termination。
+`ShutdownDeadline` 是同一次关闭广播的身份对象。正常提交要求启动落定、全部 child stage 完成且广播参与计数归零；超时提交只等待已经接受广播的参与者完成其登记，随后冻结原 outcome。迟到 rollback 只补充会话事实并继续后台收敛，不能重开广播、替换首因或伪造 termination。
 
 ### EventLoop 与 Group
 
-`EventLoop` 同时实现 JDK `ScheduledExecutorService` 和项目的 `SupervisedScheduledExecutor`。bounded 后端用 LMAX RingBuffer，容量口径是尚未物理清理的全部 accepted 任务，包括入口、timer 和 executing；unbounded 后端使用分段 MPSC 队列并在消费后清除引用。两者共享 accepted sequence，因此立即任务和零延迟任务保持一个本地全序，timer 与 command 通过有限批次互相让行。
+`EventLoop` 同时实现 JDK `ScheduledExecutorService` 和项目的 `SupervisedScheduledExecutor`。bounded 后端使用 LMAX `RingBuffer<Cell>`，unbounded 后端使用分段 MPSC typed 槽；二者只替换 `TaskQueue`，共享一个 `EventLoopKernel`、调度、生命周期和关闭协议。容量由 `TaskAdmissionGate` 的 `outstanding` 账本定义，覆盖入口、timer 和 executing，且 bounded 快照始终满足 `outstanding ≤ capacityLimit`。立即任务和零延迟任务共享单调 accepted sequence，因此保持一个本地全序，timer 与 command 通过有限批次互相让行。
 
-高级 `ScheduledTaskSpec` 以不可变字段表达 one-shot、fixed-rate、fixed-delay、dynamic-delay、expires、max executions、continue-on-failure、priority、显式 `TaskContext` 与 `CancellationToken`。Future 终态和物理任务状态分离：取消可以先完成 Future，但 bounded permit 只在任务引用从 queue/timer/执行路径真正清除后释放。
+高级 `ScheduledTaskSpec` 以不可变字段表达 one-shot、fixed-rate、fixed-delay、dynamic-delay、expires、max executions、continue-on-failure、priority、显式 `TaskContext` 与 `CancellationToken`。Future 终态和物理任务状态分离：取消可以先完成 Future，但 bounded outstanding 只在任务引用从 queue/timer/执行路径真正清除后释放。无界队列的 `maxPooledSegments` 默认 `8`，`0` 明确禁用池化；快照同时提供 `discardedTasks`、`activeQueueSegments` 和 `allocatedQueueSegments`，其中 active 不得超过 allocated。
 
-`EventLoopGroup` 拥有固定 child 集合，提供轮询 `next()` 与稳定 `select(affinityKey)`。Group gate 先于 child gate 获取准入 token，使组级关闭能冻结新任务并等待在途选择完成。child 生命周期只能由 Group 操作；任一 child 基础设施失败会以同一 deadline fail-stop 全组，Group termination 只在全部 child 真实终止后完成。
+`EventLoopGroup` 拥有固定 child 集合，提供轮询 `next()` 与稳定 `select(affinityKey)`。Group 只有一个 volatile `accepting`：child 提交先进入本地 `TaskAdmissionGate`，随后读取 owner 的 `accepting`；读取为假即在 `finally` 中回滚本地准入，因而不形成 accepted task。启动时 child 依次打开本地 gate，但只有 Group 将全局 `accepting` 置为真后才真正接收任务。关闭顺序固定为：先置全局 `accepting=false`，再关闭所有 child gate，等待所有 child 的 active publisher drain，最后向全部 child 广播同一个 shutdown 请求和 deadline。child 生命周期只能由 Group 操作；任一 child 基础设施失败会以同一 deadline fail-stop 全组，Group termination 只在全部 child 真实终止后完成。
 
-标准 `shutdown()` 使用无界 graceful deadline：保留已接受的一次性延迟任务，取消周期任务。`shutdownNow()` 通过 accepted registry CAS 返回本次取得所有权的未开始原始任务，并尽力中断 running task；它不等待用户任务退出。Spring、Group 与运维使用显式共享的有界 deadline，到期后单调升级 immediate，但仍等待线程真实退出。
+标准 `shutdown()` 使用无界 graceful deadline：保留已接受的一次性延迟任务，取消周期任务。`shutdownNow()` 的从属处置器以 `NONE → RETURNING → RETURNED` 单赢家状态机，在获胜调用线程中扫描 ordinary 槽和 tracked/scheduled index，按 accepted sequence 返回其 CAS 取得所有权的未开始原始任务；running task 不返回，只请求取消和中断，调用本身不等待用户任务退出。立即关闭或 graceful 超时升级走独立的 `NONE → DISCARDING → DISCARDED` 路径：异步处置器取消未开始的 tracked/scheduled Future，并将 ordinary 标为 discarded，不产生返回列表；worker 真实退出前完成物理清理。`WorkerSupervisor` 始终是 lifecycle、mode、deadline、首因和 termination 的唯一权威。Spring、Group 与运维使用显式共享的有界 deadline，到期后单调升级 immediate，但仍等待线程真实退出。
 
 ## 配置模型
 
@@ -292,7 +292,7 @@ Micrometer classpath、`MeterRegistry` Bean 和 `disruptor.metrics.enabled=true`
 
 Gauge 在采集时读取原生状态，不进入发布或消费热路径。`runtime.running` 是生命周期状态，`backlog` 是基于 cursor 与最小 gating sequence 的近似值，两者都不是消费者健康检查。
 
-concurrent 指标同样只读取 `EventLoopSnapshot`/`EventLoopGroupSnapshot`，覆盖 gate、worker、任务结果、调度积压和队列事实。健康判断只看基础设施：存在首个 worker/module failure 为 `DOWN`，全部根对象 RUNNING 且接受任务为 `UP`，其余状态为 `OUT_OF_SERVICE`；业务任务失败计数不改变基础设施健康。
+concurrent 指标同样只读取 `EventLoopSnapshot`/`EventLoopGroupSnapshot`，覆盖 gate、worker、任务结果、调度积压和队列事实。任务统计分为两个正交维度：逻辑 outcome 为 `{completed, failed, cancelled}`，物理关闭 disposition 为 `{returned, discarded}`；同一任务可以同时计入 `cancelled` 和 `returned` 或 `discarded`。无界队列分别报告 `disruptor.eventloop.queue.segments.active`（活跃段）和 `disruptor.eventloop.queue.segments.allocated`（活跃段加池中段）；不再使用含义不明的单一 `segments` 指标。健康判断只看基础设施：存在首个 worker/module failure 为 `DOWN`，全部根对象 RUNNING 且接受任务为 `UP`，其余状态为 `OUT_OF_SERVICE`；业务任务失败计数不改变基础设施健康。
 
 ## 验证策略
 

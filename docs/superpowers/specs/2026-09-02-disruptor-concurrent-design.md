@@ -112,7 +112,7 @@ public interface EventLoop
 
 `parent()` 对独立 loop 返回 `null`，对 Group child 返回其唯一 owner。`DisruptorEventLoop` 是默认有界实现，`UnboundedEventLoop` 是显式无界实现。两者的公共行为只有容量拒绝不同。
 
-公开 builder 配置名称、线程工厂、入口批次上限、timer 批次上限、任务异常处理器、module，以及有界容量或无界 segment 大小。生产者固定按多生产者正确性实现，不向业务暴露可能被误用的 single-producer 开关。
+公开 builder 配置名称、线程工厂、入口批次上限、timer 批次上限、任务异常处理器、module，以及有界容量或无界 segment 大小。无界 builder 还公开 `maxPooledSegments`，默认值为 `8`；`0` 明确禁用段池化，负数非法。生产者固定按多生产者正确性实现，不向业务暴露可能被误用的 single-producer 开关。
 
 ### EventLoopGroup
 
@@ -123,20 +123,20 @@ public interface EventLoop
 - `select(int affinityKey)` 在本次 Group 生命周期内稳定选择；
 - Group 的 `execute/submit/schedule` 在提交时选择一个 child，单 child 有序，跨 child 无序；
 - `EventLoopFactory` 创建带 `parent` 和稳定 `childIndex` 的 child；
-- Group 在全部 child 启动成功前不开放准入；
+- Group 在全部 child 启动成功前不开放全局 `accepting`；
 - 任一 child 启动失败或基础设施失败，Group 锁存首因并 fail-stop 全部 children；
 - child 不允许独立 `start/shutdown/shutdownNow/requestShutdown`。这些生命周期操作由 owner Group 独占，直接调用抛出明确的所有权异常；任务提交、查询和 Future 不受影响；
 - Group 终止只在全部 child 的真实 termination 完成后提交。
 
-Group 的标准 `shutdown()` 向全部 child 广播同一个 unbounded graceful deadline；`shutdownNow()` 聚合每个 child 通过 registry CAS 取得的未开始任务，按 `childIndex asc -> child acceptedSequence asc` 返回。不同 child 没有可比较的全局 accepted sequence，因此不虚构跨 child 提交顺序。
+Group 只有一个 volatile `accepting`，不为提交创建任何 Group 所有权对象。child 提交先进入本地 `TaskAdmissionGate`，再读取 Group `accepting`；读到 false 时在提交的 `finally` 中回滚本地准入，不形成 accepted task。启动时 child 可以先后打开本地 gate，只有 Group 单点置 `accepting=true` 后才真正接收任务。Group 关闭固定为：置 `accepting=false` → 关闭全部 child gate → 等待全部 child active publisher drain → 向全部 child 广播同一个 shutdown 请求和 deadline。标准 `shutdown()` 广播同一个 unbounded graceful deadline；`shutdownNow()` 聚合每个 child 的 RETURNING 赢家取得的未开始任务，按 `childIndex asc -> child acceptedSequence asc` 返回。不同 child 没有可比较的全局 accepted sequence，因此不虚构跨 child 提交顺序。
 
-Group 自己维护聚合生命周期和唯一关闭会话，不把没有 worker 的 Group 塞进 `WorkerSupervisor`。其启动回滚、广播 token、首次 deadline、模式升级、首因和迟到 child 事实遵循 `DisruptorRuntime` 已验证的会话不变量，但不复用 Runtime 的私有类型。
+Group 自己维护聚合生命周期和唯一关闭会话，不把没有 worker 的 Group 塞进 `WorkerSupervisor`。其启动回滚、首次 deadline、模式升级、首因和迟到 child 事实遵循 `DisruptorRuntime` 已验证的会话不变量，但不复用 Runtime 的私有类型。
 
 ### 快照
 
-`EventLoopSnapshot` 至少包含：名称、`SupervisedLifecycle`、是否接收任务、容量模式、容量上限、outstanding、入口 pending、timer pending、executing、completed、failed、cancelled、shutdownNow returned、首因、关闭模式以及完整 `WorkerSnapshot`。
+`EventLoopSnapshot` 至少包含：名称、`SupervisedLifecycle`、是否接收任务、容量模式、容量上限、outstanding、入口 pending、timer pending、executing、completed、failed、cancelled、shutdownNow returned、discarded、allocated queue segments、active queue segments、首因、关闭模式以及完整 `WorkerSnapshot`。bounded 的两个 segment 字段恒为零；unbounded 始终满足 `0 < activeQueueSegments ≤ allocatedQueueSegments`。
 
-`EventLoopGroupSnapshot` 至少包含：名称、生命周期、是否接收任务、child 数量、聚合 outstanding/执行/终态计数、首因、关闭模式和按 child index 固定排序的 `EventLoopSnapshot`。
+`EventLoopGroupSnapshot` 至少包含：名称、生命周期、是否接收任务、child 数量、聚合 outstanding/执行/终态计数（含 discarded）、首因、关闭模式和按 child index 固定排序的 `EventLoopSnapshot`。
 
 `EventLoopScheduledFuture<V>` 扩展 `ScheduledFuture<V>` 并提供 `ScheduledTaskSnapshot snapshot()`。任务快照包含 accepted sequence、调度模式、当前 trigger、可选 expires、priority、已执行次数、最大次数、是否已开始、Future 终态、取消原因和最后一次失败。快照只报告事实，不根据队列长度猜测状态。
 
@@ -182,9 +182,9 @@ one-shot Future 成功时持有返回值；周期 Future 在失败、取消、ex
 
 ### 接受顺序与 schedule(0)
 
-每个成功提交获得唯一、单调 `acceptedSequence`。有界后端使用 RingBuffer claim sequence，无界后端使用其队列 reservation sequence；失败的尝试不算 accepted。
+每个成功提交获得唯一、单调 `acceptedSequence`。有界与无界后端都使用其队列的 claim sequence；失败的尝试不算 accepted。
 
-入口中存放内部 task envelope，登记定时任务本身也必须经过入口。worker 遇到一个已经到期的 schedule envelope 时，立即结束当前入口批次，先回到 timer 阶段执行它，因此：
+入口槽以 `ORDINARY`、`TRACKED`、`SCHEDULE` 和仅用于 post-claim 异常的 `TOMBSTONE` 区分任务类型；登记定时任务本身也必须经过入口。worker 遇到一个已经到期的 `SCHEDULE` 槽时，立即结束当前入口批次，先回到 timer 阶段执行它，因此：
 
 ```text
 schedule(task, 0) accepted at sequence N
@@ -199,12 +199,12 @@ worker 循环固定为：
 
 1. 处理 cancellation mailbox；
 2. 最多执行 `maxTimerBatchSize` 个到期 timer；
-3. 若入口非空，至少处理一个、最多处理 `maxCommandBatchSize` 个 envelope；遇到新登记且已到期的 timer 时提前结束本批；
+3. 若入口非空，至少处理一个、最多处理 `maxCommandBatchSize` 个入口槽；遇到新登记且已到期的 timer 时提前结束本批；
 4. 调用一次 module opportunistic update；
 5. 重新读取单调时钟并重复；
 6. 两侧都为空时，park 到下一 trigger；没有 timer 时无限 park。
 
-这样，持续普通流量至多延后 timer 一个 command 批次；持续到期 timer 至多延后入口一个 timer 批次。每次成功发布、取消、关闭和更早 timer 登记都 `unpark(worker)`。实现依赖 park permit 消除“检查为空后、park 前发布”的丢唤醒窗口，不做固定毫秒轮询。
+这样，持续普通流量至多延后 timer 一个 command 批次；持续到期 timer 至多延后入口一个 timer 批次。任务发布使用 admission-backed 条件唤醒：producer 严格执行 `publish → gate.leave → 读取 parked`，只有读到 `parked=true` 才 `unpark(worker)`；worker 在准备休眠时先置 `parked=true`，再对 gate 做 acquire 并重检 queue/mailbox/timer。producer 先完成时，worker 的 acquire 能看到 publication；worker 先声明休眠时，producer 会发出 unpark permit。取消与关闭直接 unpark。该握手消除“检查为空后、park 前发布”的丢唤醒窗口，也避免每次提交无条件系统调用；不做固定毫秒轮询。
 
 ## 取消、Future 与阻塞保护
 
@@ -220,7 +220,7 @@ worker 循环固定为：
 - 一个监听器异常不能阻止后续监听器。异常交给 `CancellationListenerExceptionHandler`，默认通过 SLF4J 记录；
 - 异步 executor 拒绝也进入同一异常处理器，不回滚已冻结的取消事实。
 
-`Future.cancel`、token cancel、expires、次数上限、shutdown 和 shutdownNow 最终汇合到同一个 Future 终态 CAS。物理任务状态与 Future 终态分开：运行中 Future 可以已经取消，但有界 outstanding permit 必须等用户调用真实返回后才能释放。
+`Future.cancel`、`CancellationToken` 取消、expires、次数上限、shutdown 和 shutdownNow 最终汇合到同一个 Future 终态 CAS。物理任务状态与 Future 终态分开：运行中 Future 可以已经取消，但有界 outstanding 只能在用户调用真实返回并物理清理后释放。
 
 `cancelAfter` 不依赖隐藏全局 EventLoop。`CancellationSource.cancelAfter(reason, delay, scheduler)` 要求调用方显式传入 scheduler，并返回可取消的登记句柄；源提前取消时自动撤销尚未触发的 timer。
 
@@ -244,46 +244,32 @@ worker 循环固定为：
 - core `WorkerSupervisor` 和单一 worker；
 - `TaskAdmissionGate`；
 - `AcceptedTaskRegistry`；
+- `TaskDispositionCoordinator`；
 - Future 状态、timer heap、cancellation mailbox；
 - module 生命周期；
 - graceful/immediate shutdown 与快照计数。
 
-`TaskQueue` 是唯一可替换边界，只负责多生产者 reservation/publish、单消费者 poll、唤醒所需的可见性、容量查询和消费后引用清理。queue 不持有 lifecycle、Future、timer、module 或 shutdown 策略。
+`TaskQueue` 是唯一可替换边界，只负责多生产者 claim/write/publish、连续已发布前缀的单消费者 poll、ordinary 槽物理状态、scanner 与消费后引用清理。queue 不持有 lifecycle、容量账本、Future、timer、module 或 shutdown 策略。
 
 ### TaskAdmissionGate
 
-准入顺序为：
+`TaskAdmissionGate` 同时拥有生命周期 gate 和逻辑容量账本；`TaskQueue` 只拥有物理存储与游标。bounded gate 将 lifecycle、outstanding 和 active publisher 打包在一个 `AtomicLong`：`[63:62]` 为 `NEW/OPEN/CLOSED`，`[61:31]` 为 outstanding，`[30:0]` 为 active publisher。`tryEnter()` 的单次 CAS 同时校验 `OPEN` 与 `outstanding < capacity`，然后增加 publisher 与 outstanding；满容量直接拒绝，不 claim，也不写 tombstone。unbounded 使用相同 lifecycle/publisher word，但 outstanding 采用独立 64 位计数器，因此没有隐藏的 31 位容量上限。`open()` 仅能 `NEW → OPEN`，`CLOSED` 不可逆；`awaitDrained()` 等待 active publisher 归零，不执行用户代码。
 
-1. 检查 owner Group gate 和本地 gate；
-2. 取得 active-admission token；
-3. 有界模式取得 outstanding permit；
-4. 从 TaskQueue reserve sequence；
-5. 以该 sequence 将 `AcceptedTask` 登记到 registry；
-6. publish 只包含内部引用的 envelope，并以发布成功作为 accepted 线性化点；
-7. 释放 active-admission token，表示该次内部准入流程已经返回；
-8. 任一步失败都发布必要 tombstone、撤销 registry、归还 permit，并明确拒绝。
+提交采用 claim/write/publish 三阶段和三层 `finally`：先 `tryEnter()`，再 claim 槽；ordinary 仅写入预分配槽的原始 `Runnable`，不创建 Future、记录或 registry 项；tracked/scheduled 才创建 `AcceptedTask` 并登记 tracked-only index。内层失败时，已 claim 的槽写 `TOMBSTONE`，已登记的记录无异常地终态化并移除；中层保证已 claim 的槽一定 publish，最外层保证 gate 一定 leave。`leave(rollbackOutstanding)` 以提交是否成功决定是否在同一账本中回滚 outstanding；因此 claim 失败也不会泄漏容量，正常过载不产生 tombstone。非 tombstone publish 是 accepted 的线性化点，active publisher 清零后关闭方才冻结 accepted 集。
 
-gate 关闭后不再产生新 token；关闭控制路径等现有 token 清零后才冻结 accepted 集。这一等待只覆盖固定的内部登记/发布步骤，不执行用户代码。
-
-有界 permit 的生命周期覆盖 task 从第 3 步到物理清理完成：入口队列、timer heap、正在执行都占用同一 permit。取消运行中任务不会提前释放 permit。因而最多只存在配置容量个 accepted-but-not-cleaned task，延迟一年触发的 timer 也占容量。
+Group child 的局部 gate enter 后才读取 parent `accepting`，读取 false 即走上述 rollback；独立 loop 视 parent 恒为 accepting。成功 enter 后不二次检查关闭状态，已进入的发布完成其 publish 并归入冻结集。outstanding 从 enter 覆盖到 worker 物理清理：入口、timer heap 和 executing 都占用；取消 running task 不提前释放，延迟 timer 也持续占用容量。
 
 ### AcceptedTaskRegistry
 
-registry 保存所有 accepted 且尚未物理清理的 task，以 accepted sequence 为身份。物理状态为 `WAITING/RUNNING/CANCELLED_WAITING/RETURNED/TERMINAL`：普通取消把 WAITING 变为 CANCELLED_WAITING；shutdownNow 只有从 WAITING 取得 RETURNED 所有权才向调用方返回；两者都要等 worker 从 queue/timer 物理移除后才进入 TERMINAL。周期任务在每次执行后只在同一记录内从 RUNNING 返回 WAITING，不重复申请容量。
+registry 只保存 tracked/scheduled 的 accepted task，按 accepted sequence 有序；ordinary 永不登记，物理状态保存在可复用 `Cell` 的 CAS 字段中。tracked/scheduled 的 `AcceptedTask` 采用独立物理状态机：`WAITING/RUNNING/CANCELLED_WAITING/RETURNED/DISCARDED/TERMINAL`。周期任务只有在仍为周期、Future 未终态、未 quiescing/immediate、未 expires、未达 max executions 且失败策略允许继续时才从 `RUNNING` 回到 `WAITING`，不重复占用容量。
 
-`shutdownNow()` 关闭 gate 并等待 active-admission token 清零后，对 registry 中每个记录执行 CAS：
-
-- `WAITING -> RETURNED` 成功：取消 Future并按 accepted sequence 加入返回列表；queue/timer 后续物理跳过该记录，转 TERMINAL 时才释放 permit；
-- 已是 `RUNNING`：不进入返回列表，执行 `cancel(true)` 并中断 worker；真实返回后才转 TERMINAL 和释放 permit；
-- 已是 `CANCELLED_WAITING/RETURNED/TERMINAL`：忽略。
-
-返回元素不能是内部 envelope。来自 `execute/submit(Runnable)/schedule(Runnable)` 的记录返回调用方传入的原始 `Runnable`；来源只有 `Callable` 时返回提交时创建并交给 JDK Future 语义的 `RunnableFuture`。同一 task 最多返回一次。
+`shutdownNow()` 由从属 `TaskDispositionCoordinator` 的 `NONE → RETURNING → RETURNED` 单赢家状态机控制。赢家同步关闭准入、请求 core immediate 以尽早中断 running task、等待 active publisher drain，然后只在调用线程扫描 ordinary 槽和 tracked index：`WAITING → RETURNED` 成功后 tracked/scheduled 先取消 Future，再按 accepted sequence 收集唯一的 `shutdownNowReturnValue`；ordinary 直接收集原始 `Runnable`。running task 不返回，tracked/scheduled 执行 `cancel(true)`，ordinary 请求 worker interrupt。调用立即返回而不等待 termination；失败调用者返回空列表。`RETURNING` 期间 worker 不得抢占未开始任务，否则返回集会失去唯一交付者。所有 `Runnable` 来源返回原始 Runnable，`Callable` 与 `ScheduledTaskSpec` 来源返回提交时创建的 `RunnableFuture` 或 `ScheduledFuture`；同一 task 最多返回一次。
 
 ### 两种 TaskQueue
 
-`BoundedTaskQueue` 使用 LMAX 多生产者 RingBuffer，容量为 2 的幂，并由 outstanding permit 保证 reserve 不会因 timer 已离开入口队列而错误放大总容量。单消费者取出后先清空槽位引用，再推进 gating sequence。
+`BoundedTaskQueue` 使用 LMAX 多生产者 `RingBuffer<Cell>`，容量为 2 的幂。多生产者可以先发布 `N+1` 而 `N` 尚未发布，消费者只能前进连续已发布前缀，遇洞即停。ordinary 在 `WAITING → RUNNING` 后推进 `consumerSequence`，执行、`TERMINAL`、清槽后才推进用于复用的 `gatingSequence`；tracked/scheduled 读取外部记录后可提前清槽并同时推进两个游标。容量不属于 queue，而由 gate 的 outstanding 保证 timer 离开入口后不会错误放大总容量。
 
-`UnboundedTaskQueue` 使用分段 MPSC reservation/publish 队列。segment 为固定 2 的幂；生产者按全局 sequence 定位 segment/offset，单消费者严格按连续 sequence 前进，跨过整段后清引用并回收前序 segment。它没有 outstanding permit，但仍使用同一个 admission gate 和 registry。快照必须报告 pending 与已分配 segment 数，并明确无界内存风险。
+`UnboundedTaskQueue` 使用分段 MPSC typed 槽队列，segment 为固定 2 的幂；生产者按全局 sequence 定位 segment/offset，单消费者同样只前进连续发布前缀。段可回收到空闲池：每槽以 release/acquire `publishedSequence` 区分复用代际，复用前清空 payload/state；scanner 在段生命周期锁下捕获并遍历，worker 仅在跨段 unlink/recycle 时取同一把锁，避免回收竞态。池最多保留 `maxPooledSegments` 个空闲段，默认 `8`，`0` 禁用池化，超限段交给 GC。快照报告 `allocatedQueueSegments`（活跃加池中）与 `activeQueueSegments`（活跃），并保持 active 不大于 allocated。无界仍通过同一个 gate 如实记录 64 位 outstanding，但不以容量拒绝任务。
 
 两种队列运行同一组参数化 queue contract 和 EventLoop contract。禁止在无界实现中复制 kernel，禁止为了 LMAX 名称让无界队列伪装成固定 RingBuffer。
 
@@ -296,12 +282,12 @@ registry 保存所有 accepted 且尚未物理清理的 task，以 accepted sequ
 3. 第一个 `start()` 将 supervisor 推进到 `STARTING`，调用 `Thread.start()`，并在 `finally` 中封口 worker 登记；
 4. supervised wrapper 完成 worker 入场；worker 等待 supervisor 的“全部已登记 worker 已入场”事实；
 5. worker 按声明顺序执行 module `onStart`；
-6. 全部 module 成功后调用 `markRunning()`；独立 loop 打开 gate，Group child 等 owner Group 打开父 gate；
-7. 完成公开 `start()` stage，然后进入执行循环。
+6. 全部 module 成功后调用 `markRunning()` 并打开本地 gate；Group child 此时仍因 owner `accepting=false` 拒绝提交；
+7. child 完成自身公开 `start()` stage 并进入执行循环；Group 等全部 child start stage 完成后，才单点置全局 `accepting=true` 并完成 Group start。
 
 线程创建失败发生在构造期，构造直接失败且没有半成品对象。`Thread.start()`、worker 入场或 module 启动失败均锁存基础设施首因，关闭 gate，停止已经成功启动的 module，进入 immediate fail-stop。并发 shutdown 可以在任一步获胜；启动方仍必须封口，启动 stage 与关闭 stage 各自只有一个结果。
 
-Group 并行请求全部 child start，待全部 child 报告 RUNNING 后一次性打开 Group gate并完成 Group start。任一失败时，先关闭 Group gate，再用一个共享有界 rollback deadline 同时请求全部 child immediate；Group 保留原启动失败为首因，child 停止失败按发生顺序 suppressed，且等待全部 child 真实终止。
+Group 并行请求全部 child start，待全部 child 报告 RUNNING 后一次性置全局 `accepting=true` 并完成 Group start。任一失败时，先置 `accepting=false`，再关闭并排空全部 child gate，最后用一个共享有界 rollback deadline 同时请求全部 child immediate；Group 保留原启动失败为首因，child 停止失败按发生顺序 suppressed，且等待全部 child 真实终止。
 
 ## module 定位
 
@@ -338,15 +324,11 @@ public interface EventLoopModule {
 
 ### shutdownNow
 
-`shutdownNow()` 关闭 gate、等待内部 admission token 归还、按 accepted registry CAS 收集未开始任务，随后以 immediate 模式停止：
+所有公开关闭入口先同步、幂等关闭 gate，再请求 `WorkerSupervisor`；concurrent 不另造 lifecycle、mode、deadline、首因或 termination 的权威状态。`TaskDispositionCoordinator` 只管理未开始任务的物理处置和计数，存在三种互斥语义：graceful 保持 `NONE`，`shutdownNow()` 走 `NONE → RETURNING → RETURNED`，immediate 走 `NONE → DISCARDING → DISCARDED`。
 
-- 返回所有在其线性化点尚未开始且被本次调用成功取得所有权的原始 Runnable，按 accepted sequence 排序；
-- 未开始 Future 进入取消终态；
-- 正在执行任务不返回，收到 `cancel(true)` 和 worker interrupt；
-- Java 不能强制停止忽略中断的用户代码，因此 `shutdownNow()` 只发起 best-effort 停止，`isTerminated/termination` 仍等待线程真实退出；
-- 调用本身不等待用户任务退出。
+`shutdownNow()` 的 RETURNING 赢家立即请求 core immediate 以中断 running task，随后在调用线程等待 active publisher drain、冻结 claimed cursor，扫描 ordinary 槽和 tracked/scheduled index。只有 CAS 取得 `WAITING → RETURNED` 的任务才进入按 accepted sequence 排序的返回列表；tracked/scheduled 在入表前先取消 Future，ordinary 返回原始 Runnable。running task 不返回，只请求 `cancel(true)` 或 worker interrupt。RETURNING 的失败调用者返回空列表，赢家完成扫描即返回，不等待 termination；Java 不能强制停止忽略中断的用户代码，`isTerminated/termination` 仍等待 worker 真实退出。
 
-这比参考 `DisruptorEventLoop.shutdownNow()` 固定返回空列表更符合 JDK 21 契约。registry CAS 使调用线程无需并发消费 MPSC 队列，也不会破坏单消费者所有权。
+`requestShutdown(IMMEDIATE, deadline)` 与 graceful deadline 升级会原子设置 kernel stop mode、登记 DISCARDING 并 unpark，然后由一次性异步处置执行者等待 active publisher drain，取消全部未开始 tracked/scheduled Future 并置 `DISCARDED`，将 ordinary 槽 CAS 为 `DISCARDED`，最终置全局 `DISCARDED`。DISCARDING 不返回任务；即使 worker 卡在忽略中断的用户任务，未开始 Future 仍会及时取消。worker 在处置终态前不批量清未开始任务，之后完成槽、timer、index 与 outstanding 的物理收敛；处置执行者异常上报 `WorkerSupervisor` 首因，worker 接管 best-effort 收敛，不能永久停在处理中。
 
 ### 显式有界关闭
 
@@ -384,10 +366,10 @@ autoconfigure POM 将 `disruptor-concurrent`、`spring-boot-health` 和 `microme
 
 - `disruptor.eventloop.accepting`；
 - `disruptor.eventloop.worker.registered/started/alive`；
-- `disruptor.eventloop.tasks.outstanding/pending/executing/completed/failed/cancelled/returned`；
+- `disruptor.eventloop.tasks.outstanding/pending/executing/completed/failed/cancelled/returned/discarded`；
 - `disruptor.eventloop.scheduled.pending`；
 - `disruptor.eventloop.queue.remaining`，仅 bounded；
-- `disruptor.eventloop.queue.segments`，仅 unbounded。
+- `disruptor.eventloop.queue.segments.active` 与 `disruptor.eventloop.queue.segments.allocated`，仅 unbounded。
 
 所有指标在采集时读取 snapshot，不进入提交或执行热路径。
 
@@ -397,17 +379,19 @@ autoconfigure POM 将 `disruptor-concurrent`、`spring-boot-health` 和 `microme
 
 - core 通用 lifecycle 重命名后现有 pipeline/runtime 全部不变量不退化；
 - bounded/unbounded 同一 queue contract、同一 EventLoop contract 和同一 kernel 类型；
-- 多生产者 accepted sequence、无丢失、无重复、槽位/segment 引用清理；
+- 多生产者 accepted sequence、无丢失、无重复、连续发布前缀、槽位/segment 引用清理；
 - 有界 outstanding 同时覆盖入口、timer 和 executing；
+- ordinary 稳态提交不创建 per-task 框架对象且不进入 registry；tracked/scheduled 才进入 index；post-claim 异常必 publish tombstone 与 leave，正常过载不 claim、不 tombstone；
 - `execute` 与 `schedule(0)` 顺序、同 trigger priority、两侧批次公平；
 - 四种 schedule、expires、max executions、continue failure 与快照；
 - cancellation 早/晚注册、解注册、同步/异步线程、监听异常、重复取消和 Future 唯一终态；
 - 同 loop Future/get、await、invoke/close 阻塞保护；
 - 精确 startup、并发 shutdown、module 部分启动回滚、suppressed stop failure；
 - `shutdown()` 保留未来 one-shot delayed、取消 periodic 且使用 unbounded deadline；
-- `shutdownNow()` registry CAS 返回原始未开始 Runnable，不返回 running task；
-- bounded deadline 升级 immediate 但不伪造 termination；
-- Group gate、固定 affinity、child 生命周期所有权、child fail-stop、共享 deadline 和真实聚合终止；
+- `shutdownNow()` RETURNING 单赢家从 ordinary 槽和 tracked index 返回原始未开始 Runnable，不返回 running task；DISCARDING 取消未开始 Future 且不返回任务；
+- bounded deadline 升级 immediate 但不伪造 termination，worker 卡死时异步处置仍取消未开始 Future；
+- Group 全局 accepting、child 先本地 enter 后校验 owner、固定 affinity、child 生命周期所有权、child fail-stop、关闭 drain 顺序、共享 deadline 和真实聚合终止；
+- 无界发布代际、段生命周期锁、段池上限（默认 8、0 禁用）及 active/allocated snapshot 不变量；
 - Boot 4.1 lifecycle、health、metrics 三组条件装配及 callback 时序；
 - Commons 能力矩阵中的每个“覆盖/替代/增强/不复制”都有源码、测试、示例或明确文档证据；
 - JMH 对比原生 LMAX、core managed publish、bounded/unbounded EventLoop、JDK 单线程 executor，并在可独立构建参考仓时增加 Commons profile；不设置机器敏感硬阈值。
@@ -419,10 +403,10 @@ autoconfigure POM 将 `disruptor-concurrent`、`spring-boot-health` 和 `microme
 1. core 通用监督命名与无界 deadline；
 2. concurrent 模块和完整公共契约；
 3. 任务基元、取消、显式上下文和 module；
-4. admission gate、accepted registry 与两种 TaskQueue 契约；
+4. packed admission gate、tracked-only accepted index、task disposition 与两种 TaskQueue 契约；
 5. bounded 完整 executor、scheduler 和 JDK shutdown；
-6. unbounded 门面复用全部 kernel 契约；
-7. Group 所有权、选择、fail-stop 与聚合终止；
+6. unbounded typed segment、发布代际、生命周期锁与池化复用全部 kernel 契约；
+7. Group 全局 `accepting`、child gate drain、所有权、选择、fail-stop 与聚合终止；
 8. Boot 4.1 生命周期、健康和指标；
 9. 使用示例与 Commons 事实矩阵；
 10. JMH、全仓回归与逐条完成审计。
