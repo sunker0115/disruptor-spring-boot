@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -76,6 +77,32 @@ class TaskAdmissionGateTest {
     }
 
     @Test
+    void awaitDrainedParksPreInterruptedWaiterAndRestoresInterruptStatus() throws Exception {
+        TaskAdmissionGate gate = TaskAdmissionGate.unbounded();
+        gate.open();
+        assertTrue(gate.tryEnter());
+        AtomicBoolean interruptedAfterWait = new AtomicBoolean();
+        CountDownLatch entered = new CountDownLatch(1);
+        Thread waiter = Thread.ofPlatform().start(() -> {
+            Thread.currentThread().interrupt();
+            entered.countDown();
+            gate.awaitDrained();
+            interruptedAfterWait.set(Thread.currentThread().isInterrupted());
+        });
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS));
+            awaitState(waiter, Thread.State.WAITING);
+            assertFalse(waiter.isInterrupted(), "等待期间必须暂存而不是保留中断标记空转");
+        } finally {
+            gate.leave(true);
+            waiter.join(1_000);
+        }
+
+        assertFalse(waiter.isAlive());
+        assertTrue(interruptedAfterWait.get());
+    }
+
+    @Test
     void unboundedTracksOutstandingWithoutACapacityLimit() {
         TaskAdmissionGate gate = TaskAdmissionGate.unbounded();
         gate.open();
@@ -110,5 +137,16 @@ class TaskAdmissionGateTest {
         assertFalse(gate.tryEnter());
         assertEquals(Long.MAX_VALUE, gate.outstanding());
         assertEquals(0, gate.activePublishers());
+    }
+
+    private static void awaitState(Thread thread, Thread.State expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (thread.getState() != expected) {
+            if (System.nanoTime() - deadline >= 0) {
+                throw new AssertionError("线程未进入 " + expected + "，实际=" + thread.getState());
+            }
+            Thread.sleep(1);
+        }
     }
 }

@@ -172,20 +172,28 @@ final class TaskAdmissionGate {
     }
 
     void awaitDrained() {
-        for (int spin = 0; spin < SPIN_LIMIT; spin++) {
-            if (activePublishers() == 0) {
-                return;
-            }
-            Thread.onSpinWait();
-        }
-        Thread current = Thread.currentThread();
-        drainWaiters.add(current);
+        boolean interrupted = Thread.interrupted();
         try {
-            while (activePublishers() != 0) {
-                LockSupport.park(this);
+            for (int spin = 0; spin < SPIN_LIMIT; spin++) {
+                if (activePublishers() == 0) {
+                    return;
+                }
+                Thread.onSpinWait();
+            }
+            Thread current = Thread.currentThread();
+            drainWaiters.add(current);
+            try {
+                while (activePublishers() != 0) {
+                    interrupted |= Thread.interrupted();
+                    LockSupport.park(this);
+                }
+            } finally {
+                drainWaiters.remove(current);
             }
         } finally {
-            drainWaiters.remove(current);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

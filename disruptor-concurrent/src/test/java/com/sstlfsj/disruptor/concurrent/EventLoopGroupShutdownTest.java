@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -232,6 +233,43 @@ class EventLoopGroupShutdownTest {
     }
 
     @Test
+    void groupClosesEveryChildAndDrainsPublishersBeforeBroadcastingShutdown()
+            throws Exception {
+        DisruptorEventLoopGroup group = EventLoopGroupBuilder
+                .bounded("group-two-phase-close", 2, 8)
+                .build();
+        group.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        List<EventLoop> children = children(group);
+        Object activeGate = admissionGate(children.get(0));
+        assertTrue(invokeGateBoolean(activeGate, "tryEnter"));
+
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> shutdown = caller.submit(group::shutdown);
+            try {
+                awaitCondition(() -> !group.snapshot().acceptingTasks());
+                awaitChildGatesClosed(children);
+
+                assertFalse(shutdown.isDone(), "Group 必须等待已进入 child gate 的 publisher");
+                for (EventLoop child : children) {
+                    assertFalse(invokeGateBoolean(admissionGate(child), "isAccepting"));
+                    assertNull(supervisorDeadline(child),
+                            "全部 child drain 前不能广播 supervisor shutdown");
+                }
+            } finally {
+                if (invokeGateLong(activeGate, "activePublishers") != 0) {
+                    invokeGateLeave(activeGate, true);
+                }
+            }
+            shutdown.get(2, TimeUnit.SECONDS);
+        } finally {
+            caller.shutdownNow();
+            assertTrue(caller.awaitTermination(2, TimeUnit.SECONDS));
+        }
+        group.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+    }
+
+    @Test
     void childInfrastructureFailureFailStopsGroupWithoutRemappingAffinity() throws Exception {
         IllegalStateException original = new IllegalStateException("module update failed");
         DisruptorEventLoopGroup group = EventLoopGroupBuilder.builder(
@@ -331,6 +369,51 @@ class EventLoopGroupShutdownTest {
         return (ShutdownDeadline) deadline.get(supervisor);
     }
 
+    private static Object admissionGate(EventLoop child) throws Exception {
+        Object kernel = fieldValue(child, EventLoopKernel.class);
+        Field gate = EventLoopKernel.class.getDeclaredField("gate");
+        gate.setAccessible(true);
+        return gate.get(kernel);
+    }
+
+    private static boolean invokeGateBoolean(Object gate, String method) throws Exception {
+        var operation = gate.getClass().getDeclaredMethod(method);
+        operation.setAccessible(true);
+        return (boolean) operation.invoke(gate);
+    }
+
+    private static long invokeGateLong(Object gate, String method) throws Exception {
+        var operation = gate.getClass().getDeclaredMethod(method);
+        operation.setAccessible(true);
+        return (long) operation.invoke(gate);
+    }
+
+    private static void invokeGateLeave(Object gate, boolean rollback) throws Exception {
+        var operation = gate.getClass().getDeclaredMethod("leave", boolean.class);
+        operation.setAccessible(true);
+        operation.invoke(gate, rollback);
+    }
+
+    private static void awaitChildGatesClosed(List<EventLoop> children) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (true) {
+            boolean allClosed = true;
+            for (EventLoop child : children) {
+                if (invokeGateBoolean(admissionGate(child), "isAccepting")) {
+                    allClosed = false;
+                    break;
+                }
+            }
+            if (allClosed) {
+                return;
+            }
+            if (System.nanoTime() - deadline >= 0) {
+                throw new AssertionError("等待 child gate 关闭超时");
+            }
+            Thread.sleep(1);
+        }
+    }
+
     private static Object fieldValue(Object owner, Class<?> fieldType) throws Exception {
         Class<?> type = owner.getClass();
         while (type != null) {
@@ -349,6 +432,17 @@ class EventLoopGroupShutdownTest {
         List<EventLoop> children = new ArrayList<>();
         group.forEach(children::add);
         return List.copyOf(children);
+    }
+
+    private static void awaitCondition(java.util.function.BooleanSupplier condition)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() - deadline >= 0) {
+                throw new AssertionError("等待条件超时");
+            }
+            Thread.sleep(1);
+        }
     }
 
     private static void awaitIgnoringInterrupt(CountDownLatch latch) {

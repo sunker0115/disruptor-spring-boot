@@ -423,6 +423,14 @@ public final class EventLoopKernel {
         LockSupport.unpark(worker);
     }
 
+    public void closeAdmissions() {
+        gate.closeForAdmissions();
+    }
+
+    public void awaitAdmissionsDrained() {
+        gate.awaitDrained();
+    }
+
     public boolean isShutdown() {
         SupervisedLifecycle lifecycle = supervisor.snapshot().lifecycle();
         return lifecycle == SupervisedLifecycle.QUIESCING
@@ -816,44 +824,37 @@ public final class EventLoopKernel {
     }
 
     private boolean admitOrdinary(Runnable command) {
-        GroupLifecycleCoordinator.AdmissionLease ownerLease = acquireOwnerAdmission();
-        if (groupOwner != null && ownerLease == null) {
+        if (!gate.tryEnter()) {
             return false;
         }
+        boolean rollbackOutstanding = true;
+        long sequence = -1;
         try {
-            if (!gate.tryEnter()) {
-                return false;
-            }
-            boolean rollbackOutstanding = true;
-            long sequence = -1;
             try {
                 try {
-                    try {
-                        sequence = queue.tryClaim();
-                        if (sequence < 0) {
-                            return false;
-                        }
-                        queue.writeOrdinary(sequence, command);
-                        rollbackOutstanding = false;
-                    } finally {
-                        if (sequence >= 0 && rollbackOutstanding) {
-                            queue.writeTombstone(sequence);
-                        }
+                    if (!ownerAccepting()) {
+                        return false;
                     }
+                    sequence = queue.tryClaim();
+                    if (sequence < 0) {
+                        return false;
+                    }
+                    queue.writeOrdinary(sequence, command);
+                    rollbackOutstanding = false;
                 } finally {
-                    if (sequence >= 0) {
-                        queue.publish(sequence);
+                    if (sequence >= 0 && rollbackOutstanding) {
+                        queue.writeTombstone(sequence);
                     }
                 }
             } finally {
-                wakeup.finishAdmission(sequence, rollbackOutstanding);
+                if (sequence >= 0) {
+                    queue.publish(sequence);
+                }
             }
-            return true;
         } finally {
-            if (ownerLease != null) {
-                ownerLease.close();
-            }
+            wakeup.finishAdmission(sequence, rollbackOutstanding);
         }
+        return true;
     }
 
     private <T> EventLoopFutureTask<T> admitTracked(
@@ -863,69 +864,61 @@ public final class EventLoopKernel {
             throw new IllegalArgumentException("tracked 准入类型非法：" + type);
         }
         Objects.requireNonNull(factory, "factory 不能为空");
-        GroupLifecycleCoordinator.AdmissionLease ownerLease = acquireOwnerAdmission();
-        if (groupOwner != null && ownerLease == null) {
+        if (!gate.tryEnter()) {
             return null;
         }
+        boolean rollbackOutstanding = true;
+        long sequence = -1;
+        AcceptedTask<T> task = null;
+        boolean registered = false;
         try {
-            if (!gate.tryEnter()) {
-                return null;
-            }
-            boolean rollbackOutstanding = true;
-            long sequence = -1;
-            AcceptedTask<T> task = null;
-            boolean registered = false;
             try {
                 try {
-                    try {
-                        sequence = queue.tryClaim();
-                        if (sequence < 0) {
-                            return null;
-                        }
-                        task = factory.create(sequence, clock.nanoTime());
-                        registry.register(task);
-                        registered = true;
-                        if (type == TaskType.TRACKED) {
-                            queue.writeTracked(sequence, task);
-                        } else {
-                            queue.writeSchedule(sequence, task);
-                        }
-                        rollbackOutstanding = false;
-                    } finally {
-                        if (sequence >= 0 && rollbackOutstanding) {
-                            if (registered) {
-                                registry.terminalizeAndRemove(task);
-                            }
-                            queue.writeTombstone(sequence);
-                        }
+                    if (!ownerAccepting()) {
+                        return null;
                     }
+                    sequence = queue.tryClaim();
+                    if (sequence < 0) {
+                        return null;
+                    }
+                    task = factory.create(sequence, clock.nanoTime());
+                    registry.register(task);
+                    registered = true;
+                    if (type == TaskType.TRACKED) {
+                        queue.writeTracked(sequence, task);
+                    } else {
+                        queue.writeSchedule(sequence, task);
+                    }
+                    rollbackOutstanding = false;
                 } finally {
-                    if (sequence >= 0) {
-                        queue.publish(sequence);
+                    if (sequence >= 0 && rollbackOutstanding) {
+                        if (registered) {
+                            registry.terminalizeAndRemove(task);
+                        }
+                        queue.writeTombstone(sequence);
                     }
                 }
             } finally {
-                wakeup.finishAdmission(sequence, rollbackOutstanding);
+                if (sequence >= 0) {
+                    queue.publish(sequence);
+                }
             }
-            return task.future();
         } finally {
-            if (ownerLease != null) {
-                ownerLease.close();
-            }
+            wakeup.finishAdmission(sequence, rollbackOutstanding);
         }
+        return task.future();
     }
 
-    private GroupLifecycleCoordinator.AdmissionLease acquireOwnerAdmission() {
+    private boolean ownerAccepting() {
         GroupLifecycleCoordinator current = groupOwner;
-        return current == null ? null : current.tryAcquireAdmission();
+        return current == null || current.isAccepting();
     }
 
     private boolean acceptingTasks() {
         if (!gate.isAccepting()) {
             return false;
         }
-        GroupLifecycleCoordinator current = groupOwner;
-        return current == null || current.snapshot().accepting();
+        return ownerAccepting();
     }
 
     private void reportOwnerFailure(Throwable failure) {

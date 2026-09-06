@@ -17,7 +17,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
-/** 固定 Group 的唯一启动、owner gate、关闭会话和真实终止协调器。 */
+/** 固定 Group 的唯一启动、全局准入、关闭会话和真实终止协调器。 */
 public final class GroupLifecycleCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(GroupLifecycleCoordinator.class);
@@ -25,7 +25,6 @@ public final class GroupLifecycleCoordinator {
 
     private final String name;
     private final Duration shutdownTimeout;
-    private final OwnerAdmissionGate admissionGate = new OwnerAdmissionGate();
     private final Object stateLock = new Object();
     private final Object broadcastLock = new Object();
     private final CompletableFuture<Void> startup = new CompletableFuture<>();
@@ -43,6 +42,7 @@ public final class GroupLifecycleCoordinator {
     private ShutdownMode shutdownMode;
     private ShutdownDeadline shutdownDeadline;
     private ShutdownMode broadcastedMode;
+    private volatile boolean accepting;
 
     public GroupLifecycleCoordinator(String name, Duration shutdownTimeout) {
         this.name = requireName(name);
@@ -67,8 +67,8 @@ public final class GroupLifecycleCoordinator {
                         onChildTermination(child, stageFailure)));
     }
 
-    public AdmissionLease tryAcquireAdmission() {
-        return admissionGate.tryAcquire();
+    public boolean isAccepting() {
+        return accepting;
     }
 
     public void childFailed(EventLoop child, Throwable cause) {
@@ -114,7 +114,7 @@ public final class GroupLifecycleCoordinator {
         if (request == null) {
             return;
         }
-        awaitAdmissionsUninterruptibly();
+        sealChildAdmissions();
         broadcast(request.mode(), request.deadline());
         startTerminationCoordinator();
     }
@@ -125,7 +125,7 @@ public final class GroupLifecycleCoordinator {
         if (request == null) {
             return List.of();
         }
-        awaitAdmissionsUninterruptibly();
+        sealChildAdmissions();
         List<Runnable> returned = new ArrayList<>();
         List<Throwable> failures = new ArrayList<>();
         synchronized (broadcastLock) {
@@ -149,7 +149,7 @@ public final class GroupLifecycleCoordinator {
         synchronized (stateLock) {
             return new StateSnapshot(
                     lifecycle,
-                    admissionGate.accepting(),
+                    accepting,
                     failure,
                     shutdownMode,
                     shutdownDeadline);
@@ -189,7 +189,7 @@ public final class GroupLifecycleCoordinator {
         synchronized (stateLock) {
             if (lifecycle == SupervisedLifecycle.STARTING) {
                 lifecycle = SupervisedLifecycle.RUNNING;
-                admissionGate.open();
+                accepting = true;
                 started = true;
             } else if (startupFailure == null) {
                 startupFailure = new GroupStartupAbortedException(name);
@@ -205,7 +205,7 @@ public final class GroupLifecycleCoordinator {
     private void failStartup(Throwable cause) {
         ShutdownRequest request;
         synchronized (stateLock) {
-            admissionGate.close();
+            accepting = false;
             if (startupFailure == null) {
                 startupFailure = cause;
             }
@@ -219,7 +219,7 @@ public final class GroupLifecycleCoordinator {
             lifecycle = SupervisedLifecycle.STOPPING;
             request = new ShutdownRequest(shutdownMode, shutdownDeadline);
         }
-        awaitAdmissionsUninterruptibly();
+        sealChildAdmissions();
         broadcast(request.mode(), request.deadline());
         startTerminationCoordinator();
     }
@@ -231,7 +231,7 @@ public final class GroupLifecycleCoordinator {
                 return null;
             }
             SupervisedLifecycle previous = lifecycle;
-            admissionGate.close();
+            accepting = false;
             if (shutdownDeadline == null) {
                 shutdownDeadline = deadline;
             }
@@ -347,7 +347,7 @@ public final class GroupLifecycleCoordinator {
             if (!startupFailureDetected && !runningFailureDetected) {
                 return;
             }
-            admissionGate.close();
+            accepting = false;
             if (startupFailureDetected && startupFailure == null) {
                 startupFailure = cause;
             }
@@ -361,7 +361,7 @@ public final class GroupLifecycleCoordinator {
             lifecycle = SupervisedLifecycle.STOPPING;
             request = new ShutdownRequest(shutdownMode, shutdownDeadline);
         }
-        awaitAdmissionsUninterruptibly();
+        sealChildAdmissions();
         broadcast(request.mode(), request.deadline());
         startTerminationCoordinator();
     }
@@ -388,19 +388,9 @@ public final class GroupLifecycleCoordinator {
         }
     }
 
-    private void awaitAdmissionsUninterruptibly() {
-        boolean interrupted = false;
-        while (true) {
-            try {
-                admissionGate.awaitClosedAdmissions();
-                break;
-            } catch (InterruptedException ignored) {
-                interrupted = true;
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
+    private void sealChildAdmissions() {
+        children.forEach(child -> child.admissions().close());
+        children.forEach(child -> child.admissions().awaitDrained());
     }
 
     private void publishStartupSuccess() {
@@ -475,11 +465,13 @@ public final class GroupLifecycleCoordinator {
     public record ChildControl(
             EventLoop loop,
             ChildStarter starter,
+            ChildAdmissions admissions,
             ChildShutdownRequester shutdownRequester,
             ChildShutdownNow shutdownNow) {
         public ChildControl {
             Objects.requireNonNull(loop, "loop 不能为空");
             Objects.requireNonNull(starter, "starter 不能为空");
+            Objects.requireNonNull(admissions, "admissions 不能为空");
             Objects.requireNonNull(shutdownRequester, "shutdownRequester 不能为空");
             Objects.requireNonNull(shutdownNow, "shutdownNow 不能为空");
         }
@@ -488,6 +480,12 @@ public final class GroupLifecycleCoordinator {
     @FunctionalInterface
     public interface ChildStarter {
         CompletionStage<Void> start();
+    }
+
+    public interface ChildAdmissions {
+        void close();
+
+        void awaitDrained();
     }
 
     @FunctionalInterface
@@ -500,71 +498,7 @@ public final class GroupLifecycleCoordinator {
         List<Runnable> shutdownNow(ShutdownDeadline deadline);
     }
 
-    public interface AdmissionLease extends AutoCloseable {
-        @Override
-        void close();
-    }
-
     private record ShutdownRequest(ShutdownMode mode, ShutdownDeadline deadline) {
-    }
-
-    private static final class OwnerAdmissionGate {
-        private boolean open;
-        private long activeAdmissions;
-
-        private synchronized void open() {
-            if (open) {
-                throw new IllegalStateException("Group admission gate 已打开");
-            }
-            open = true;
-        }
-
-        private synchronized void close() {
-            open = false;
-            notifyAll();
-        }
-
-        private synchronized AdmissionLease tryAcquire() {
-            if (!open) {
-                return null;
-            }
-            activeAdmissions++;
-            return new Lease(this);
-        }
-
-        private synchronized boolean accepting() {
-            return open;
-        }
-
-        private synchronized void awaitClosedAdmissions() throws InterruptedException {
-            while (activeAdmissions != 0) {
-                wait();
-            }
-        }
-
-        private synchronized void release() {
-            if (activeAdmissions <= 0) {
-                throw new IllegalStateException("没有 Group admission lease 可归还");
-            }
-            activeAdmissions--;
-            notifyAll();
-        }
-    }
-
-    private static final class Lease implements AdmissionLease {
-        private final OwnerAdmissionGate gate;
-        private final AtomicBoolean released = new AtomicBoolean();
-
-        private Lease(OwnerAdmissionGate gate) {
-            this.gate = gate;
-        }
-
-        @Override
-        public void close() {
-            if (released.compareAndSet(false, true)) {
-                gate.release();
-            }
-        }
     }
 
     public static final class GroupShutdownTimeoutException extends IllegalStateException {

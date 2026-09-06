@@ -223,6 +223,16 @@ abstract class AbstractEventLoop extends AbstractExecutorService implements Even
         kernel().requestShutdown(mode, deadline);
     }
 
+    final void closeAdmissionsFromOwner(Object lifecycleOwnerToken) {
+        requireOwner(lifecycleOwnerToken);
+        kernel().closeAdmissions();
+    }
+
+    final void awaitAdmissionsDrainedFromOwner(Object lifecycleOwnerToken) {
+        requireOwner(lifecycleOwnerToken);
+        kernel().awaitAdmissionsDrained();
+    }
+
     final List<Runnable> shutdownNowFromOwner(
             Object lifecycleOwnerToken,
             ShutdownDeadline deadline) {

@@ -70,6 +70,17 @@ public final class DisruptorEventLoopGroup
             controls.add(new GroupLifecycleCoordinator.ChildControl(
                     child,
                     () -> child.startFromOwner(lifecycleOwnerToken),
+                    new GroupLifecycleCoordinator.ChildAdmissions() {
+                        @Override
+                        public void close() {
+                            child.closeAdmissionsFromOwner(lifecycleOwnerToken);
+                        }
+
+                        @Override
+                        public void awaitDrained() {
+                            child.awaitAdmissionsDrainedFromOwner(lifecycleOwnerToken);
+                        }
+                    },
                     (mode, deadline) -> child.requestShutdownFromOwner(
                             lifecycleOwnerToken, mode, deadline),
                     deadline -> child.shutdownNowFromOwner(
