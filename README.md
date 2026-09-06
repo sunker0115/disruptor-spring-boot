@@ -151,6 +151,19 @@ loop.start().toCompletableFuture().join();
 Future<Order> future = loop.submit(() -> loadOrder(orderId));
 ```
 
+### 选择与导航
+
+| 需求 | 选择 | 语义 |
+| --- | --- | --- |
+| 入口必须快速拒绝，不能以积压掩盖背压 | `EventLoopBuilder.bounded` | 容量覆盖已接收任务；满载时 `tryExecute` 返回 `false`，`execute`/`submit` 拒绝 |
+| 允许显式积压的后台任务 | `EventLoopBuilder.unbounded` | 不适合 HTTP 背压边界 |
+| 所有任务必须由一个线程拥有 | 单个 `EventLoop` | `execute` 仅投递，`submit` 通过 `Future` 取得结果，`schedule` 用于延迟或周期任务 |
+| 按 key 分片但每个 key 保持单线程 | `EventLoopGroup` | 用 `select(affinityKey)` 固定选择 child |
+| 停止时保留已接收任务 | `shutdown()` / `GRACEFUL` | 关闭准入后排空一次性任务 |
+| 需要立刻取消未开始任务 | `shutdownNow()` / `IMMEDIATE` | 返回获得所有权的未开始原始任务 |
+
+EventLoop 的任务所有权是“谁执行普通任务”；Disruptor 管道的事件流水线是“事件经过哪些 handler”。两者可串联但不互相替代：可参考 [concurrent Spring 示例](disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/concurrent/ConcurrentExampleConfiguration.java)、[纯 Java 示例](disruptor-spring-boot-example/src/main/java/com/sstlfsj/disruptor/example/nospring/PureJavaConcurrentExample.java)，以及本次的 [撮合 tutorial 配置](disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/config/MatchConfig.java) 和 [HTTP 入口](disruptor-spring-boot-tutorial/src/main/java/com/sstlfsj/disruptor/tutorial/ingress/MatchingOrderIngress.java)。
+
 高级调度通过不可变 `ScheduledTaskSpec` 表达上下文、动态延迟、执行次数、失败策略、优先级与取消令牌：
 
 ```java

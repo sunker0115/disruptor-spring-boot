@@ -2,8 +2,11 @@ package com.sstlfsj.disruptor.tutorial.ingress;
 
 import com.lmax.disruptor.dsl.ProducerType;
 import com.sstlfsj.disruptor.autoconfigure.DisruptorLifecycle;
+import com.sstlfsj.disruptor.concurrent.DisruptorEventLoop;
+import com.sstlfsj.disruptor.concurrent.EventLoopBuilder;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.core.PipelineSpec;
+import com.sstlfsj.disruptor.tutorial.config.MatchConfig;
 import com.sstlfsj.disruptor.tutorial.dto.PlaceOrderRequest;
 import com.sstlfsj.disruptor.tutorial.match.Side;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
@@ -27,6 +30,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MatchingOrderIngressTest {
 
     @Test
+    void matchConfigurationDeclaresAnEventLoopRoot() {
+        assertThat(MatchConfig.class.getDeclaredMethods())
+                .anyMatch(method -> method.getReturnType().getName()
+                        .equals("com.sstlfsj.disruptor.concurrent.EventLoop"));
+    }
+
+    @Test
     void serializesConcurrentCallersAndStopsBeforeRuntime() throws Exception {
         int orderCount = 16;
         CountDownLatch consumed = new CountDownLatch(orderCount);
@@ -42,10 +52,14 @@ class MatchingOrderIngressTest {
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder().add(spec).build();
         DisruptorLifecycle runtimeLifecycle = new DisruptorLifecycle(runtime, -100);
-        MatchingOrderIngress ingress = new MatchingOrderIngress(runtime, runtimeLifecycle);
+        DisruptorEventLoop publisher = EventLoopBuilder
+                .bounded("matching-order-ingress", 64)
+                .build();
+        MatchingOrderIngress ingress = new MatchingOrderIngress(runtime, runtimeLifecycle, publisher);
         PlaceOrderRequest request = new PlaceOrderRequest(
                 "TEST", Side.BUY, new BigDecimal("100"), BigDecimal.ONE);
 
+        publisher.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
         runtimeLifecycle.start();
         ingress.start();
         assertThat(ingress.getPhase()).isEqualTo(-99);

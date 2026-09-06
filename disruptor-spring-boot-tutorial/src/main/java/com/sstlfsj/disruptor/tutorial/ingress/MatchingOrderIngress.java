@@ -3,27 +3,24 @@ package com.sstlfsj.disruptor.tutorial.ingress;
 import com.lmax.disruptor.EventTranslatorOneArg;
 import com.lmax.disruptor.RingBuffer;
 import com.sstlfsj.disruptor.autoconfigure.DisruptorLifecycle;
+import com.sstlfsj.disruptor.concurrent.EventLoop;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.tutorial.dto.PlaceOrderRequest;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 将并发下单请求串行化到唯一发布线程，再通过原生 RingBuffer 进入 SINGLE 撮合管道。
- * 入口在 Runtime 之后启动、之前停止，确保原生生产者退出后 Runtime 才开始排空。
+ * 将并发下单请求串行化到有界 EventLoop 的唯一 worker，再通过原生 RingBuffer 进入 SINGLE 撮合管道。
+ * 入口在 Runtime 与 EventLoop 之后启动、之前停止，确保唯一生产者排空后 Runtime 才开始排空。
  */
 @Component
 public final class MatchingOrderIngress implements SmartLifecycle {
@@ -39,27 +36,24 @@ public final class MatchingOrderIngress implements SmartLifecycle {
                 event.setTransactTime(command.transactTime());
             };
 
-    private static final long STOP_TIMEOUT_SECONDS = 5L;
-
     private final RingBuffer<OrderEvent> ringBuffer;
-    private final ThreadPoolExecutor publisher;
+    private final DisruptorRuntime runtime;
+    private final EventLoop publisher;
     private final AtomicLong orderIdGenerator = new AtomicLong();
     private final int phase;
     private volatile boolean running;
 
-    public MatchingOrderIngress(DisruptorRuntime runtime, DisruptorLifecycle runtimeLifecycle) {
+    public MatchingOrderIngress(
+            DisruptorRuntime runtime,
+            DisruptorLifecycle runtimeLifecycle,
+            EventLoop matchingOrderIngressEventLoop) {
         Objects.requireNonNull(runtime, "runtime 不能为空");
         Objects.requireNonNull(runtimeLifecycle, "runtimeLifecycle 不能为空");
+        this.publisher = Objects.requireNonNull(
+                matchingOrderIngressEventLoop, "matchingOrderIngressEventLoop 不能为空");
+        this.runtime = runtime;
         this.ringBuffer = runtime.require("matching", OrderEvent.class).unsafeRingBuffer();
         this.phase = ingressPhase(runtimeLifecycle.getPhase());
-        this.publisher = new ThreadPoolExecutor(
-                1,
-                1,
-                0L,
-                TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(ringBuffer.getBufferSize()),
-                runnable -> new Thread(runnable, "matching-order-ingress"),
-                new ThreadPoolExecutor.AbortPolicy());
     }
 
     /**
@@ -97,10 +91,9 @@ public final class MatchingOrderIngress implements SmartLifecycle {
         if (running) {
             return;
         }
-        if (publisher.isShutdown()) {
-            throw new IllegalStateException("撮合订单入口已停止，不能重新启动");
+        if (!runtime.isRunning() || !publisher.snapshot().acceptingTasks()) {
+            throw new IllegalStateException("Runtime 与 EventLoop 启动完成前不能开放撮合订单入口");
         }
-        publisher.prestartCoreThread();
         running = true;
     }
 
@@ -130,31 +123,27 @@ public final class MatchingOrderIngress implements SmartLifecycle {
     }
 
     private synchronized void stopPublisher() {
-        if (publisher.isTerminated()) {
+        if (!running && publisher.isShutdown()) {
             running = false;
             return;
         }
         running = false;
         publisher.shutdown();
+        boolean interrupted = false;
         try {
-            if (publisher.awaitTermination(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                return;
+            while (true) {
+                try {
+                    publisher.termination().toCompletableFuture().get();
+                    return;
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                } catch (ExecutionException failed) {
+                    throw propagate(failed.getCause());
+                }
             }
-            cancel(publisher.shutdownNow());
-            if (!publisher.awaitTermination(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("撮合订单入口线程未在超时内退出");
-            }
-        } catch (InterruptedException interrupted) {
-            cancel(publisher.shutdownNow());
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("等待撮合订单入口线程退出时被中断", interrupted);
-        }
-    }
-
-    private static void cancel(List<Runnable> abandoned) {
-        for (Runnable task : abandoned) {
-            if (task instanceof Future<?> future) {
-                future.cancel(false);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }

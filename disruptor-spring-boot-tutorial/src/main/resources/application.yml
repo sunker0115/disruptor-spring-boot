@@ -2,6 +2,7 @@ server:
   port: 8080
 
 disruptor:
+  lifecycle-phase: -100
   shutdown-timeout: 10s
   defaults:
     buffer-size: 1024
@@ -9,6 +10,10 @@ disruptor:
   pipelines:
     matching:
       producer-type: SINGLE
+
+  concurrent:
+    lifecycle-phase: -200
+    shutdown-timeout: 10s
 
 logging:
   level:
