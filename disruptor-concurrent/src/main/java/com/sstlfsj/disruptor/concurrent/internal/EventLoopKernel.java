@@ -175,13 +175,14 @@ public final class EventLoopKernel {
             int maxPooledSegments,
             TaskExceptionHandler taskExceptionHandler,
             List<EventLoopModule> modules) {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(segmentSize, maxPooledSegments);
         return new EventLoopKernel(
                 owner,
                 name,
                 CapacityMode.UNBOUNDED,
                 OptionalLong.empty(),
-                new UnboundedTaskQueue(segmentSize, maxPooledSegments),
-                TaskAdmissionGate.unbounded(),
+                queue,
+                TaskAdmissionGate.unbounded(queue.ledger()),
                 threadFactory,
                 shutdownTimeout,
                 clock,

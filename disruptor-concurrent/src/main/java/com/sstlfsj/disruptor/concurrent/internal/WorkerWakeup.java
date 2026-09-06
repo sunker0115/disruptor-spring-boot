@@ -29,7 +29,7 @@ final class WorkerWakeup {
     }
 
     void finishAdmission(long sequence, boolean rollbackOutstanding) {
-        gate.leave(rollbackOutstanding);
+        gate.leave(sequence, rollbackOutstanding);
         if (sequence >= 0 && parked.get()) {
             unpark.run();
         }

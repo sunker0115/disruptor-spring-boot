@@ -1,5 +1,6 @@
 package com.sstlfsj.disruptor.concurrent.internal;
 
+import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -17,15 +18,15 @@ final class TaskAdmissionGate {
     private static final int SPIN_LIMIT = 64;
 
     private final AtomicLong admission = new AtomicLong();
-    private final AtomicLong unboundedOutstanding;
+    private final UnboundedTaskLedger unboundedLedger;
     private final ConcurrentLinkedQueue<Thread> drainWaiters = new ConcurrentLinkedQueue<>();
     private final long capacity;
     private final boolean bounded;
 
-    private TaskAdmissionGate(long capacity, boolean bounded) {
+    private TaskAdmissionGate(long capacity, boolean bounded, UnboundedTaskLedger unboundedLedger) {
         this.capacity = capacity;
         this.bounded = bounded;
-        this.unboundedOutstanding = bounded ? null : new AtomicLong();
+        this.unboundedLedger = unboundedLedger;
     }
 
     static TaskAdmissionGate bounded(long capacity) {
@@ -33,11 +34,16 @@ final class TaskAdmissionGate {
             throw new IllegalArgumentException(
                     "capacity 必须在 [1, 2^31-1] 范围内，实际值=" + capacity);
         }
-        return new TaskAdmissionGate(capacity, true);
+        return new TaskAdmissionGate(capacity, true, null);
     }
 
     static TaskAdmissionGate unbounded() {
-        return new TaskAdmissionGate(Long.MAX_VALUE, false);
+        return unbounded(new UnboundedTaskLedger());
+    }
+
+    static TaskAdmissionGate unbounded(UnboundedTaskLedger ledger) {
+        return new TaskAdmissionGate(Long.MAX_VALUE, false,
+                Objects.requireNonNull(ledger, "ledger 不能为空"));
     }
 
     void open() {
@@ -94,21 +100,21 @@ final class TaskAdmissionGate {
                 }
                 next += 1L << OUTSTANDING_SHIFT;
             }
-            if (!admission.compareAndSet(current, next)) {
-                continue;
-            }
-            if (bounded || incrementUnboundedOutstanding()) {
+            if (admission.compareAndSet(current, next)) {
                 return true;
             }
-            leavePublisherOnly();
-            return false;
         }
     }
 
     void leave(boolean rollbackOutstanding) {
+        leave(-1, rollbackOutstanding);
+    }
+
+    /** sequence < 0 表示只进入 publisher、尚未占号；无界账本此时没有回滚额度。 */
+    void leave(long sequence, boolean rollbackOutstanding) {
         if (!bounded) {
-            if (rollbackOutstanding) {
-                decrementUnboundedOutstanding(1);
+            if (rollbackOutstanding && sequence >= 0) {
+                unboundedLedger.rollbackClaim();
             }
             leavePublisherOnly();
             return;
@@ -141,7 +147,7 @@ final class TaskAdmissionGate {
             throw new IllegalArgumentException("count 必须为正数，实际值=" + count);
         }
         if (!bounded) {
-            decrementUnboundedOutstanding(count);
+            unboundedLedger.completeBatch(count);
             return;
         }
         while (true) {
@@ -159,7 +165,7 @@ final class TaskAdmissionGate {
     }
 
     long outstanding() {
-        return bounded ? boundedOutstanding(admission.get()) : unboundedOutstanding.get();
+        return bounded ? boundedOutstanding(admission.get()) : unboundedLedger.outstanding();
     }
 
     long activePublishers() {
@@ -193,31 +199,6 @@ final class TaskAdmissionGate {
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    private boolean incrementUnboundedOutstanding() {
-        while (true) {
-            long current = unboundedOutstanding.get();
-            if (current == Long.MAX_VALUE) {
-                return false;
-            }
-            if (unboundedOutstanding.compareAndSet(current, current + 1)) {
-                return true;
-            }
-        }
-    }
-
-    private void decrementUnboundedOutstanding(int count) {
-        while (true) {
-            long current = unboundedOutstanding.get();
-            if (current < count) {
-                throw new IllegalStateException("完成数量超过 outstanding：count=" + count
-                        + "，outstanding=" + current);
-            }
-            if (unboundedOutstanding.compareAndSet(current, current - count)) {
-                return;
             }
         }
     }

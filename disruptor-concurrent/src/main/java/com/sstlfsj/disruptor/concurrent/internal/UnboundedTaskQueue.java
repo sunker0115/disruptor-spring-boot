@@ -4,7 +4,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayDeque;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** 分段、池化且以绝对发布代际保护复用的无界 MPSC typed-slot 队列。 */
@@ -31,7 +30,8 @@ final class UnboundedTaskQueue implements TaskQueue {
     private final int segmentShift;
     private final int segmentMask;
     private final int maxPooledSegments;
-    private final AtomicLong nextClaimSequence = new AtomicLong();
+    private final SegmentFactory segmentFactory;
+    private final UnboundedTaskLedger ledger = new UnboundedTaskLedger();
     private int allocatedSegments = 1;
     private int activeSegments = 1;
     private final ReentrantLock segmentLock = new ReentrantLock();
@@ -44,6 +44,10 @@ final class UnboundedTaskQueue implements TaskQueue {
     private long currentSequence = -1;
 
     UnboundedTaskQueue(int segmentSize, int maxPooledSegments) {
+        this(segmentSize, maxPooledSegments, Segment::new);
+    }
+
+    UnboundedTaskQueue(int segmentSize, int maxPooledSegments, SegmentFactory segmentFactory) {
         if (segmentSize <= 0 || Integer.bitCount(segmentSize) != 1) {
             throw new IllegalArgumentException(
                     "segmentSize 必须为 2 的幂，实际值=" + segmentSize);
@@ -56,19 +60,25 @@ final class UnboundedTaskQueue implements TaskQueue {
         this.segmentShift = Integer.numberOfTrailingZeros(segmentSize);
         this.segmentMask = segmentSize - 1;
         this.maxPooledSegments = maxPooledSegments;
-        Segment initial = new Segment(0, segmentSize);
+        this.segmentFactory = Objects.requireNonNull(segmentFactory, "segmentFactory 不能为空");
+        Segment initial = segmentFactory.create(0, segmentSize);
         head = initial;
         tail = initial;
     }
 
     @Override
     public long tryClaim() {
-        long sequence = nextClaimSequence.getAndIncrement();
-        if (sequence < 0) {
-            throw new IllegalStateException("TaskQueue sequence 已耗尽");
+        while (true) {
+            long sequence = ledger.candidateSequence();
+            // 分配可失败；只有目标段已就绪才能提交占号。
+            if (segmentForClaim(sequence, true) != null && ledger.tryCommitClaim(sequence)) {
+                return sequence;
+            }
         }
-        segmentForClaim(sequence);
-        return sequence;
+    }
+
+    UnboundedTaskLedger ledger() {
+        return ledger;
     }
 
     @Override
@@ -186,7 +196,7 @@ final class UnboundedTaskQueue implements TaskQueue {
 
     @Override
     public long claimedCursor() {
-        return nextClaimSequence.get() - 1;
+        return ledger.claimedCursor();
     }
 
     @Override
@@ -275,6 +285,10 @@ final class UnboundedTaskQueue implements TaskQueue {
     }
 
     private Segment segmentForClaim(long sequence) {
+        return segmentForClaim(sequence, false);
+    }
+
+    private Segment segmentForClaim(long sequence, boolean candidate) {
         long targetId = sequence >>> segmentShift;
         Segment observedTail = tail;
         if (observedTail.id == targetId) {
@@ -282,6 +296,10 @@ final class UnboundedTaskQueue implements TaskQueue {
         }
         segmentLock.lock();
         try {
+            // 候选号尚无 publication hole 保护；等锁期间它的段可能已被消费并回收。
+            if (candidate && ledger.candidateSequence() != sequence) {
+                return null;
+            }
             Segment current = tail;
             while (current.id < targetId) {
                 Segment next = acquireSegment(current.id + 1);
@@ -341,8 +359,9 @@ final class UnboundedTaskQueue implements TaskQueue {
     private Segment acquireSegment(long id) {
         Segment segment = pooledSegments.pollFirst();
         if (segment == null) {
+            Segment created = segmentFactory.create(id, segmentSize);
             allocatedSegments++;
-            return new Segment(id, segmentSize);
+            return created;
         }
         segment.reset(id);
         return segment;
@@ -371,12 +390,17 @@ final class UnboundedTaskQueue implements TaskQueue {
         }
     }
 
-    private static final class Segment {
+    @FunctionalInterface
+    interface SegmentFactory {
+        Segment create(long id, int segmentSize);
+    }
+
+    static final class Segment {
         private long id;
         private final Cell[] cells;
         private volatile Segment next;
 
-        private Segment(long id, int segmentSize) {
+        Segment(long id, int segmentSize) {
             this.id = id;
             this.cells = new Cell[segmentSize];
             for (int index = 0; index < segmentSize; index++) {

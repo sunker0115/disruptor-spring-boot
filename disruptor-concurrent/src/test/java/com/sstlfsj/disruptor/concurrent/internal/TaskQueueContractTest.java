@@ -245,6 +245,67 @@ class TaskQueueContractTest {
     }
 
     @Test
+    void failedSegmentAllocationDoesNotCommitClaimOrLeaveAPublicationHole() {
+        AtomicBoolean failExpansion = new AtomicBoolean(true);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 0, (id, size) -> {
+            if (id == 1 && failExpansion.getAndSet(false)) {
+                throw new OutOfMemoryError("注入扩段分配失败");
+            }
+            return new UnboundedTaskQueue.Segment(id, size);
+        });
+        publishOrdinary(queue);
+        publishOrdinary(queue);
+        assertThrows(OutOfMemoryError.class, queue::tryClaim);
+        assertEquals(1, queue.claimedCursor(), "分配失败不得提前占号");
+        assertEquals(new QueueSegmentSnapshot(1, 1), queue.segmentSnapshot());
+        SequencedRunnable recovered = publishOrdinary(queue);
+        assertEquals(2, recovered.sequence());
+        consumeOrdinaries(queue, 3);
+        assertFalse(queue.poll());
+        assertEquals(0, queue.pending());
+        assertEquals(2, queue.consumerCursor());
+        assertEquals(new QueueSegmentSnapshot(1, 1), queue.segmentSnapshot());
+    }
+
+    @Test
+    void uncommittedCandidateRetriesAfterItsSegmentWasConsumedWhileWaitingForLock()
+            throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 0);
+        publishOrdinary(queue);
+        ReentrantLock lifecycleLock = segmentLifecycleLock(queue);
+        ExecutorService producer = Executors.newSingleThreadExecutor();
+        try {
+            Future<Long> delayedClaim;
+            lifecycleLock.lock();
+            try {
+                delayedClaim = producer.submit(queue::tryClaim);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                while (!lifecycleLock.hasQueuedThreads()) {
+                    assertTrue(System.nanoTime() < deadline, "producer 应在占号前等待段锁");
+                    Thread.onSpinWait();
+                }
+                assertEquals(0, queue.claimedCursor());
+                publishOrdinary(queue);
+                publishOrdinary(queue);
+                consumeOrdinaries(queue, 3);
+                assertFalse(queue.poll());
+                assertEquals(new QueueSegmentSnapshot(1, 1), queue.segmentSnapshot());
+            } finally {
+                lifecycleLock.unlock();
+            }
+            long sequence = delayedClaim.get(2, TimeUnit.SECONDS);
+            assertEquals(3, sequence);
+            queue.writeOrdinary(sequence, new SequencedRunnable(sequence));
+            queue.publish(sequence);
+            consumeOrdinaries(queue, 1);
+            assertEquals(0, queue.pending());
+        } finally {
+            producer.shutdownNow();
+            assertTrue(producer.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
     void unboundedQueueRecyclesSegmentsWithoutIncreasingAllocatedCount() {
         UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 8);
         for (int index = 0; index < 6; index++) {

@@ -2,11 +2,9 @@ package com.sstlfsj.disruptor.concurrent.internal;
 
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -53,9 +51,11 @@ class TaskAdmissionGateTest {
 
     @Test
     void closeRejectsNewEntriesAndAwaitDrainedWaitsForLastPublisher() throws Exception {
-        TaskAdmissionGate gate = TaskAdmissionGate.unbounded();
+        UnboundedTaskLedger ledger = new UnboundedTaskLedger();
+        TaskAdmissionGate gate = TaskAdmissionGate.unbounded(ledger);
         gate.open();
         assertTrue(gate.tryEnter());
+        assertTrue(ledger.tryCommitClaim(0));
         gate.closeForAdmissions();
         assertFalse(gate.isAccepting());
         assertFalse(gate.tryEnter());
@@ -104,11 +104,14 @@ class TaskAdmissionGateTest {
 
     @Test
     void unboundedTracksOutstandingWithoutACapacityLimit() {
-        TaskAdmissionGate gate = TaskAdmissionGate.unbounded();
+        UnboundedTaskLedger ledger = new UnboundedTaskLedger();
+        TaskAdmissionGate gate = TaskAdmissionGate.unbounded(ledger);
         gate.open();
 
         for (int index = 0; index < 4; index++) {
             assertTrue(gate.tryEnter());
+            assertEquals(index, gate.outstanding(), "进入 publisher 不等于成功占号");
+            assertTrue(ledger.tryCommitClaim(index));
             gate.leave(false);
         }
 
@@ -126,17 +129,38 @@ class TaskAdmissionGateTest {
     }
 
     @Test
-    void unboundedOutstandingRefusesOverflowWithoutWrapping() throws Exception {
-        TaskAdmissionGate gate = TaskAdmissionGate.unbounded();
+    void unboundedSequenceExhaustionLeavesNoPublisherOrOutstandingLeak() throws Exception {
+        UnboundedTaskLedger ledger = UnboundedTaskLedgerTest.exhaustedAfterOneMoreClaim();
+        TaskAdmissionGate gate = TaskAdmissionGate.unbounded(ledger);
         gate.open();
-        Field field = TaskAdmissionGate.class.getDeclaredField("unboundedOutstanding");
-        field.setAccessible(true);
-        AtomicLong outstanding = (AtomicLong) field.get(gate);
-        outstanding.set(Long.MAX_VALUE);
-
-        assertFalse(gate.tryEnter());
-        assertEquals(Long.MAX_VALUE, gate.outstanding());
+        assertTrue(gate.tryEnter());
+        assertTrue(ledger.tryCommitClaim(ledger.candidateSequence()));
+        gate.leave(false);
+        assertEquals(1, gate.outstanding());
+        gate.completeBatch(1);
+        assertTrue(gate.tryEnter());
+        assertThrows(IllegalStateException.class, ledger::candidateSequence);
+        gate.leave(true);
+        assertEquals(Long.MAX_VALUE - 1, ledger.claimedCursor());
+        assertEquals(0, gate.outstanding());
         assertEquals(0, gate.activePublishers());
+    }
+
+    @Test
+    void failureBeforeClaimCannotRollbackAnotherPublishersOutstanding() {
+        UnboundedTaskLedger ledger = new UnboundedTaskLedger();
+        TaskAdmissionGate gate = TaskAdmissionGate.unbounded(ledger);
+        gate.open();
+        assertTrue(gate.tryEnter());
+        assertTrue(ledger.tryCommitClaim(0));
+        gate.leave(false);
+        assertTrue(gate.tryEnter());
+        assertEquals(1, gate.outstanding());
+        gate.leave(true);
+        assertEquals(1, gate.outstanding());
+        assertEquals(0, gate.activePublishers());
+        gate.completeBatch(1);
+        assertEquals(0, gate.outstanding());
     }
 
     private static void awaitState(Thread thread, Thread.State expected)
