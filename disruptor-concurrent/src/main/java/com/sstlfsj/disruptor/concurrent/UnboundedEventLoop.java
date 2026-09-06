@@ -15,6 +15,7 @@ public final class UnboundedEventLoop extends AbstractEventLoop {
                 configuration.clock(),
                 configuration.maxCommandBatchSize(),
                 configuration.maxTimerBatchSize(),
+                configuration.maxPooledSegments(),
                 configuration.taskExceptionHandler(),
                 configuration.modules()));
     }

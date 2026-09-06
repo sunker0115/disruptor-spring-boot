@@ -53,6 +53,8 @@ class DisruptorConcurrentMetricsTest {
                     "bounded-metrics", "").value()).isZero();
             assertThat(gauge(registry, "disruptor.eventloop.tasks.returned",
                     "bounded-metrics", "").value()).isZero();
+            assertThat(gauge(registry, "disruptor.eventloop.tasks.discarded",
+                    "bounded-metrics", "").value()).isZero();
             assertThat(gauge(registry, "disruptor.eventloop.scheduled.pending",
                     "bounded-metrics", "").value()).isZero();
             assertThat(gauge(registry, "disruptor.eventloop.queue.remaining",
@@ -62,8 +64,13 @@ class DisruptorConcurrentMetricsTest {
             awaitGauge(gauge(registry, "disruptor.eventloop.tasks.completed",
                     "bounded-metrics", ""), 1.0);
 
-            assertThat(gauge(registry, "disruptor.eventloop.queue.segments",
+            assertThat(gauge(registry, "disruptor.eventloop.queue.segments.allocated",
                     "metrics-group-0", "metrics-group").value()).isGreaterThanOrEqualTo(1.0);
+            assertThat(gauge(registry, "disruptor.eventloop.queue.segments.active",
+                    "metrics-group-0", "metrics-group").value()).isGreaterThanOrEqualTo(1.0);
+            assertThat(registry.find("disruptor.eventloop.queue.segments")
+                    .tags("eventloop", "metrics-group-0", "group", "metrics-group")
+                    .gauge()).isNull();
             assertThat(registry.find("disruptor.eventloop.queue.remaining")
                     .tags("eventloop", "metrics-group-0", "group", "metrics-group")
                     .gauge()).isNull();

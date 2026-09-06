@@ -17,9 +17,11 @@ public final class EventLoopBuilder<T extends EventLoop> {
     private static final Duration DEFAULT_SHUTDOWN_TIMEOUT = Duration.ofSeconds(10);
     private static final int DEFAULT_COMMAND_BATCH_SIZE = 64;
     private static final int DEFAULT_TIMER_BATCH_SIZE = 64;
+    private static final int DEFAULT_MAX_POOLED_SEGMENTS = 8;
 
     private final String name;
     private final int queueSize;
+    private final CapacityMode capacityMode;
     private final Function<Configuration, T> factory;
     private final List<EventLoopModule> modules = new ArrayList<>();
 
@@ -28,17 +30,20 @@ public final class EventLoopBuilder<T extends EventLoop> {
     private NanoClock clock = NanoClock.system();
     private int maxCommandBatchSize = DEFAULT_COMMAND_BATCH_SIZE;
     private int maxTimerBatchSize = DEFAULT_TIMER_BATCH_SIZE;
+    private int maxPooledSegments = DEFAULT_MAX_POOLED_SEGMENTS;
     private TaskExceptionHandler taskExceptionHandler = EventLoopBuilder::logTaskFailure;
 
     private EventLoopBuilder(
             String name,
             int queueSize,
+            CapacityMode capacityMode,
             Function<Configuration, T> factory) {
         this.name = requireName(name);
         if (queueSize <= 0 || Integer.bitCount(queueSize) != 1) {
             throw new IllegalArgumentException("queueSize 必须为 2 的幂，实际值=" + queueSize);
         }
         this.queueSize = queueSize;
+        this.capacityMode = Objects.requireNonNull(capacityMode, "capacityMode 不能为空");
         this.factory = Objects.requireNonNull(factory, "factory 不能为空");
         this.threadFactory = command -> Thread.ofPlatform()
                 .name(name + "-worker")
@@ -46,11 +51,13 @@ public final class EventLoopBuilder<T extends EventLoop> {
     }
 
     public static EventLoopBuilder<DisruptorEventLoop> bounded(String name, int capacity) {
-        return new EventLoopBuilder<>(name, capacity, DisruptorEventLoop::new);
+        return new EventLoopBuilder<>(
+                name, capacity, CapacityMode.BOUNDED, DisruptorEventLoop::new);
     }
 
     public static EventLoopBuilder<UnboundedEventLoop> unbounded(String name, int segmentSize) {
-        return new EventLoopBuilder<>(name, segmentSize, UnboundedEventLoop::new);
+        return new EventLoopBuilder<>(
+                name, segmentSize, CapacityMode.UNBOUNDED, UnboundedEventLoop::new);
     }
 
     public EventLoopBuilder<T> threadFactory(ThreadFactory threadFactory) {
@@ -83,6 +90,19 @@ public final class EventLoopBuilder<T extends EventLoop> {
         return this;
     }
 
+    /** 设置无界队列最多保留的空闲 segment 数；0 表示禁用池化。 */
+    public EventLoopBuilder<T> maxPooledSegments(int maxPooledSegments) {
+        if (capacityMode != CapacityMode.UNBOUNDED) {
+            throw new IllegalStateException("maxPooledSegments 仅适用于 UNBOUNDED EventLoop");
+        }
+        if (maxPooledSegments < 0) {
+            throw new IllegalArgumentException(
+                    "maxPooledSegments 不能为负数，实际值=" + maxPooledSegments);
+        }
+        this.maxPooledSegments = maxPooledSegments;
+        return this;
+    }
+
     public EventLoopBuilder<T> taskExceptionHandler(TaskExceptionHandler taskExceptionHandler) {
         this.taskExceptionHandler = Objects.requireNonNull(
                 taskExceptionHandler, "taskExceptionHandler 不能为空");
@@ -103,6 +123,7 @@ public final class EventLoopBuilder<T extends EventLoop> {
                 clock,
                 maxCommandBatchSize,
                 maxTimerBatchSize,
+                maxPooledSegments,
                 taskExceptionHandler,
                 List.copyOf(modules)));
     }
@@ -135,6 +156,7 @@ public final class EventLoopBuilder<T extends EventLoop> {
             NanoClock clock,
             int maxCommandBatchSize,
             int maxTimerBatchSize,
+            int maxPooledSegments,
             TaskExceptionHandler taskExceptionHandler,
             List<EventLoopModule> modules) {
     }

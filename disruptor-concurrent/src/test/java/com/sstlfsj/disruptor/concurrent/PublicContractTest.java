@@ -68,6 +68,15 @@ class PublicContractTest {
                 .childCount(1)
                 .children(source)
                 .build();
+        EventLoopSnapshot unbounded = EventLoopSnapshot.builder()
+                .name("unbounded-loop")
+                .lifecycle(SupervisedLifecycle.NEW)
+                .capacityMode(CapacityMode.UNBOUNDED)
+                .capacityLimit(OptionalLong.empty())
+                .allocatedQueueSegments(1)
+                .activeQueueSegments(1)
+                .worker(worker)
+                .build();
         ScheduledTaskSnapshot task = ScheduledTaskSnapshot.builder()
                 .acceptedSequence(1)
                 .scheduleMode(ScheduleMode.ONE_SHOT)
@@ -80,12 +89,24 @@ class PublicContractTest {
         assertEquals(List.of(child), group.children());
         assertThrows(UnsupportedOperationException.class, () -> group.children().clear());
         assertEquals(task, task.toBuilder().build());
+        assertThrows(IllegalArgumentException.class, () -> child.toBuilder()
+                .outstandingTasks(9)
+                .build());
+        assertThrows(IllegalArgumentException.class, () -> child.toBuilder()
+                .activeQueueSegments(1)
+                .build());
         assertThrows(IllegalArgumentException.class, () -> EventLoopSnapshot.builder()
                 .name("invalid")
                 .lifecycle(SupervisedLifecycle.NEW)
                 .capacityMode(CapacityMode.UNBOUNDED)
                 .capacityLimit(OptionalLong.of(8))
                 .worker(worker)
+                .build());
+        assertThrows(IllegalArgumentException.class, () -> unbounded.toBuilder()
+                .activeQueueSegments(2)
+                .build());
+        assertThrows(IllegalArgumentException.class, () -> group.toBuilder()
+                .discardedTasks(-1)
                 .build());
     }
 }

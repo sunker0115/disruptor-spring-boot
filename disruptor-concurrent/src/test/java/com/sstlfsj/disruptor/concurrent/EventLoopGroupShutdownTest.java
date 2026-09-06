@@ -178,6 +178,47 @@ class EventLoopGroupShutdownTest {
     }
 
     @Test
+    void groupSnapshotAggregatesDiscardedTasksFromEveryChild() throws Exception {
+        DisruptorEventLoopGroup group = EventLoopGroupBuilder
+                .bounded("group-discarded", 2, 8)
+                .build();
+        group.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        List<EventLoop> children = children(group);
+        CountDownLatch entered = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            for (EventLoop child : children) {
+                child.execute(() -> {
+                    entered.countDown();
+                    awaitIgnoringInterrupt(release);
+                });
+            }
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            List<Future<?>> queued = new ArrayList<>(children.size());
+            for (EventLoop child : children) {
+                queued.add(child.submit(() -> { }));
+            }
+
+            group.requestShutdown(ShutdownMode.IMMEDIATE, ShutdownDeadline.unbounded());
+            awaitCondition(() -> queued.stream().allMatch(Future::isCancelled));
+            release.countDown();
+            EventLoopGroupSnapshot terminated = group.termination().toCompletableFuture()
+                    .get(2, TimeUnit.SECONDS);
+
+            assertEquals(2, terminated.discardedTasks());
+            assertEquals(2, terminated.children().stream()
+                    .mapToLong(EventLoopSnapshot::discardedTasks)
+                    .sum());
+        } finally {
+            release.countDown();
+            if (!group.isTerminated()) {
+                group.shutdownNow();
+                group.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void shutdownNowFreezesEveryAcceptedChildPublicationBeforeRegistrySweep()
             throws Exception {
         DisruptorEventLoopGroup group = EventLoopGroupBuilder

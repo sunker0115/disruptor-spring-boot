@@ -67,11 +67,16 @@ class EventLoopExecutorContractTest {
         });
         assertTrue(entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
 
-        assertEquals(1, loop.snapshot().outstandingTasks());
+        EventLoopSnapshot saturated = loop.snapshot();
+        assertEquals(1, saturated.outstandingTasks());
+        assertTrue(saturated.outstandingTasks() <= saturated.capacityLimit().orElseThrow());
         assertFalse(loop.tryExecute(() -> { }));
         RejectedExecutionException rejected = assertThrows(
                 RejectedExecutionException.class, () -> loop.execute(() -> { }));
         assertTrue(rejected.getMessage().contains("outstanding=1"));
+        EventLoopSnapshot rejectedSnapshot = loop.snapshot();
+        assertTrue(rejectedSnapshot.outstandingTasks()
+                <= rejectedSnapshot.capacityLimit().orElseThrow());
 
         release.countDown();
         running.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);

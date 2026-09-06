@@ -136,6 +136,7 @@ public final class DisruptorEventLoopGroup
                 .cancelledTasks(sum(childSnapshots, EventLoopSnapshot::cancelledTasks))
                 .shutdownNowReturnedTasks(sum(
                         childSnapshots, EventLoopSnapshot::shutdownNowReturnedTasks))
+                .discardedTasks(sum(childSnapshots, EventLoopSnapshot::discardedTasks))
                 .failure(state.failure())
                 .shutdownMode(state.shutdownMode())
                 .children(childSnapshots)

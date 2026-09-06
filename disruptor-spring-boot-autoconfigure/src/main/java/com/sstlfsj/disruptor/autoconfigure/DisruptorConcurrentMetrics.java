@@ -83,14 +83,18 @@ public final class DisruptorConcurrentMetrics implements MeterBinder {
                 EventLoopSnapshot::cancelledTasks, eventLoop, group);
         register(registry, "disruptor.eventloop.tasks.returned", source,
                 EventLoopSnapshot::shutdownNowReturnedTasks, eventLoop, group);
+        register(registry, "disruptor.eventloop.tasks.discarded", source,
+                EventLoopSnapshot::discardedTasks, eventLoop, group);
         register(registry, "disruptor.eventloop.scheduled.pending", source,
                 EventLoopSnapshot::scheduledPendingTasks, eventLoop, group);
         if (capacityMode == CapacityMode.BOUNDED) {
             register(registry, "disruptor.eventloop.queue.remaining", source,
                     snapshot -> snapshot.remainingCapacity().orElseThrow(), eventLoop, group);
         } else {
-            register(registry, "disruptor.eventloop.queue.segments", source,
+            register(registry, "disruptor.eventloop.queue.segments.allocated", source,
                     EventLoopSnapshot::allocatedQueueSegments, eventLoop, group);
+            register(registry, "disruptor.eventloop.queue.segments.active", source,
+                    EventLoopSnapshot::activeQueueSegments, eventLoop, group);
         }
     }
 

@@ -77,6 +77,7 @@ public final class EventLoopKernel {
     private volatile long completed;
     private volatile long failed;
     private volatile long cancelled;
+    private volatile long discarded;
     private final AtomicLong returned = new AtomicLong();
     private final WorkerWakeup wakeup;
     private volatile AcceptedTask<?> currentTask;
@@ -171,6 +172,7 @@ public final class EventLoopKernel {
             NanoClock clock,
             int maxCommandBatchSize,
             int maxTimerBatchSize,
+            int maxPooledSegments,
             TaskExceptionHandler taskExceptionHandler,
             List<EventLoopModule> modules) {
         return new EventLoopKernel(
@@ -178,7 +180,7 @@ public final class EventLoopKernel {
                 name,
                 CapacityMode.UNBOUNDED,
                 OptionalLong.empty(),
-                new UnboundedTaskQueue(segmentSize),
+                new UnboundedTaskQueue(segmentSize, maxPooledSegments),
                 TaskAdmissionGate.unbounded(),
                 threadFactory,
                 shutdownTimeout,
@@ -684,6 +686,9 @@ public final class EventLoopKernel {
                                     || state == OrdinaryState.DISCARDED) {
                                 cancelled++;
                             }
+                            if (state == OrdinaryState.DISCARDED) {
+                                discarded++;
+                            }
                             physicalCompleted++;
                             continue;
                         }
@@ -944,10 +949,14 @@ public final class EventLoopKernel {
         if (task.state() != AcceptedTask.PhysicalState.RUNNING) {
             awaitTaskDisposition();
         }
+        AcceptedTask.PhysicalState physicalState = task.state();
         if (!task.terminate()) {
             return 0;
         }
         registry.remove(task);
+        if (physicalState == AcceptedTask.PhysicalState.DISCARDED) {
+            discarded++;
+        }
         switch (task.future().snapshot().outcome()) {
             case SUCCEEDED -> completed++;
             case FAILED -> failed++;
@@ -976,7 +985,11 @@ public final class EventLoopKernel {
         while (queue.poll()) {
             TaskType type = queue.currentType();
             if (type == TaskType.ORDINARY) {
+                OrdinaryState state = queue.currentOrdinaryState();
                 cancelled++;
+                if (state == OrdinaryState.DISCARDED) {
+                    discarded++;
+                }
                 queue.advanceConsumer();
                 queue.releaseCurrentSlot();
                 physicalCompleted++;
@@ -1115,6 +1128,7 @@ public final class EventLoopKernel {
     }
 
     private EventLoopSnapshot snapshot(WorkerSnapshot workerSnapshot, boolean accepting) {
+        QueueSegmentSnapshot queueSegments = queue.segmentSnapshot();
         return EventLoopSnapshot.builder()
                 .name(name)
                 .lifecycle(workerSnapshot.lifecycle())
@@ -1129,7 +1143,9 @@ public final class EventLoopKernel {
                 .failedTasks(failed)
                 .cancelledTasks(cancelled)
                 .shutdownNowReturnedTasks(returned.get())
-                .allocatedQueueSegments(queue.allocatedSegments())
+                .discardedTasks(discarded)
+                .allocatedQueueSegments(queueSegments.allocated())
+                .activeQueueSegments(queueSegments.active())
                 .failure(workerSnapshot.failure())
                 .shutdownMode(workerSnapshot.shutdownMode())
                 .worker(workerSnapshot)

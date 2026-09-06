@@ -50,9 +50,20 @@ interface TaskQueue {
             OrdinaryDisposition disposition,
             OrdinaryClaimedSink sink);
 
-    int allocatedSegments();
+    /** 在同一个队列一致性边界内读取物理保留段与活跃段。 */
+    QueueSegmentSnapshot segmentSnapshot();
+}
 
-    int activeSegments();
+record QueueSegmentSnapshot(int allocated, int active) {
+
+    static final QueueSegmentSnapshot NONE = new QueueSegmentSnapshot(0, 0);
+
+    QueueSegmentSnapshot {
+        if (allocated < 0 || active < 0 || active > allocated) {
+            throw new IllegalArgumentException(
+                    "segment 计数非法：allocated=" + allocated + "，active=" + active);
+        }
+    }
 }
 
 enum TaskType {

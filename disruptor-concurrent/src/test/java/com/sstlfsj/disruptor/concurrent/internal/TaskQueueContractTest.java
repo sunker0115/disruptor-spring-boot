@@ -35,7 +35,7 @@ class TaskQueueContractTest {
     static Stream<QueueFactory> queues() {
         return Stream.of(
                 new QueueFactory("bounded", () -> new BoundedTaskQueue(4_096)),
-                new QueueFactory("unbounded", () -> new UnboundedTaskQueue(64)));
+                new QueueFactory("unbounded", () -> new UnboundedTaskQueue(64, 8)));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -244,27 +244,24 @@ class TaskQueueContractTest {
 
     @Test
     void unboundedQueueRecyclesSegmentsWithoutIncreasingAllocatedCount() {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 8);
         for (int index = 0; index < 6; index++) {
             publishOrdinary(queue);
         }
-        assertEquals(3, queue.allocatedSegments());
-        assertEquals(3, queue.activeSegments());
+        assertEquals(new QueueSegmentSnapshot(3, 3), queue.segmentSnapshot());
         consumeOrdinaries(queue, 6);
-        assertEquals(3, queue.allocatedSegments());
-        assertEquals(1, queue.activeSegments());
+        assertEquals(new QueueSegmentSnapshot(3, 1), queue.segmentSnapshot());
 
         for (int index = 0; index < 4; index++) {
             publishOrdinary(queue);
         }
-        assertEquals(3, queue.allocatedSegments());
-        assertEquals(3, queue.activeSegments());
+        assertEquals(new QueueSegmentSnapshot(3, 3), queue.segmentSnapshot());
         consumeOrdinaries(queue, 4);
     }
 
     @Test
     void unboundedReusedCellRequiresTheNewPublicationGeneration() {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(1);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 8);
         publishOrdinary(queue);
         consumeOrdinaries(queue, 1);
         publishOrdinary(queue);
@@ -283,7 +280,7 @@ class TaskQueueContractTest {
 
     @Test
     void unboundedDelayedProducerLookupIsProtectedBySegmentLifecycleLock() throws Exception {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(1);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 8);
         publishOrdinary(queue);
         long delayed = queue.tryClaim();
         SequencedRunnable delayedTask = new SequencedRunnable(delayed);
@@ -317,7 +314,7 @@ class TaskQueueContractTest {
 
     @Test
     void unboundedDoubleScannerAndConsumerDoNotUseRecycledSegments() throws Exception {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(2);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 8);
         int total = 128;
         for (int index = 0; index < total; index++) {
             publishOrdinary(queue);
@@ -361,11 +358,61 @@ class TaskQueueContractTest {
             secondScanner.get(5, TimeUnit.SECONDS);
             consumer.get(5, TimeUnit.SECONDS);
             assertEquals(total, claimed.size());
-            assertEquals(1, queue.activeSegments());
-            assertTrue(queue.allocatedSegments() <= 9);
+            QueueSegmentSnapshot segments = queue.segmentSnapshot();
+            assertEquals(1, segments.active());
+            assertTrue(segments.allocated() <= 9);
         } finally {
             racers.shutdownNow();
         }
+    }
+
+    @Test
+    void unboundedSegmentSnapshotStaysConsistentDuringGrowthAndRecycle()
+            throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 0);
+        int total = 10_000;
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService racers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> producer = racers.submit(() -> {
+                await(start);
+                for (int index = 0; index < total; index++) {
+                    publishOrdinary(queue);
+                }
+            });
+            Future<?> consumer = racers.submit(() -> {
+                await(start);
+                int consumed = 0;
+                while (consumed < total && !Thread.currentThread().isInterrupted()) {
+                    if (!queue.poll()) {
+                        Thread.onSpinWait();
+                        continue;
+                    }
+                    finishCurrentOrdinary(queue);
+                    consumed++;
+                }
+                assertEquals(total, consumed);
+            });
+
+            start.countDown();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!producer.isDone() || !consumer.isDone()) {
+                if (System.nanoTime() - deadline >= 0) {
+                    throw new AssertionError("并发 segment 扩缩未在期限内完成");
+                }
+                QueueSegmentSnapshot snapshot = queue.segmentSnapshot();
+                assertTrue(snapshot.active() >= 1);
+                assertTrue(snapshot.active() <= snapshot.allocated());
+            }
+            producer.get(5, TimeUnit.SECONDS);
+            consumer.get(5, TimeUnit.SECONDS);
+        } finally {
+            racers.shutdownNow();
+            racers.awaitTermination(2, TimeUnit.SECONDS);
+        }
+        QueueSegmentSnapshot drained = queue.segmentSnapshot();
+        assertEquals(1, drained.active());
+        assertEquals(1, drained.allocated());
     }
 
     private static SequencedRunnable publishOrdinary(TaskQueue queue) {

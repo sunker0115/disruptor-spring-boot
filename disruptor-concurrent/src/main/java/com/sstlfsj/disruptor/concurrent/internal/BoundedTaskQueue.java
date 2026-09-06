@@ -197,13 +197,8 @@ final class BoundedTaskQueue implements TaskQueue {
     }
 
     @Override
-    public int allocatedSegments() {
-        return 0;
-    }
-
-    @Override
-    public int activeSegments() {
-        return 0;
+    public QueueSegmentSnapshot segmentSnapshot() {
+        return QueueSegmentSnapshot.NONE;
     }
 
     int retainedReferences() {

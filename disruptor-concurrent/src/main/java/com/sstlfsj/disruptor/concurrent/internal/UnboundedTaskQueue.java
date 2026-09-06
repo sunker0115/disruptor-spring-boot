@@ -4,14 +4,12 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayDeque;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** 分段、池化且以绝对发布代际保护复用的无界 MPSC typed-slot 队列。 */
 final class UnboundedTaskQueue implements TaskQueue {
 
-    private static final int MAX_POOLED_SEGMENTS = 8;
     private static final int EMPTY = -1;
     private static final long UNPUBLISHED = Long.MIN_VALUE;
     private static final TaskType[] TASK_TYPES = TaskType.values();
@@ -32,9 +30,10 @@ final class UnboundedTaskQueue implements TaskQueue {
     private final int segmentSize;
     private final int segmentShift;
     private final int segmentMask;
+    private final int maxPooledSegments;
     private final AtomicLong nextClaimSequence = new AtomicLong();
-    private final AtomicInteger allocatedSegments = new AtomicInteger(1);
-    private final AtomicInteger activeSegments = new AtomicInteger(1);
+    private int allocatedSegments = 1;
+    private int activeSegments = 1;
     private final ReentrantLock segmentLock = new ReentrantLock();
     private final ArrayDeque<Segment> pooledSegments = new ArrayDeque<>();
 
@@ -44,14 +43,19 @@ final class UnboundedTaskQueue implements TaskQueue {
     private Cell currentCell;
     private long currentSequence = -1;
 
-    UnboundedTaskQueue(int segmentSize) {
+    UnboundedTaskQueue(int segmentSize, int maxPooledSegments) {
         if (segmentSize <= 0 || Integer.bitCount(segmentSize) != 1) {
             throw new IllegalArgumentException(
                     "segmentSize 必须为 2 的幂，实际值=" + segmentSize);
         }
+        if (maxPooledSegments < 0) {
+            throw new IllegalArgumentException(
+                    "maxPooledSegments 不能为负数，实际值=" + maxPooledSegments);
+        }
         this.segmentSize = segmentSize;
         this.segmentShift = Integer.numberOfTrailingZeros(segmentSize);
         this.segmentMask = segmentSize - 1;
+        this.maxPooledSegments = maxPooledSegments;
         Segment initial = new Segment(0, segmentSize);
         head = initial;
         tail = initial;
@@ -229,13 +233,13 @@ final class UnboundedTaskQueue implements TaskQueue {
     }
 
     @Override
-    public int allocatedSegments() {
-        return allocatedSegments.get();
-    }
-
-    @Override
-    public int activeSegments() {
-        return activeSegments.get();
+    public QueueSegmentSnapshot segmentSnapshot() {
+        segmentLock.lock();
+        try {
+            return new QueueSegmentSnapshot(allocatedSegments, activeSegments);
+        } finally {
+            segmentLock.unlock();
+        }
     }
 
     int retainedReferences() {
@@ -284,7 +288,7 @@ final class UnboundedTaskQueue implements TaskQueue {
                 current.next = next;
                 current = next;
                 tail = current;
-                activeSegments.incrementAndGet();
+                activeSegments++;
             }
             return current.id == targetId ? current : findFromHeadLocked(targetId);
         } finally {
@@ -324,8 +328,8 @@ final class UnboundedTaskQueue implements TaskQueue {
                     return null;
                 }
                 head = next;
+                activeSegments--;
                 recycleSegment(current);
-                activeSegments.decrementAndGet();
                 current = next;
             }
             return current.id == targetId ? current : null;
@@ -337,7 +341,7 @@ final class UnboundedTaskQueue implements TaskQueue {
     private Segment acquireSegment(long id) {
         Segment segment = pooledSegments.pollFirst();
         if (segment == null) {
-            allocatedSegments.incrementAndGet();
+            allocatedSegments++;
             return new Segment(id, segmentSize);
         }
         segment.reset(id);
@@ -346,10 +350,10 @@ final class UnboundedTaskQueue implements TaskQueue {
 
     private void recycleSegment(Segment segment) {
         segment.next = null;
-        if (pooledSegments.size() < MAX_POOLED_SEGMENTS) {
+        if (pooledSegments.size() < maxPooledSegments) {
             pooledSegments.addFirst(segment);
         } else {
-            allocatedSegments.decrementAndGet();
+            allocatedSegments--;
         }
     }
 

@@ -20,6 +20,7 @@ public record EventLoopGroupSnapshot(
         long failedTasks,
         long cancelledTasks,
         long shutdownNowReturnedTasks,
+        long discardedTasks,
         Throwable failure,
         ShutdownMode shutdownMode,
         List<EventLoopSnapshot> children) {
@@ -41,6 +42,7 @@ public record EventLoopGroupSnapshot(
         requireNonNegative(failedTasks, "failedTasks");
         requireNonNegative(cancelledTasks, "cancelledTasks");
         requireNonNegative(shutdownNowReturnedTasks, "shutdownNowReturnedTasks");
+        requireNonNegative(discardedTasks, "discardedTasks");
         if (acceptingTasks && lifecycle != SupervisedLifecycle.RUNNING) {
             throw new IllegalArgumentException("只有 RUNNING 生命周期可以接收任务");
         }

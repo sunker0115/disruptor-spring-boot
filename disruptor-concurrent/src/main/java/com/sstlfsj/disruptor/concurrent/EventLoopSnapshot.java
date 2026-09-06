@@ -24,7 +24,9 @@ public record EventLoopSnapshot(
         long failedTasks,
         long cancelledTasks,
         long shutdownNowReturnedTasks,
+        long discardedTasks,
         int allocatedQueueSegments,
+        int activeQueueSegments,
         Throwable failure,
         ShutdownMode shutdownMode,
         WorkerSnapshot worker) {
@@ -53,11 +55,24 @@ public record EventLoopSnapshot(
         requireNonNegative(failedTasks, "failedTasks");
         requireNonNegative(cancelledTasks, "cancelledTasks");
         requireNonNegative(shutdownNowReturnedTasks, "shutdownNowReturnedTasks");
+        requireNonNegative(discardedTasks, "discardedTasks");
         if (allocatedQueueSegments < 0) {
             throw new IllegalArgumentException("allocatedQueueSegments 不能为负数");
         }
-        if (capacityMode == CapacityMode.BOUNDED && allocatedQueueSegments != 0) {
+        if (activeQueueSegments < 0) {
+            throw new IllegalArgumentException("activeQueueSegments 不能为负数");
+        }
+        if (capacityMode == CapacityMode.BOUNDED
+                && (allocatedQueueSegments != 0 || activeQueueSegments != 0)) {
             throw new IllegalArgumentException("BOUNDED 快照不报告无界队列 segment");
+        }
+        if (capacityMode == CapacityMode.UNBOUNDED
+                && (allocatedQueueSegments == 0 || activeQueueSegments == 0)) {
+            throw new IllegalArgumentException("UNBOUNDED 快照必须报告至少一个 segment");
+        }
+        if (activeQueueSegments > allocatedQueueSegments) {
+            throw new IllegalArgumentException(
+                    "activeQueueSegments 不能超过 allocatedQueueSegments");
         }
         if (capacityLimit.isPresent() && outstandingTasks > capacityLimit.getAsLong()) {
             throw new IllegalArgumentException("outstandingTasks 不能超过 capacityLimit");

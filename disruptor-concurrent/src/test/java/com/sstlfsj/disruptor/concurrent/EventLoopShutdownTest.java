@@ -103,6 +103,40 @@ class EventLoopShutdownTest {
     }
 
     @Test
+    void immediateShutdownCountsDiscardedTasksSeparatelyFromExecutionOutcome()
+            throws Exception {
+        DisruptorEventLoop loop = runningLoop("discarded", 8);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            loop.execute(() -> {
+                entered.countDown();
+                awaitIgnoringInterrupt(release);
+            });
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            loop.execute(() -> { });
+            Future<?> tracked = loop.submit(() -> { });
+            ScheduledFuture<?> scheduled = loop.schedule(() -> { }, 1, TimeUnit.DAYS);
+
+            loop.requestShutdown(ShutdownMode.IMMEDIATE, ShutdownDeadline.unbounded());
+            awaitCondition(() -> tracked.isCancelled() && scheduled.isCancelled());
+            release.countDown();
+            EventLoopSnapshot terminated = loop.termination().toCompletableFuture()
+                    .get(2, TimeUnit.SECONDS);
+
+            assertEquals(3, terminated.discardedTasks());
+            assertEquals(3, terminated.cancelledTasks());
+            assertEquals(0, terminated.shutdownNowReturnedTasks());
+        } finally {
+            release.countDown();
+            if (!loop.isTerminated()) {
+                loop.shutdownNow();
+                loop.termination().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void shutdownUsesUnboundedDeadlineAndRunsAcceptedFutureOneShot() throws Exception {
         ManualNanoClock clock = new ManualNanoClock();
         AtomicReference<Thread> worker = new AtomicReference<>();
