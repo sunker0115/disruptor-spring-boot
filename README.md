@@ -276,7 +276,7 @@ Disruptor 在 translator 抛异常时仍会发布已经领取的槽位。transla
 
 ### 生命周期
 
-`DisruptorRuntime` 是一次性状态机：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → STOPPED`。处于 `RUNNING` 时重复调用 `start()` 不产生额外动作，重复停止也是幂等的；进入 `STOPPED` 后再次启动会失败。
+`DisruptorRuntime` 是一次性状态机：`NEW → STARTING → RUNNING → QUIESCING → STOPPING → TERMINATED`。处于 `RUNNING` 时重复调用 `start()` 不产生额外动作，重复停止也是幂等的；进入 `STOPPED` 后再次启动会失败。
 
 优雅关闭会先拒绝新受管发布并等待在途发布完成，再捕获固定目标游标；随后按启动逆序等待最小 gating sequence 越过目标、调用 `halt()`，最后等待消费线程真正退出。该判断不依赖消费者是否已经报告 `isRunning()`，因此启动后立即关闭也不会漏掉已发布事件。
 
