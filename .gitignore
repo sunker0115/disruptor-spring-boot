@@ -1,15 +1,23 @@
-# 构建产物
+# ===== 构建与产物 =====
 target/
 *.class
+
 # flatten-maven-plugin 生成的展开 pom（CI-friendly ${revision}）
 .flattened-pom.xml
 
-# IntelliJ IDEA
+# ===== IDE =====
 .idea/
 *.iml
 
-# macOS
+# ===== 本地 Agent / 工具 / 任务产物 =====
+.planning/
+.codegraph/
+inputs.json
+
+# ===== macOS =====
 .DS_Store
 
-# 任务输入元数据（非项目代码）
-inputs.json
+# ===== 日志与 JVM 崩溃转储 =====
+*.log
+hs_err_pid*.log
+replay_pid*.log
