@@ -15,7 +15,7 @@ $MVN -pl disruptor-spring-boot-example org.codehaus.mojo:exec-maven-plugin:3.5.0
 $MVN -pl disruptor-spring-boot-example spring-boot:run
 ```
 
-纯 Java 入口会输出 one-shot 的 `request-42` 上下文、`tryExecute` 接收结果、两次动态调度和 `demo-complete` 取消事件，然后优雅关闭并等待终止。Spring 启动会运行已有 demo 与 `demo6`，其中输出 `order-42@tenant-a`、相同 affinity key 的同一 worker、fixed-rate 取消和 `demo-complete`。
+纯 Java 入口会输出 one-shot 的 `request-42` 上下文、`tryExecute` 接收结果、两次动态调度、`demo-complete` 取消事件，以及一个仅用于内部短突发的 unbounded loop，然后优雅关闭并等待终止。Spring 启动会运行已有 demo 与 `demo6`，其中输出 `order-42@tenant-a`、相同 affinity key 的同一 worker、fixed-rate 取消和 `demo-complete`。
 
 ## 选择 API
 

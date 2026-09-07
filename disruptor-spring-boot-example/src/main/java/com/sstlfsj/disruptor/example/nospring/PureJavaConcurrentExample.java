@@ -3,6 +3,7 @@ package com.sstlfsj.disruptor.example.nospring;
 import com.sstlfsj.disruptor.concurrent.CancellationReason;
 import com.sstlfsj.disruptor.concurrent.CancellationSource;
 import com.sstlfsj.disruptor.concurrent.DisruptorEventLoop;
+import com.sstlfsj.disruptor.concurrent.EventLoop;
 import com.sstlfsj.disruptor.concurrent.EventLoopBuilder;
 import com.sstlfsj.disruptor.concurrent.EventLoopScheduledFuture;
 import com.sstlfsj.disruptor.concurrent.ScheduleMode;
@@ -69,6 +70,7 @@ public final class PureJavaConcurrentExample {
             if (!cancelled.await(2, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("取消监听器未完成");
             }
+            runInternalBurstExample();
         } finally {
             loop.shutdown();
             if (!loop.awaitTermination(2, TimeUnit.SECONDS)) {
@@ -79,6 +81,31 @@ public final class PureJavaConcurrentExample {
             }
         }
         log.info("[pure-concurrent] 完成");
+    }
+
+    private static void runInternalBurstExample() throws Exception {
+        EventLoop burst = EventLoopBuilder.unbounded(
+                        "pure-java-internal-burst", 4)
+                .shutdownTimeout(Duration.ofSeconds(2))
+                .build();
+        CountDownLatch completed = new CountDownLatch(2);
+        burst.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        try {
+            burst.execute(completed::countDown);
+            burst.execute(completed::countDown);
+            if (!completed.await(2, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("内部突发任务未完成");
+            }
+            log.info("[pure-concurrent] unbounded 内部短突发已完成");
+        } finally {
+            burst.shutdown();
+            if (!burst.awaitTermination(2, TimeUnit.SECONDS)) {
+                burst.shutdownNow();
+                if (!burst.awaitTermination(2, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("内部短突发 EventLoop 未终止");
+                }
+            }
+        }
     }
 
     private static void requireAccepted(boolean accepted) {
