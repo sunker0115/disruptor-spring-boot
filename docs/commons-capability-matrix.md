@@ -17,7 +17,7 @@
 | 消费屏障、依赖序列、alert | `ConsumerBarrier`、`SingleConsumerBarrier`、`MultiConsumerBarrier` | LMAX `SequenceBarrier`、原生 `EventProcessor` 与 topology；`DisruptorPipelineTest`、`NativeCapabilitiesTest` | 项目级替代 |
 | Blocking、BusySpin、Sleeping、Yielding 与 timeout wait | 同名 `WaitStrategy` 实现、`SequenceBlocker` | core 的 wait-strategy 工厂保留 LMAX 策略；构造参数型策略由 `PipelineSpec.waitStrategy(...)` 提供 | 覆盖；不复制 `SequenceBlocker` |
 | 有界事件拓扑、用户事件和原始 sequence | `EventSequencer`、`RingBufferEventSequencer`、`EventHandler` | `PipelineSpec.topology` 接收原生 `Disruptor<E>`，运行时不包装业务 handler | 覆盖 |
-| 分段 MPSC 无界 event sequencer | `MpUnboundedBuffer`、`MpUnboundedBufferSequencer`、`MpUnboundedEventSequencer` | `UnboundedTaskQueue` 作为 EventLoop 任务后端，与 bounded 后端共享唯一 kernel；分段 typed 槽 + 发布代际 + 段生命周期锁回收到空闲链表、超 `maxPooledSegments` 才释放 GC，复用前清 payload/state；`TaskQueueContractTest`（段回收、代际、双 scanner 无 use-after-free）、`UnboundedEventLoopTest` | 项目级覆盖；不公开通用无界事件总线 |
+| 分段 MPSC 无界 event sequencer | `MpUnboundedBuffer`、`MpUnboundedBufferSequencer`、`MpUnboundedEventSequencer` | `UnboundedTaskQueue` 作为 EventLoop 任务后端，与 bounded 后端共享唯一 kernel；分段 typed 槽 + 绝对 publication 代际 + CAS 段链 + 单消费者 head 回收 + 固定容量原子池，超 `maxPooledSegments` 才释放 GC；scanner 仅在 kernel 静默期读取；`TaskQueueContractTest`、`UnboundedEventLoopTest` 覆盖段回收、代际、MPSC 扩段、双 scanner 与 shutdown 交错 | 项目级覆盖；不公开通用无界事件总线 |
 | 生产者/消费者屏障作为独立低层扩展 API | `ProducerBarrier`、`ConsumerBarrier`、`Sequencer` | core 保留 LMAX 原生 `RingBuffer`、barrier 与自定义 processor 逃生口；concurrent 只公开任务执行边界 | 项目级替代；不兼容 fork API |
 
 ## Commons-Concurrent 模块
@@ -59,6 +59,6 @@
 
 ## 结论
 
-本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约。性能上，槽位原生重写后 ordinary 热路径已实测零堆分配（bounded 0.004、unbounded 1.607 B/op，与 Commons 同级）；吞吐相对 Commons，bounded 达 80.0%（相对门槛压线通过），unbounded 为 63.3%（未达 80%，分段回收契约的残余成本，列为后续专项优化）。功能覆盖不表示吞吐持平。
+本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约。性能上，槽位原生重写后 ordinary 热路径已实测零堆分配（bounded 0.004、unbounded 1.607 B/op，与 Commons 同级）；本轮又移除 unbounded 数据面的显式段锁。本机 JDK 21 同参数两轮复测：unbounded 相对自身 bounded 约 82%（差距约 18%，上一轮为 78%/21.7%），相对 Commons 仍约 64%，未达 80% 门槛；MPSC 2/4/8 producer 下 unbounded/bounded 为 89%–105%，无结构性退化。单线程残余差距是跨段绝对序列账本与逐槽所有权契约的固有成本。功能覆盖不表示吞吐持平。
 
 未复制项集中在 Commons 自身生态抽象：自研 Future API、ComponentId/Agent phases、WatcherMgr、LOCAL_ORDER 快路、任务池和 GlobalEventLoop。它们分别由 JDK/Spring/业务显式编排替代，或因破坏本项目全序、容量和所有权不变量而明确排除。因此“完整覆盖”指场景能力闭合，不表示包名、类型或调用点兼容。

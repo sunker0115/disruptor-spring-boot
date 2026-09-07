@@ -181,13 +181,18 @@ Commons 侧同为一次 40 次迭代的干净运行（方差极低，误差约 �
 
 结论必须分开表述。**分配**：槽位原生重写把普通 `execute/tryExecute` 的每任务分配从
 cutover 前的约 756–792 B/op 降到 bounded 0.004、unbounded 1.607 B/op，两者都达到
-≤10 B/op 门槛，ordinary 热路径实测零堆分配。**吞吐**：相对 cutover 前基线（bounded
-1,213,550、unbounded 1,311,135 ops/s）提升约 11–12 倍；相对门槛上 bounded 达到
-Commons 的 80.0%（压线通过），unbounded 为 63.3%（未达 80%）。unbounded 缺口来自
-分段队列的段生命周期锁、发布代际与段池化管理开销——Commons 的无界路径几乎追平自身
-有界（18.38M vs 18.59M），而本项目 unbounded（11.64M）明显低于自身 bounded（14.87M）。
-这是为“真无界 + 段回收 + 无 use-after-free”契约付出的残余成本，作为后续专项优化项，
-不在本轮解决。
+≤10 B/op 门槛，ordinary 热路径实测零堆分配。**吞吐**：上一轮正式基线中，bounded
+达到 Commons 的 80.0%，unbounded 为 63.3%；本轮已移除 unbounded 数据面的显式
+`ReentrantLock`，改为 CAS 段链、单消费者回收、固定原子池和静默期 scanner 握手。
+本机 JDK 21 同参数复测（`-f 5 -wi 4 -i 8`、in-flight 65,536、1 提交线程、负载约 2–4 窗口，
+两轮取中位）：bounded ≈14.3M、unbounded ≈11.7M，unbounded 相对上一轮基线（11.64M）约
++0.6%，绝对吞吐基本持平；同轮 unbounded/bounded 比值约 82%（上一轮 78.3%），差距由 21.7%
+收窄至约 18%，且收窄主要来自同轮 bounded 波动而非 unbounded 绝对提升。相对 Commons，
+unbounded 仍约 64%，未达 80% 门槛。MPSC 定向（2/4/8 producer）中 unbounded/bounded 为
+89%–105%，无结构性退化。据此判断：无锁化消除的是段锁与扫描互斥这类结构成本，收益落在
+多生产者与关闭路径；单线程 unbounded 相对 bounded 的残余差距来自跨段绝对序列账本与逐槽
+所有权契约，是三条自研语义的固有成本。publication acquire/release、accepted 全序、
+容量账本和 shutdown ownership 不属于可放宽项。
 
 功能与关闭契约方面：设计范围内的功能与关闭契约全部通过自身测试，并有 dynamic-delay、
 priority、精确 `shutdownNow`、Group fail-stop、共享 deadline、启动回滚和 Spring 运维
