@@ -776,6 +776,11 @@ public final class EventLoopKernel {
                 && disposition.state() == TaskDispositionCoordinator.State.NONE;
     }
 
+    private void scanOrdinaryQuiescent(OrdinaryDisposition target, OrdinaryClaimedSink sink) {
+        gate.awaitDrained();
+        queue.scanOrdinaryUnstarted(queue.claimedCursor(), target, sink);
+    }
+
     private void parkUntilWork() {
         wakeup.prepareToPark();
         ScheduledTask<?> next = timers.peek();
@@ -1020,8 +1025,7 @@ public final class EventLoopKernel {
 
     private List<Runnable> returnUnstarted() {
         List<SequencedRunnable> claimed = new ArrayList<>();
-        long frozen = queue.claimedCursor();
-        queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.RETURN,
+        scanOrdinaryQuiescent(OrdinaryDisposition.RETURN,
                 (sequence, original) -> claimed.add(new SequencedRunnable(sequence, original)));
         registry.scanForShutdown(task -> {
             if (task.tryReturn()) {
@@ -1037,9 +1041,7 @@ public final class EventLoopKernel {
     }
 
     private void discardUnstarted() {
-        gate.awaitDrained();
-        long frozen = queue.claimedCursor();
-        queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.DISCARD,
+        scanOrdinaryQuiescent(OrdinaryDisposition.DISCARD,
                 (sequence, original) -> {
                 });
         registry.scanForShutdown(task -> {

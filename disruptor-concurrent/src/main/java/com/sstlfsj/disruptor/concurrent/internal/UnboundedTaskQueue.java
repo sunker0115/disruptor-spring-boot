@@ -2,9 +2,9 @@ package com.sstlfsj.disruptor.concurrent.internal;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.ArrayDeque;
 import java.util.Objects;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /** 分段、池化且以绝对发布代际保护复用的无界 MPSC typed-slot 队列。 */
 final class UnboundedTaskQueue implements TaskQueue {
@@ -15,12 +15,16 @@ final class UnboundedTaskQueue implements TaskQueue {
     private static final OrdinaryState[] ORDINARY_STATES = OrdinaryState.values();
     private static final VarHandle PUBLISHED_SEQUENCE;
     private static final VarHandle ORDINARY_STATE;
+    private static final VarHandle NEXT;
+    private static final VarHandle TAIL;
 
     static {
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             PUBLISHED_SEQUENCE = lookup.findVarHandle(Cell.class, "publishedSequence", long.class);
             ORDINARY_STATE = lookup.findVarHandle(Cell.class, "ordinaryState", int.class);
+            NEXT = lookup.findVarHandle(Segment.class, "next", Segment.class);
+            TAIL = lookup.findVarHandle(UnboundedTaskQueue.class, "tail", Segment.class);
         } catch (NoSuchFieldException | IllegalAccessException failure) {
             throw new ExceptionInInitializerError(failure);
         }
@@ -32,10 +36,8 @@ final class UnboundedTaskQueue implements TaskQueue {
     private final int maxPooledSegments;
     private final SegmentFactory segmentFactory;
     private final UnboundedTaskLedger ledger = new UnboundedTaskLedger();
-    private int allocatedSegments = 1;
-    private int activeSegments = 1;
-    private final ReentrantLock segmentLock = new ReentrantLock();
-    private final ArrayDeque<Segment> pooledSegments = new ArrayDeque<>();
+    private final AtomicInteger allocatedSegments = new AtomicInteger(1);
+    private final AtomicReferenceArray<Cell[]> pooledCells;
 
     private volatile Segment head;
     private volatile Segment tail;
@@ -60,6 +62,7 @@ final class UnboundedTaskQueue implements TaskQueue {
         this.segmentShift = Integer.numberOfTrailingZeros(segmentSize);
         this.segmentMask = segmentSize - 1;
         this.maxPooledSegments = maxPooledSegments;
+        this.pooledCells = new AtomicReferenceArray<>(maxPooledSegments);
         this.segmentFactory = Objects.requireNonNull(segmentFactory, "segmentFactory 不能为空");
         Segment initial = segmentFactory.create(0, segmentSize);
         head = initial;
@@ -112,6 +115,8 @@ final class UnboundedTaskQueue implements TaskQueue {
     @Override
     public void publish(long sequence) {
         Cell cell = cellForClaim(sequence);
+        // type/state/payload 的完整 plain 写先于此 release；只有 acquire 精确读到
+        // 同一绝对 sequence 的 worker/scanner 才能读槽。复用不清除旧 publication。
         PUBLISHED_SEQUENCE.setRelease(cell, sequence);
     }
 
@@ -214,61 +219,58 @@ final class UnboundedTaskQueue implements TaskQueue {
         int target = disposition == OrdinaryDisposition.RETURN
                 ? OrdinaryState.RETURNED.ordinal()
                 : OrdinaryState.DISCARDED.ordinal();
-        segmentLock.lock();
-        try {
-            long first = consumerSequence + 1;
-            Segment segment = head;
-            for (long sequence = first; sequence <= claimedInclusive; sequence++) {
-                long expectedSegmentId = sequence >>> segmentShift;
-                while (segment != null && segment.id < expectedSegmentId) {
-                    segment = segment.next;
-                }
-                if (segment == null || segment.id != expectedSegmentId) {
-                    continue;
-                }
-                Cell cell = segment.cells[(int) sequence & segmentMask];
-                if ((long) PUBLISHED_SEQUENCE.getAcquire(cell) != sequence
-                        || cell.type != TaskType.ORDINARY.ordinal()) {
-                    continue;
-                }
-                Runnable original = cell.ordinary;
-                if (original != null && ORDINARY_STATE.compareAndSet(cell,
-                        OrdinaryState.WAITING.ordinal(), target)) {
-                    sink.accept(sequence, original);
-                }
+        // kernel 已封 admission、drain publishers 并取得静默票据。
+        // 扫描只读稳定链接/游标，只有 WAITING ownership 通过 CAS 改变。
+        long first = consumerSequence + 1;
+        Segment segment = head;
+        for (long sequence = first; sequence <= claimedInclusive; sequence++) {
+            long expectedSegmentId = sequence >>> segmentShift;
+            while (segment != null && segment.id < expectedSegmentId) {
+                segment = segment.next;
             }
-        } finally {
-            segmentLock.unlock();
+            if (segment == null || segment.id != expectedSegmentId) {
+                continue;
+            }
+            Cell cell = segment.cells[(int) sequence & segmentMask];
+            if ((long) PUBLISHED_SEQUENCE.getAcquire(cell) != sequence
+                    || cell.type != TaskType.ORDINARY.ordinal()) {
+                continue;
+            }
+            Runnable original = cell.ordinary;
+            if (original != null && ORDINARY_STATE.compareAndSet(cell,
+                    OrdinaryState.WAITING.ordinal(), target)) {
+                sink.accept(sequence, original);
+            }
         }
     }
 
     @Override
     public QueueSegmentSnapshot segmentSnapshot() {
-        segmentLock.lock();
-        try {
-            return new QueueSegmentSnapshot(allocatedSegments, activeSegments);
-        } finally {
-            segmentLock.unlock();
+        while (true) {
+            Segment first = head;
+            Segment last = tail;
+            int allocated = allocatedSegments.get();
+            // 节点身份永不复用，双读不会 ABA；稳定后精确，并发时允许漏计尚未
+            // 推进 tail 的刚链接段。allocated 还包括池及 producer 独占的候选段。
+            if (first == head && last == tail) {
+                return new QueueSegmentSnapshot(allocated, (int) (last.id - first.id + 1));
+            }
         }
     }
 
     int retainedReferences() {
         int retained = 0;
-        segmentLock.lock();
-        try {
-            Segment segment = head;
-            while (segment != null) {
-                for (Cell cell : segment.cells) {
-                    if (cell.ordinary != null || cell.tracked != null) {
-                        retained++;
-                    }
+        // 诊断仅在静默期调用，与 scanner 一样不参与结构同步。
+        Segment segment = head;
+        while (segment != null) {
+            for (Cell cell : segment.cells) {
+                if (cell.ordinary != null || cell.tracked != null) {
+                    retained++;
                 }
-                segment = segment.next;
             }
-            return retained;
-        } finally {
-            segmentLock.unlock();
+            segment = segment.next;
         }
+        return retained;
     }
 
     private void writeRecord(long sequence, AcceptedTask<?> record, TaskType type) {
@@ -290,42 +292,38 @@ final class UnboundedTaskQueue implements TaskQueue {
 
     private Segment segmentForClaim(long sequence, boolean candidate) {
         long targetId = sequence >>> segmentShift;
-        Segment observedTail = tail;
-        if (observedTail.id == targetId) {
-            return observedTail;
-        }
-        segmentLock.lock();
-        try {
-            // 候选号尚无 publication hole 保护；等锁期间它的段可能已被消费并回收。
+        while (true) {
+            Segment current = tail;
+            if (current.id > targetId) {
+                current = head;
+            }
+            while (current.id < targetId) {
+                Segment next = current.next;
+                if (next == null) {
+                    if (candidate && ledger.candidateSequence() != sequence) {
+                        return null;
+                    }
+                    Segment created = acquireSegment(current.id + 1);
+                    if (NEXT.compareAndSet(current, null, created)) {
+                        next = created;
+                    } else {
+                        recycleSegment(created);
+                        next = current.next;
+                    }
+                }
+                // 链接赢家可以暂停；任何观察到 next 的 producer 都能帮助推进 tail。
+                TAIL.compareAndSet(this, current, next);
+                current = next;
+            }
+            if (current.id == targetId) {
+                // 已提交的占号由 publication hole 保护；候选号即使已过期也只能
+                // 在 ledger CAS 失败后重试，不能触碰 Cell。
+                return current;
+            }
             if (candidate && ledger.candidateSequence() != sequence) {
                 return null;
             }
-            Segment current = tail;
-            while (current.id < targetId) {
-                Segment next = acquireSegment(current.id + 1);
-                current.next = next;
-                current = next;
-                tail = current;
-                activeSegments++;
-            }
-            return current.id == targetId ? current : findFromHeadLocked(targetId);
-        } finally {
-            segmentLock.unlock();
         }
-    }
-
-    private Segment findFromHeadLocked(long targetId) {
-        Segment segment = head;
-        while (segment.id < targetId) {
-            segment = segment.next;
-            if (segment == null) {
-                throw new IllegalStateException("claim sequence 对应的 segment 不存在");
-            }
-        }
-        if (segment.id != targetId) {
-            throw new IllegalStateException("claim sequence 落后于已回收 segment");
-        }
-        return segment;
     }
 
     private Segment segmentForConsumer(long sequence) {
@@ -337,43 +335,52 @@ final class UnboundedTaskQueue implements TaskQueue {
         if (current.id > targetId) {
             throw new IllegalStateException("consumer sequence 落后于 head segment");
         }
-        segmentLock.lock();
-        try {
-            current = head;
-            while (current.id < targetId) {
-                Segment next = current.next;
-                if (next == null) {
-                    return null;
-                }
-                head = next;
-                activeSegments--;
-                recycleSegment(current);
-                current = next;
+        // poll 只有在 currentCell 已 release 后才进入此处；唯一 consumer 已顺序
+        // 释放整段所有槽。段链接后永不改写，关闭 scanner 可沿旧 head 安全遍历；
+        // gate 排空 producer 后，回收到池中的 Cell[] 也不会在扫描期间再次分配。
+        while (current.id < targetId) {
+            Segment next = current.next;
+            if (next == null) {
+                return null;
             }
-            return current.id == targetId ? current : null;
-        } finally {
-            segmentLock.unlock();
+            TAIL.compareAndSet(this, current, next);
+            head = next;
+            recycleSegment(current);
+            current = next;
         }
+        return current.id == targetId ? current : null;
     }
 
     private Segment acquireSegment(long id) {
-        Segment segment = pooledSegments.pollFirst();
-        if (segment == null) {
-            Segment created = segmentFactory.create(id, segmentSize);
-            allocatedSegments++;
-            return created;
+        for (int index = 0; index < maxPooledSegments; index++) {
+            Cell[] cells = pooledCells.getAndSet(index, null);
+            if (cells != null) {
+                try {
+                    // 只复用 Cell 存储，节点的 id/身份和已链接 next 永不复用或改写。
+                    return new Segment(id, cells);
+                } catch (Throwable failure) {
+                    recycleCells(cells);
+                    throw failure;
+                }
+            }
         }
-        segment.reset(id);
-        return segment;
+        Segment created = segmentFactory.create(id, segmentSize);
+        allocatedSegments.incrementAndGet();
+        return created;
     }
 
     private void recycleSegment(Segment segment) {
-        segment.next = null;
-        if (pooledSegments.size() < maxPooledSegments) {
-            pooledSegments.addFirst(segment);
-        } else {
-            allocatedSegments--;
+        recycleCells(segment.cells);
+    }
+
+    private void recycleCells(Cell[] cells) {
+        for (int index = 0; index < maxPooledSegments; index++) {
+            // CAS release 传递 worker 清槽；getAndSet acquire 唯一取得存储所有权。
+            if (pooledCells.compareAndSet(index, null, cells)) {
+                return;
+            }
         }
+        allocatedSegments.decrementAndGet();
     }
 
     private Cell current() {
@@ -396,7 +403,7 @@ final class UnboundedTaskQueue implements TaskQueue {
     }
 
     static final class Segment {
-        private long id;
+        private final long id;
         private final Cell[] cells;
         private volatile Segment next;
 
@@ -408,16 +415,9 @@ final class UnboundedTaskQueue implements TaskQueue {
             }
         }
 
-        private void reset(long id) {
+        private Segment(long id, Cell[] cells) {
             this.id = id;
-            this.next = null;
-            for (Cell cell : cells) {
-                cell.type = EMPTY;
-                cell.ordinaryState = OrdinaryState.TERMINAL.ordinal();
-                cell.ordinary = null;
-                cell.tracked = null;
-                cell.publishedSequence = UNPUBLISHED;
-            }
+            this.cells = cells;
         }
     }
 
@@ -428,4 +428,5 @@ final class UnboundedTaskQueue implements TaskQueue {
         private AcceptedTask<?> tracked;
         private volatile long publishedSequence = UNPUBLISHED;
     }
+
 }

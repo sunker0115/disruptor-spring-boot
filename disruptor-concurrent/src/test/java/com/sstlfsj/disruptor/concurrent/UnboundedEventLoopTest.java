@@ -1,16 +1,108 @@
 package com.sstlfsj.disruptor.concurrent;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.OptionalLong;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class UnboundedEventLoopTest {
+
+    @ParameterizedTest
+    @ValueSource(strings = {"poll", "advanceConsumer"})
+    void shutdownScannerUsesSlotOwnershipWhileWorkerIsPausedInsideQueueAccess(String pausedMethod)
+            throws Exception {
+        UnboundedEventLoop loop = EventLoopBuilder.unbounded("scanner-quiescence", 1)
+                .maxPooledSegments(0)
+                .build();
+        CountDownLatch running = new CountDownLatch(1);
+        CountDownLatch finishRunning = new CountDownLatch(1);
+        CountDownLatch pollEntered = new CountDownLatch(1);
+        CountDownLatch allowPoll = new CountDownLatch(1);
+        CountDownLatch scannerEntered = new CountDownLatch(1);
+        CountDownLatch scannerFinished = new CountDownLatch(1);
+        AtomicBoolean interceptPoll = new AtomicBoolean();
+
+        Field kernelField = AbstractEventLoop.class.getDeclaredField("kernel");
+        kernelField.setAccessible(true);
+        Object kernel = kernelField.get(loop);
+        Field queueField = kernel.getClass().getDeclaredField("queue");
+        queueField.setAccessible(true);
+        Object queue = queueField.get(kernel);
+        Class<?> queueType = queueField.getType();
+        // 只插入调度屏障；claim、publication、poll、回收和扫描均委托真实队列。
+        queueField.set(kernel, Proxy.newProxyInstance(queueType.getClassLoader(),
+                new Class<?>[]{queueType}, (proxy, method, arguments) -> {
+                    method.setAccessible(true);
+                    boolean delayedPoll = method.getName().equals(pausedMethod)
+                            && interceptPoll.compareAndSet(true, false);
+                    if (delayedPoll) {
+                        pollEntered.countDown();
+                        awaitIgnoringInterrupt(allowPoll);
+                    }
+                    boolean scanning = method.getName().equals("scanOrdinaryUnstarted");
+                    if (scanning) {
+                        scannerEntered.countDown();
+                    }
+                    try {
+                        return method.invoke(queue, arguments);
+                    } catch (InvocationTargetException failure) {
+                        throw failure.getCause();
+                    } finally {
+                        if (scanning) {
+                            scannerFinished.countDown();
+                        }
+                    }
+                }));
+
+        var shutdownCaller = Executors.newSingleThreadExecutor();
+        try {
+            loop.start().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            loop.execute(() -> {
+                running.countDown();
+                awaitIgnoringInterrupt(finishRunning);
+            });
+            assertTrue(running.await(2, TimeUnit.SECONDS));
+            loop.execute(() -> { });
+            loop.execute(() -> { });
+            interceptPoll.set(true);
+            finishRunning.countDown();
+            assertTrue(pollEntered.await(2, TimeUnit.SECONDS));
+            // worker 此时已通过 canProcessTasks，尚未执行真实 poll。
+            var shutdown = shutdownCaller.submit(loop::shutdownNow);
+            awaitCondition(loop::isShutdown);
+            try {
+                assertTrue(scannerEntered.await(2, TimeUnit.SECONDS),
+                        "publisher 排空后 scanner 不应等待 worker 的逐任务静默票据");
+                assertTrue(scannerFinished.await(2, TimeUnit.SECONDS),
+                        "不可变段链上的 scanner 应能在 worker 暂停时独立完成");
+            } finally {
+                allowPoll.countDown();
+            }
+            int expectedReturned = pausedMethod.equals("poll") ? 2 : 1;
+            assertEquals(expectedReturned, shutdown.get(2, TimeUnit.SECONDS).size(),
+                    "槽位 WAITING/RUNNING CAS 必须精确决定 shutdownNow 所有权");
+        } finally {
+            finishRunning.countDown();
+            allowPoll.countDown();
+            loop.shutdownNow();
+            assertTrue(loop.awaitTermination(2, TimeUnit.SECONDS));
+            shutdownCaller.shutdownNow();
+            assertTrue(shutdownCaller.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
 
     @Test
     void builderRequiresPowerOfTwoSegmentSize() {
@@ -129,6 +221,20 @@ class UnboundedEventLoopTest {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(interrupted);
+        }
+    }
+
+    private static void awaitIgnoringInterrupt(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (latch.getCount() != 0) {
+            try {
+                latch.await();
+            } catch (InterruptedException ignored) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

@@ -10,7 +10,9 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -18,9 +20,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -268,31 +269,30 @@ class TaskQueueContractTest {
     }
 
     @Test
-    void uncommittedCandidateRetriesAfterItsSegmentWasConsumedWhileWaitingForLock()
+    void uncommittedCandidateRetriesAfterItsSegmentWasConsumedDuringAllocation()
             throws Exception {
-        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 0);
+        CountDownLatch allocating = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicBoolean delay = new AtomicBoolean(true);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 0, (id, size) -> {
+            if (id == 1 && delay.compareAndSet(true, false)) {
+                allocating.countDown();
+                await(resume);
+            }
+            return new UnboundedTaskQueue.Segment(id, size);
+        });
         publishOrdinary(queue);
-        ReentrantLock lifecycleLock = segmentLifecycleLock(queue);
         ExecutorService producer = Executors.newSingleThreadExecutor();
         try {
-            Future<Long> delayedClaim;
-            lifecycleLock.lock();
-            try {
-                delayedClaim = producer.submit(queue::tryClaim);
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-                while (!lifecycleLock.hasQueuedThreads()) {
-                    assertTrue(System.nanoTime() < deadline, "producer 应在占号前等待段锁");
-                    Thread.onSpinWait();
-                }
-                assertEquals(0, queue.claimedCursor());
-                publishOrdinary(queue);
-                publishOrdinary(queue);
-                consumeOrdinaries(queue, 3);
-                assertFalse(queue.poll());
-                assertEquals(new QueueSegmentSnapshot(1, 1), queue.segmentSnapshot());
-            } finally {
-                lifecycleLock.unlock();
-            }
+            Future<Long> delayedClaim = producer.submit(queue::tryClaim);
+            assertTrue(allocating.await(2, TimeUnit.SECONDS));
+            assertEquals(0, queue.claimedCursor());
+            publishOrdinary(queue);
+            publishOrdinary(queue);
+            consumeOrdinaries(queue, 3);
+            assertFalse(queue.poll());
+            assertEquals(new QueueSegmentSnapshot(1, 1), queue.segmentSnapshot());
+            resume.countDown();
             long sequence = delayedClaim.get(2, TimeUnit.SECONDS);
             assertEquals(3, sequence);
             queue.writeOrdinary(sequence, new SequencedRunnable(sequence));
@@ -300,9 +300,153 @@ class TaskQueueContractTest {
             consumeOrdinaries(queue, 1);
             assertEquals(0, queue.pending());
         } finally {
+            resume.countDown();
             producer.shutdownNow();
             assertTrue(producer.awaitTermination(2, TimeUnit.SECONDS));
         }
+    }
+
+    @Test
+    void stalledExpansionDoesNotBlockAWinnerOrLinkIntoARecycledGeneration() throws Exception {
+        CountDownLatch allocating = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicBoolean delay = new AtomicBoolean(true);
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 1, (id, size) -> {
+            if (id == 1 && delay.compareAndSet(true, false)) {
+                allocating.countDown();
+                await(resume);
+            }
+            return new UnboundedTaskQueue.Segment(id, size);
+        });
+        publishOrdinary(queue);
+        ExecutorService producers = Executors.newFixedThreadPool(2);
+        try {
+            Future<SequencedRunnable> delayed = producers.submit(() -> publishOrdinary(queue));
+            assertTrue(allocating.await(2, TimeUnit.SECONDS));
+            Future<?> winner = producers.submit(() -> {
+                assertEquals(1, publishOrdinary(queue).sequence());
+                assertEquals(2, publishOrdinary(queue).sequence());
+            });
+            try {
+                winner.get(1, TimeUnit.SECONDS);
+                assertEquals(3, queue.segmentSnapshot().active(),
+                        "同一目标段只允许一个链接赢家");
+                consumeOrdinaries(queue, 3);
+                assertFalse(queue.poll());
+                // 回收旧扩段起点，并复用其 Cell；延迟 CAS 不得写入新代的 next。
+                assertEquals(3, publishOrdinary(queue).sequence());
+                consumeOrdinaries(queue, 1);
+            } finally {
+                resume.countDown();
+            }
+            assertEquals(4, delayed.get(2, TimeUnit.SECONDS).sequence());
+            assertTrue(queue.poll());
+            assertEquals(4, ((SequencedRunnable) queue.currentOrdinary()).sequence());
+            finishCurrentOrdinary(queue);
+            assertFalse(queue.poll());
+            assertEquals(0, queue.pending());
+            assertEquals(0, queue.retainedReferences());
+            assertEquals(new QueueSegmentSnapshot(2, 1), queue.segmentSnapshot());
+        } finally {
+            resume.countDown();
+            producers.shutdownNow();
+            assertTrue(producers.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = OrdinaryState.class, names = {"RETURNED", "DISCARDED", "TERMINAL"})
+    void recyclingPreservesTheOldAbsolutePublicationUntilTheNewRelease(OrdinaryState oldState)
+            throws Exception {
+        AtomicReference<UnboundedTaskQueue.Segment> first = new AtomicReference<>();
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 1, (id, size) -> {
+            var segment = new UnboundedTaskQueue.Segment(id, size);
+            first.compareAndSet(null, segment);
+            return segment;
+        });
+        publishOrdinary(queue);
+        if (oldState != OrdinaryState.TERMINAL) {
+            queue.scanOrdinaryUnstarted(0, oldState == OrdinaryState.RETURNED
+                    ? OrdinaryDisposition.RETURN : OrdinaryDisposition.DISCARD,
+                    (sequence, task) -> { });
+        }
+        assertTrue(queue.poll());
+        if (oldState == OrdinaryState.TERMINAL) {
+            assertTrue(queue.tryStartCurrentOrdinary());
+            queue.terminalizeCurrentOrdinary();
+        }
+        queue.advanceConsumer();
+        queue.releaseCurrentSlot();
+        publishOrdinary(queue);
+        consumeOrdinaries(queue, 1);
+        long reused = queue.tryClaim();
+        Field cells = UnboundedTaskQueue.Segment.class.getDeclaredField("cells");
+        cells.setAccessible(true);
+        Object cell = ((Object[]) cells.get(first.get()))[0];
+        Field published = cell.getClass().getDeclaredField("publishedSequence");
+        published.setAccessible(true);
+        assertEquals(0, published.getLong(cell), "复用不得逐 Cell 清零 publication");
+        assertFalse(queue.poll());
+        queue.writeOrdinary(reused, new SequencedRunnable(reused));
+        assertFalse(queue.poll());
+        queue.publish(reused);
+        assertEquals(reused, published.getLong(cell), "必须复用原 Cell 存储并发布新绝对代际");
+        consumeOrdinaries(queue, 1);
+    }
+
+    @Test
+    void fullFixedPoolDropsSurplusSegmentsAndKeepsOneActiveSegment() {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 1);
+        for (int round = 0; round < 8; round++) {
+            for (int index = 0; index < 32; index++) {
+                publishOrdinary(queue);
+                var snapshot = queue.segmentSnapshot();
+                assertTrue(snapshot.allocated() >= snapshot.active());
+                assertTrue(snapshot.active() >= 1);
+            }
+            consumeOrdinaries(queue, 32);
+            assertFalse(queue.poll());
+            assertEquals(new QueueSegmentSnapshot(2, 1), queue.segmentSnapshot());
+            assertEquals(0, queue.retainedReferences());
+        }
+    }
+
+    @Test
+    void stableChainDoubleScannerHasExactlyOneWaitingOwnershipWinner() throws Exception {
+        UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 1);
+        for (int index = 0; index < 128; index++) {
+            publishOrdinary(queue);
+        }
+        QueueSegmentSnapshot before = queue.segmentSnapshot();
+        Set<Long> claimed = ConcurrentHashMap.newKeySet();
+        CountDownLatch start = new CountDownLatch(1);
+        try (ExecutorService scanners = Executors.newFixedThreadPool(2)) {
+            List<Future<?>> scans = new ArrayList<>();
+            for (OrdinaryDisposition disposition : OrdinaryDisposition.values()) {
+                scans.add(scanners.submit(() -> {
+                    await(start);
+                    queue.scanOrdinaryUnstarted(127, disposition, (sequence, task) -> {
+                        assertEquals(sequence, ((SequencedRunnable) task).sequence());
+                        assertTrue(claimed.add(sequence));
+                    });
+                }));
+            }
+            start.countDown();
+            for (Future<?> scan : scans) {
+                scan.get(2, TimeUnit.SECONDS);
+            }
+        }
+        assertEquals(128, claimed.size());
+        assertEquals(-1, queue.consumerCursor(), "scanner 不推进消费者游标");
+        assertEquals(before, queue.segmentSnapshot(), "scanner 不回收或改变链");
+        for (int index = 0; index < 128; index++) {
+            assertTrue(queue.poll());
+            assertFalse(queue.tryStartCurrentOrdinary());
+            queue.advanceConsumer();
+            queue.releaseCurrentSlot();
+        }
+        assertFalse(queue.poll());
+        assertEquals(0, queue.retainedReferences());
     }
 
     @Test
@@ -342,35 +486,41 @@ class TaskQueueContractTest {
     }
 
     @Test
-    void unboundedDelayedProducerLookupIsProtectedBySegmentLifecycleLock() throws Exception {
+    void unboundedDelayedProducerHoleProtectsItsGenerationWhileHeadAdvances() throws Exception {
         UnboundedTaskQueue queue = new UnboundedTaskQueue(1, 8);
         publishOrdinary(queue);
         long delayed = queue.tryClaim();
         SequencedRunnable delayedTask = new SequencedRunnable(delayed);
         SequencedRunnable aheadTask = publishOrdinary(queue);
-        ReentrantLock lifecycleLock = segmentLifecycleLock(queue);
         ExecutorService producer = Executors.newSingleThreadExecutor();
         CountDownLatch writeStarted = new CountDownLatch(1);
+        CountDownLatch resumeWrite = new CountDownLatch(1);
         try {
-            Future<?> delayedWrite;
-            lifecycleLock.lock();
-            try {
-                delayedWrite = producer.submit(() -> {
-                    writeStarted.countDown();
-                    queue.writeOrdinary(delayed, delayedTask);
-                });
-                assertTrue(writeStarted.await(1, TimeUnit.SECONDS));
-                Future<?> blockedWrite = delayedWrite;
-                assertThrows(TimeoutException.class,
-                        () -> blockedWrite.get(200, TimeUnit.MILLISECONDS));
-            } finally {
-                lifecycleLock.unlock();
-            }
+            Future<?> delayedWrite = producer.submit(() -> {
+                writeStarted.countDown();
+                await(resumeWrite);
+                queue.writeOrdinary(delayed, delayedTask);
+                queue.publish(delayed);
+            });
+            assertTrue(writeStarted.await(1, TimeUnit.SECONDS));
+            assertTrue(queue.poll());
+            assertTrue(queue.tryStartCurrentOrdinary());
+            queue.advanceConsumer();
+            publishOrdinary(queue);
+            assertEquals(4, queue.segmentSnapshot().active(),
+                    "advance 尚未 release 时整段不能回收");
+            queue.terminalizeCurrentOrdinary();
+            queue.releaseCurrentSlot();
+            assertFalse(queue.poll());
+            assertEquals(3, queue.segmentSnapshot().active(),
+                    "head 已进入 publication hole 所在段，不能回收该代");
+            resumeWrite.countDown();
             delayedWrite.get(1, TimeUnit.SECONDS);
-            queue.publish(delayed);
             consumeOrdinaries(queue, 3);
             assertEquals(2, aheadTask.sequence());
+            assertEquals(0, queue.retainedReferences());
         } finally {
+            resumeWrite.countDown();
             producer.shutdownNow();
         }
     }
@@ -382,7 +532,7 @@ class TaskQueueContractTest {
         UnboundedTaskQueue queue = new UnboundedTaskQueue(4, 8);
         ExecutorService producers = Executors.newFixedThreadPool(producerCount);
         try {
-            for (int round = 0; round < 16; round++) {
+            for (int round = 0; round < 128; round++) {
                 // 已发布前缀允许 head 前进；下一段首槽由落后 producer 持有。
                 long prefix = queue.claimedCursor() + 1;
                 for (int index = 0; index < 4; index++) {
@@ -394,15 +544,16 @@ class TaskQueueContractTest {
                 CountDownLatch resumeHole = new CountDownLatch(1);
                 List<Future<?>> publications = new ArrayList<>();
                 for (int producer = 0; producer < producerCount; producer++) {
+                    long seed = 31L * round + producer;
                     publications.add(producers.submit(() -> {
                         assertTrue(start.await(2, TimeUnit.SECONDS));
-                        long[] claims = new long[8];
-                        for (int index = 0; index < claims.length; index++) {
-                            claims[index] = queue.tryClaim();
+                        List<Long> claims = new ArrayList<>();
+                        for (int index = 0; index < 8; index++) {
+                            claims.add(queue.tryClaim());
                         }
+                        Collections.shuffle(claims, new Random(seed));
                         boolean holdsHole = false;
-                        for (int index = claims.length - 1; index >= 0; index--) {
-                            long sequence = claims[index];
+                        for (long sequence : claims) {
                             if (sequence == hole) {
                                 holdsHole = true;
                             } else {
@@ -492,7 +643,7 @@ class TaskQueueContractTest {
     }
 
     @Test
-    void unboundedDoubleScannerAndConsumerDoNotUseRecycledSegments() throws Exception {
+    void unboundedDoubleScannerExcludesRunningSlotBeforeConsumerRecyclesSegments() throws Exception {
         UnboundedTaskQueue queue = new UnboundedTaskQueue(2, 8);
         int total = 128;
         for (int index = 0; index < total; index++) {
@@ -500,42 +651,34 @@ class TaskQueueContractTest {
         }
         long frozen = queue.claimedCursor();
         Set<Long> claimed = ConcurrentHashMap.newKeySet();
+        assertTrue(queue.poll());
+        assertTrue(queue.tryStartCurrentOrdinary());
+        assertTrue(claimed.add(0L));
+        queue.advanceConsumer();
         CountDownLatch start = new CountDownLatch(1);
         Runnable scan = () -> {
             await(start);
             queue.scanOrdinaryUnstarted(frozen, OrdinaryDisposition.RETURN,
                     (sequence, task) -> assertTrue(claimed.add(sequence)));
         };
-        ExecutorService racers = Executors.newFixedThreadPool(3);
+        ExecutorService racers = Executors.newFixedThreadPool(2);
         try {
             Future<?> firstScanner = racers.submit(scan);
             Future<?> secondScanner = racers.submit(scan);
-            Future<?> consumer = racers.submit(() -> {
-                await(start);
-                int consumed = 0;
-                while (consumed < total) {
-                    if (!queue.poll()) {
-                        Thread.onSpinWait();
-                        continue;
-                    }
-                    long sequence = ((SequencedRunnable) queue.currentOrdinary()).sequence();
-                    if (queue.tryStartCurrentOrdinary()) {
-                        assertTrue(claimed.add(sequence));
-                    }
-                    OrdinaryState state = queue.currentOrdinaryState();
-                    queue.advanceConsumer();
-                    if (state == OrdinaryState.RUNNING) {
-                        queue.terminalizeCurrentOrdinary();
-                    }
-                    queue.releaseCurrentSlot();
-                    consumed++;
-                }
-            });
-
             start.countDown();
             firstScanner.get(5, TimeUnit.SECONDS);
             secondScanner.get(5, TimeUnit.SECONDS);
-            consumer.get(5, TimeUnit.SECONDS);
+            assertEquals(OrdinaryState.RUNNING, queue.currentOrdinaryState());
+            queue.terminalizeCurrentOrdinary();
+            queue.releaseCurrentSlot();
+            for (int index = 1; index < total; index++) {
+                assertTrue(queue.poll());
+                assertEquals(OrdinaryState.RETURNED, queue.currentOrdinaryState());
+                assertFalse(queue.tryStartCurrentOrdinary());
+                queue.advanceConsumer();
+                queue.releaseCurrentSlot();
+            }
+            assertFalse(queue.poll());
             assertEquals(total, claimed.size());
             QueueSegmentSnapshot segments = queue.segmentSnapshot();
             assertEquals(1, segments.active());
@@ -622,13 +765,6 @@ class TaskQueueContractTest {
             return bounded.retainedReferences();
         }
         return ((UnboundedTaskQueue) queue).retainedReferences();
-    }
-
-    private static ReentrantLock segmentLifecycleLock(UnboundedTaskQueue queue)
-            throws ReflectiveOperationException {
-        Field field = UnboundedTaskQueue.class.getDeclaredField("segmentLock");
-        field.setAccessible(true);
-        return (ReentrantLock) field.get(queue);
     }
 
     private static void await(CountDownLatch latch) {
