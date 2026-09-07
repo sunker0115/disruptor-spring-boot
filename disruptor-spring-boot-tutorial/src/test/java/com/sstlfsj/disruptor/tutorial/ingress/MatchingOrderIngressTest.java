@@ -9,6 +9,7 @@ import com.sstlfsj.disruptor.core.PipelineSpec;
 import com.sstlfsj.disruptor.tutorial.config.MatchConfig;
 import com.sstlfsj.disruptor.tutorial.dto.PlaceOrderRequest;
 import com.sstlfsj.disruptor.tutorial.match.Side;
+import com.sstlfsj.disruptor.tutorial.pipeline.MatchingPipeline;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
 import org.junit.jupiter.api.Test;
 
@@ -42,7 +43,7 @@ class MatchingOrderIngressTest {
         CountDownLatch consumed = new CountDownLatch(orderCount);
         Set<Long> consumedOrderIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
         PipelineSpec<OrderEvent> spec = PipelineSpec.builder(
-                        "matching", OrderEvent.class, OrderEvent::new)
+                        MatchingPipeline.PIPELINE_NAME, OrderEvent.class, OrderEvent::new)
                 .bufferSize(64)
                 .producerType(ProducerType.SINGLE)
                 .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {

@@ -31,6 +31,12 @@ import java.util.List;
 @RequiredArgsConstructor
 public class MatchingPipeline {
 
+    /**
+     * 管道注册名。PipelineSpec 构建与各 {@code runtime.require(...)} 引用共用同一常量，
+     * 避免字符串散落导致改名漏改；yml 的 {@code disruptor.pipelines.<name>} 键与此保持一致。
+     */
+    public static final String PIPELINE_NAME = "matching";
+
     private static final Logger log = LoggerFactory.getLogger(MatchingPipeline.class);
 
     private final MatchEngine engine;
@@ -40,7 +46,7 @@ public class MatchingPipeline {
 
     @Bean
     public PipelineSpec<OrderEvent> matchingPipelineSpec() {
-        return PipelineSpec.builder("matching", OrderEvent.class, OrderEvent::new)
+        return PipelineSpec.builder(PIPELINE_NAME, OrderEvent.class, OrderEvent::new)
                 .producerType(ProducerType.SINGLE)
                 .topology(disruptor -> disruptor
                         .handleEventsWith((event, sequence, endOfBatch) -> match(event))

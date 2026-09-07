@@ -4,6 +4,7 @@ import com.sstlfsj.disruptor.concurrent.EventLoop;
 import com.sstlfsj.disruptor.concurrent.EventLoopBuilder;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.tutorial.match.MatchEngine;
+import com.sstlfsj.disruptor.tutorial.pipeline.MatchingPipeline;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -25,7 +26,7 @@ public class MatchConfig {
      */
     @Bean(destroyMethod = "")
     public EventLoop matchingOrderIngressEventLoop(DisruptorRuntime runtime) {
-        int capacity = runtime.require("matching", OrderEvent.class)
+        int capacity = runtime.require(MatchingPipeline.PIPELINE_NAME, OrderEvent.class)
                 .unsafeRingBuffer()
                 .getBufferSize();
         return EventLoopBuilder.bounded("matching-order-ingress", capacity).build();

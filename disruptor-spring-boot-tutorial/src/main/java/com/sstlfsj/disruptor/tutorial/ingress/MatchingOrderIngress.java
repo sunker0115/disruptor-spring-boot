@@ -6,6 +6,7 @@ import com.sstlfsj.disruptor.autoconfigure.DisruptorLifecycle;
 import com.sstlfsj.disruptor.concurrent.EventLoop;
 import com.sstlfsj.disruptor.core.DisruptorRuntime;
 import com.sstlfsj.disruptor.tutorial.dto.PlaceOrderRequest;
+import com.sstlfsj.disruptor.tutorial.pipeline.MatchingPipeline;
 import com.sstlfsj.disruptor.tutorial.pipeline.OrderEvent;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
@@ -52,7 +53,8 @@ public final class MatchingOrderIngress implements SmartLifecycle {
         this.publisher = Objects.requireNonNull(
                 matchingOrderIngressEventLoop, "matchingOrderIngressEventLoop 不能为空");
         this.runtime = runtime;
-        this.ringBuffer = runtime.require("matching", OrderEvent.class).unsafeRingBuffer();
+        this.ringBuffer = runtime.require(MatchingPipeline.PIPELINE_NAME, OrderEvent.class)
+                .unsafeRingBuffer();
         this.phase = ingressPhase(runtimeLifecycle.getPhase());
     }
 
