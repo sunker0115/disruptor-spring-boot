@@ -118,8 +118,8 @@ java -jar disruptor-benchmarks/target/benchmarks.jar \
   com.sstlfsj.disruptor.benchmark.EventLoopBenchmark -f 5 -wi 4 -i 8
 ```
 
-`boundedEventLoop`/`unboundedEventLoop` 取 3 次独立运行的中位；三条参照路径为同机
-一次 40 次迭代的干净运行：
+上一轮段锁版正式基线：`boundedEventLoop`/`unboundedEventLoop` 取 3 次独立运行的中位；
+三条参照路径为同机一次 40 次迭代的干净运行：
 
 | 基准 | 吞吐 ops/s |
 | --- | ---: |
@@ -163,12 +163,13 @@ Commons 侧同为一次 40 次迭代的干净运行（方差极低，误差约 �
 | `CommonsEventLoopBenchmark.commonsBoundedEventLoop` | 18,589,910.272 |
 | `CommonsEventLoopBenchmark.commonsUnboundedEventLoop` | 18,381,694.231 |
 
-相对门槛判定（本项目中位 ÷ Commons）：
+上一轮段锁版正式基线判定（3 次干净中位 ÷ 同机 Commons）：该表记录改造前代码，
+无锁化后的复测不属干净 3 次中位、不作门槛判定，见下方吞吐段。
 
 | 路径 | 本项目中位 | Commons | 相对比 | ≥80% |
 | --- | ---: | ---: | ---: | :---: |
-| bounded | 14,867,520 | 18,589,910 | 80.0% | 通过 |
-| unbounded | 11,639,896 | 18,381,694 | 63.3% | 未达 |
+| bounded（段锁前） | 14,867,520 | 18,589,910 | 80.0% | 通过 |
+| unbounded（段锁前） | 11,639,896 | 18,381,694 | 63.3% | 未达 |
 
 额外使用 `-prof gc` 的分配诊断（框架自身 B/op）：
 
