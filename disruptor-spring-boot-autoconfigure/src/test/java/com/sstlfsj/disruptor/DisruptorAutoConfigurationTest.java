@@ -113,6 +113,7 @@ class DisruptorAutoConfigurationTest {
         CountDownLatch succeeded = new CountDownLatch(2);
         contextRunner.withBean("faulty", PipelineSpec.class, () -> PipelineSpec
                         .builder("faulty", TestEvent.class, TestEvent::new)
+                        .threadFactory(runnable -> supervisedTestThread(runnable, "disruptor-faulty-1"))
                         .topology(disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
                             if ("boom".equals(event.value)) {
                                 throw new IllegalStateException("boom");
@@ -410,6 +411,13 @@ class DisruptorAutoConfigurationTest {
             builder.bufferSize(bufferSize);
         }
         return builder.build();
+    }
+
+    private static Thread supervisedTestThread(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        // 故障已通过 Runtime 行为断言，避免预期传播重复写入 CI 注解。
+        thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+        return thread;
     }
 
     static final class TestEvent {

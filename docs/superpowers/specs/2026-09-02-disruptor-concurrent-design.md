@@ -253,11 +253,11 @@ worker 循环固定为：
 
 ### TaskAdmissionGate
 
-`TaskAdmissionGate` 同时拥有生命周期 gate 和逻辑容量账本；`TaskQueue` 只拥有物理存储与游标。bounded gate 将 lifecycle、outstanding 和 active publisher 打包在一个 `AtomicLong`：`[63:62]` 为 `NEW/OPEN/CLOSED`，`[61:31]` 为 outstanding，`[30:0]` 为 active publisher。`tryEnter()` 的单次 CAS 同时校验 `OPEN` 与 `outstanding < capacity`，然后增加 publisher 与 outstanding；满容量直接拒绝，不 claim，也不写 tombstone。unbounded 使用相同 lifecycle/publisher word，但 outstanding 采用独立 64 位计数器，因此没有隐藏的 31 位容量上限。`open()` 仅能 `NEW → OPEN`，`CLOSED` 不可逆；`awaitDrained()` 等待 active publisher 归零，不执行用户代码。
+`TaskAdmissionGate` 同时拥有生命周期 gate 和逻辑容量账本；`TaskQueue` 只拥有物理存储与游标。bounded gate 将 lifecycle、outstanding 和 active publisher 打包在一个 `AtomicLong`：`[63:62]` 为 `NEW/OPEN/CLOSED`，`[61:31]` 为 outstanding，`[30:0]` 为 active publisher。`tryEnter()` 的单次 CAS 同时校验 `OPEN` 与 `outstanding < capacity`，然后增加 publisher 与 outstanding；满容量直接拒绝，不 claim，也不写 tombstone。unbounded 使用相同 lifecycle/publisher word，并由 queue 与 gate 共享 `UnboundedTaskLedger`：claim CAS 增加 64 位 claimed，worker 物理完成推进单写者 completed，claim 后失败通过 rolledBack 扣除，因此没有隐藏的 31 位容量上限或第二条正常提交计数链。`open()` 仅能 `NEW → OPEN`，`CLOSED` 不可逆；`awaitDrained()` 等待 active publisher 归零，不执行用户代码。
 
 提交采用 claim/write/publish 三阶段和三层 `finally`：先 `tryEnter()`，再 claim 槽；ordinary 仅写入预分配槽的原始 `Runnable`，不创建 Future、记录或 registry 项；tracked/scheduled 才创建 `AcceptedTask` 并登记 tracked-only index。内层失败时，已 claim 的槽写 `TOMBSTONE`，已登记的记录无异常地终态化并移除；中层保证已 claim 的槽一定 publish，最外层保证 gate 一定 leave。`leave(rollbackOutstanding)` 以提交是否成功决定是否在同一账本中回滚 outstanding；因此 claim 失败也不会泄漏容量，正常过载不产生 tombstone。非 tombstone publish 是 accepted 的线性化点，active publisher 清零后关闭方才冻结 accepted 集。
 
-Group child 的局部 gate enter 后才读取 parent `accepting`，读取 false 即走上述 rollback；独立 loop 视 parent 恒为 accepting。成功 enter 后不二次检查关闭状态，已进入的发布完成其 publish 并归入冻结集。outstanding 从 enter 覆盖到 worker 物理清理：入口、timer heap 和 executing 都占用；取消 running task 不提前释放，延迟 timer 也持续占用容量。
+Group child 的局部 gate enter 后才读取 parent `accepting`，读取 false 即走上述 rollback；独立 loop 视 parent 恒为 accepting。成功 enter 后不二次检查关闭状态，已进入的发布完成其 publish 并归入冻结集。bounded outstanding 从 enter 开始计数，unbounded outstanding 从成功 claim 开始计数；两者都覆盖到 worker 物理清理，因此入口、timer heap 和 executing 都占用。取消 running task 不提前释放，延迟 timer 也持续占用容量。
 
 ### AcceptedTaskRegistry
 
@@ -269,7 +269,7 @@ registry 只保存 tracked/scheduled 的 accepted task，按 accepted sequence �
 
 `BoundedTaskQueue` 使用 LMAX 多生产者 `RingBuffer<Cell>`，容量为 2 的幂。多生产者可以先发布 `N+1` 而 `N` 尚未发布，消费者只能前进连续已发布前缀，遇洞即停。ordinary 在 `WAITING → RUNNING` 后推进 `consumerSequence`，执行、`TERMINAL`、清槽后才推进用于复用的 `gatingSequence`；tracked/scheduled 读取外部记录后可提前清槽并同时推进两个游标。容量不属于 queue，而由 gate 的 outstanding 保证 timer 离开入口后不会错误放大总容量。
 
-`UnboundedTaskQueue` 使用分段 MPSC typed 槽队列，segment 为固定 2 的幂；生产者按全局 sequence 定位 segment/offset，单消费者同样只前进连续发布前缀。段可回收到空闲池：每槽以 release/acquire `publishedSequence` 区分复用代际，复用前清空 payload/state；scanner 在段生命周期锁下捕获并遍历，worker 仅在跨段 unlink/recycle 时取同一把锁，避免回收竞态。池最多保留 `maxPooledSegments` 个空闲段，默认 `8`，`0` 禁用池化，超限段交给 GC。快照报告 `allocatedQueueSegments`（活跃加池中）与 `activeQueueSegments`（活跃），并保持 active 不大于 allocated。无界仍通过同一个 gate 如实记录 64 位 outstanding，但不以容量拒绝任务。
+`UnboundedTaskQueue` 使用分段 MPSC typed 槽队列，segment 为固定 2 的幂；生产者在可失败的段分配完成后以 CAS 提交全局 sequence，按 sequence 定位 segment/offset，并通过 CAS 链接新段、协助推进 tail；单消费者只前进连续发布前缀并推进 head。段节点的 id、身份和 next 永不复用，空闲池只保存固定容量的 `Cell[]`；复用时创建新节点并完整覆盖 type/state/payload，最后以 release 写绝对 `publishedSequence`，不遍历重置旧 publication。scanner 只在 disposition 阻止 worker 继续取任务、gate 关闭且 active publisher 排空后的静默期遍历稳定链，不引入段生命周期锁。池最多保留 `maxPooledSegments` 个槽数组，默认 `8`，`0` 禁用池化，超限存储交给 GC。快照报告 `allocatedQueueSegments`（活跃加池中）与 `activeQueueSegments`（活跃），并保持 active 不大于 allocated。无界通过共享 ledger 如实派生 64 位 outstanding，但不以容量拒绝任务。
 
 两种队列运行同一组参数化 queue contract 和 EventLoop contract。禁止在无界实现中复制 kernel，禁止为了 LMAX 名称让无界队列伪装成固定 RingBuffer。
 
@@ -391,7 +391,7 @@ autoconfigure POM 将 `disruptor-concurrent`、`spring-boot-health` 和 `microme
 - `shutdownNow()` RETURNING 单赢家从 ordinary 槽和 tracked index 返回原始未开始 Runnable，不返回 running task；DISCARDING 取消未开始 Future 且不返回任务；
 - bounded deadline 升级 immediate 但不伪造 termination，worker 卡死时异步处置仍取消未开始 Future；
 - Group 全局 accepting、child 先本地 enter 后校验 owner、固定 affinity、child 生命周期所有权、child fail-stop、关闭 drain 顺序、共享 deadline 和真实聚合终止；
-- 无界发布代际、段生命周期锁、段池上限（默认 8、0 禁用）及 active/allocated snapshot 不变量；
+- 无界发布代际、CAS 段链、静默期扫描、槽数组池上限（默认 8、0 禁用）及 active/allocated snapshot 不变量；
 - Boot 4.1 lifecycle、health、metrics 三组条件装配及 callback 时序；
 - Commons 能力矩阵中的每个“覆盖/替代/增强/不复制”都有源码、测试、示例或明确文档证据；
 - JMH 对比原生 LMAX、core managed publish、bounded/unbounded EventLoop、JDK 单线程 executor，并在可独立构建参考仓时增加 Commons profile；不设置机器敏感硬阈值。
@@ -405,7 +405,7 @@ autoconfigure POM 将 `disruptor-concurrent`、`spring-boot-health` 和 `microme
 3. 任务基元、取消、显式上下文和 module；
 4. packed admission gate、tracked-only accepted index、task disposition 与两种 TaskQueue 契约；
 5. bounded 完整 executor、scheduler 和 JDK shutdown；
-6. unbounded typed segment、发布代际、生命周期锁与池化复用全部 kernel 契约；
+6. unbounded typed segment、发布代际、CAS 段链、静默期扫描与池化复用全部 kernel 契约；
 7. Group 全局 `accepting`、child gate drain、所有权、选择、fail-stop 与聚合终止；
 8. Boot 4.1 生命周期、健康和指标；
 9. 使用示例与 Commons 事实矩阵；

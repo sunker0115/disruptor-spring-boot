@@ -133,12 +133,12 @@ bounded gate 不使用该账本，继续在 enter 时原子预留容量，保证
 
 - Segment 和 Cell 只在首次分配时完整初始化。
 - worker 在 `releaseCurrentSlot()` 清除 ordinary/tracked 引用；整段只有在全部槽已消费/释放后才能回收。
-- 复用时只设置新 segment id 和 links，不遍历 Cell，不把 publishedSequence 写回哨兵。
+- 复用 `Cell[]` 时创建具有新 id 的 segment 节点，不遍历 Cell，不把 publishedSequence 写回哨兵。
 - producer 为新任务完整覆盖 type、ordinaryState、ordinary/tracked，最后 `setRelease` 新绝对 sequence。
 - worker/scanner 以 `getAcquire == expectedSequence` 判定该代已发布；旧 sequence 无法冒充新代。
 - `tail` 与每段 `next` 通过 CAS/release 发布。一个 producer 成功链接新段，其他 producer 观察该链接并协助推进 tail；CAS 失败代表全局进度。
-- 每段保留 `prev`，让已经取得较早 sequence 的落后 producer 从较新 tail 向前定位；目标 publication hole 未补齐前，唯一消费者不能越过并回收该段，因此引用保持有效。
-- 唯一消费者在整段全部消费并释放后推进 head，再把旧段放入固定容量的 `AtomicReferenceArray<Segment>` 池；producer 以 `getAndSet(null)` 取得唯一所有权。池满时放弃复用并修正 allocated 计数。
+- segment 节点只保留不可变 id 与永不改写的 `next`；tail 已越过目标段时，落后 producer 从 head 向后定位。目标 publication hole 未补齐前，唯一消费者不能越过并回收该段，因此引用保持有效。
+- 唯一消费者在整段全部消费并释放后推进 head，再把旧段的 `Cell[]` 放入固定容量的 `AtomicReferenceArray<Cell[]>` 池；producer 以 `getAndSet(null)` 取得唯一所有权，并为复用存储创建新节点。池满时放弃复用并修正 allocated 计数。
 - 池操作只扫描固定的 `maxPooledSegments` 个槽位，可能保守地放弃复用但不能阻塞；池大小仍是构建期固定值。
 - scanner 不与正常段回收并发：RETURNING/DISCARDING 先阻止 worker 获取下一任务，关闭 gate 并等待 active publishers 归零后，head/tail 链在扫描期间稳定。scanner 不修改链接、不推进游标。
 - segment 统计使用边界级原子计数或可重试快照，不在每任务路径更新；必须持续满足 `allocated >= active >= 1`。

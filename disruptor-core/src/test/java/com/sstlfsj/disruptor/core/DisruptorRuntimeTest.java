@@ -243,7 +243,7 @@ class DisruptorRuntimeTest {
                         .threadFactory(runnable -> {
                             threadFactoryEntered.countDown();
                             awaitUninterruptibly(releaseThreadFactory);
-                            return new Thread(runnable, "stuck-startup-worker");
+                            return supervisedTestThread(runnable, "stuck-startup-worker");
                         })
                         .topology(disruptor -> disruptor.handleEventsWith(
                                 (event, sequence, endOfBatch) -> {
@@ -547,7 +547,7 @@ class DisruptorRuntimeTest {
                     if (threadNumber.incrementAndGet() == 2) {
                         throw new IllegalStateException("second consumer cannot start");
                     }
-                    Thread thread = new Thread(runnable, "partial-start-1");
+                    Thread thread = supervisedTestThread(runnable, "partial-start-1");
                     startedThread.set(thread);
                     return thread;
                 })
@@ -613,6 +613,7 @@ class DisruptorRuntimeTest {
         };
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "slow", TestEvent.class, () -> new TestEvent("slot"))
+                .threadFactory(runnable -> supervisedTestThread(runnable, "disruptor-slow-1"))
                 .topology(disruptor -> disruptor.handleEventsWith(blocking))
                 .build();
         DisruptorRuntime runtime = DisruptorRuntime.builder()
@@ -1034,6 +1035,7 @@ class DisruptorRuntimeTest {
         CountDownLatch failedHandlerEntered = new CountDownLatch(1);
         PipelineSpec<TestEvent> failing = PipelineSpec.builder(
                         "failing", TestEvent.class, () -> new TestEvent("slot"))
+                .threadFactory(runnable -> supervisedTestThread(runnable, "disruptor-failing-1"))
                 .topology(disruptor -> disruptor.handleEventsWith(
                         (event, sequence, endOfBatch) -> {
                             failedHandlerEntered.countDown();
@@ -1428,6 +1430,13 @@ class DisruptorRuntimeTest {
     }
 
     private static final class OtherEvent {
+    }
+
+    private static Thread supervisedTestThread(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        // 故障已通过 Runtime stage/snapshot 断言，避免预期传播重复写入 CI 注解。
+        thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+        return thread;
     }
 
     private static final class ThrowingHaltProcessor implements EventProcessor {

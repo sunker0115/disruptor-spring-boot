@@ -39,6 +39,7 @@ class ExceptionHandlingTest {
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                 "strict", TestEvent.class, TestEvent::new)
                 .bufferSize(16)
+                .threadFactory(runnable -> supervisedTestThread(runnable, "disruptor-strict-1"))
                 .topology(disruptor -> disruptor.handleEventsWith(upstream)
                         .then((event, sequence, endOfBatch) -> downstream.countDown()))
                 .build();
@@ -132,6 +133,13 @@ class ExceptionHandlingTest {
     private static DisruptorTopology<TestEvent> noopTopology() {
         return disruptor -> disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
         });
+    }
+
+    private static Thread supervisedTestThread(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        // 故障已通过 Runtime 聚合结果断言，避免预期传播重复写入 CI 注解。
+        thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+        return thread;
     }
 
     private static final class NoopExceptionHandler implements ExceptionHandler<TestEvent> {

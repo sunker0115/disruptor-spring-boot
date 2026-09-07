@@ -38,8 +38,11 @@ class EventLoopGroupShutdownTest {
                         "startup-failure",
                         3,
                         (parent, childIndex) -> {
+                            String childName = "startup-failure-" + childIndex;
                             EventLoopBuilder<DisruptorEventLoop> builder =
-                                    EventLoopBuilder.bounded("startup-failure-" + childIndex, 8);
+                                    EventLoopBuilder.bounded(childName, 8)
+                                            .threadFactory(command -> supervisedTestThread(
+                                                    command, childName + "-worker"));
                             if (childIndex == 1) {
                                 builder.module(new EventLoopModule() {
                                     @Override
@@ -83,14 +86,21 @@ class EventLoopGroupShutdownTest {
                         "thread-start-failure",
                         3,
                         (parent, childIndex) -> {
+                            String childName = "thread-start-failure-" + childIndex;
                             EventLoopBuilder<DisruptorEventLoop> builder = EventLoopBuilder
-                                    .bounded("thread-start-failure-" + childIndex, 8);
+                                    .bounded(childName, 8)
+                                    .threadFactory(command -> supervisedTestThread(
+                                            command, childName + "-worker"));
                             if (childIndex == 1) {
-                                builder.threadFactory(command -> new Thread(command) {
-                                    @Override
-                                    public synchronized void start() {
-                                        throw original;
-                                    }
+                                builder.threadFactory(command -> {
+                                    Thread thread = new Thread(command, childName + "-worker") {
+                                        @Override
+                                        public synchronized void start() {
+                                            throw original;
+                                        }
+                                    };
+                                    thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+                                    return thread;
                                 });
                             }
                             return builder.build();
@@ -494,6 +504,13 @@ class EventLoopGroupShutdownTest {
                 // 真实退出仍由测试控制。
             }
         }
+    }
+
+    private static Thread supervisedTestThread(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        // 故障已通过 Group stage/snapshot 断言，避免预期传播重复写入 CI 注解。
+        thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+        return thread;
     }
 
     private record NamedRunnable(String name) implements Runnable {

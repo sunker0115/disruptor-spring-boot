@@ -72,7 +72,7 @@ class DisruptorPipelineTest {
                     if (created.incrementAndGet() == 2) {
                         throw expected;
                     }
-                    Thread thread = new Thread(runnable, "partial-worker");
+                    Thread thread = supervisedTestThread(runnable, "partial-worker");
                     firstThread.set(thread);
                     return thread;
                 })
@@ -415,7 +415,7 @@ class DisruptorPipelineTest {
         CountDownLatch allowEntry = new CountDownLatch(1);
         PipelineSpec<TestEvent> spec = PipelineSpec.builder(
                         "close-wins-start", TestEvent.class, TestEvent::new)
-                .threadFactory(runnable -> new Thread(() -> {
+                .threadFactory(runnable -> supervisedTestThread(() -> {
                     threadCreated.countDown();
                     awaitUninterruptibly(allowEntry);
                     runnable.run();
@@ -671,6 +671,13 @@ class DisruptorPipelineTest {
             Thread.onSpinWait();
         }
         assertEquals(state, thread.getState());
+    }
+
+    private static Thread supervisedTestThread(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        // 故障已通过 supervisor stage/snapshot 断言，避免预期传播重复写入 CI 注解。
+        thread.setUncaughtExceptionHandler((ignored, failure) -> { });
+        return thread;
     }
 
     private static class ObservingProcessor implements EventProcessor {
