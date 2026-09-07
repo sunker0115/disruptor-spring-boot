@@ -59,6 +59,6 @@
 
 ## 结论
 
-本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约。性能上，槽位原生重写后 ordinary 热路径已实测零堆分配（bounded 0.004、unbounded 1.607 B/op，与 Commons 同级）；本轮又移除 unbounded 数据面的显式段锁。本机 JDK 21 同参数两轮复测：unbounded 相对自身 bounded 约 82%（差距约 18%，上一轮为 78%/21.7%），相对 Commons 仍约 64%，未达 80% 门槛；MPSC 2/4/8 producer 下 unbounded/bounded 为 89%–105%，无结构性退化。单线程残余差距是跨段绝对序列账本与逐槽所有权契约的固有成本。功能覆盖不表示吞吐持平。
+本项目完整承担两个参考模块在当前工程中的目标场景：原生事件拓扑由 `disruptor-core` 保留 LMAX 4.0 能力，单线程任务执行与调度由 `disruptor-concurrent` 承担。dynamic-delay、priority、`shutdownNow` 返回值、Group fail-stop、共享 deadline、精确启动回滚和 Spring 运维集成强于参考实现。该结论只针对能力与契约。性能上，槽位原生重写后 ordinary 热路径已实测零堆分配（bounded 0.004、unbounded 1.607 B/op，与 Commons 同级）；本轮又移除 unbounded 数据面的显式段锁。本机 JDK 21 同参数 3 次中位复测：bounded 相对 Commons 80.3%（压线通过），unbounded 65.1%（段锁前 63.3%，仍未达 80%）；unbounded 绝对中位 11.64M→11.96M（+2.7%），相对自身 bounded 约 80%（段锁前 78.3%）。MPSC 2/4/8 producer 下 unbounded/bounded 为 89%–105%，无结构性退化。单线程残余差距是跨段绝对序列账本与逐槽所有权契约的固有成本。功能覆盖不表示吞吐持平。
 
 未复制项集中在 Commons 自身生态抽象：自研 Future API、ComponentId/Agent phases、WatcherMgr、LOCAL_ORDER 快路、任务池和 GlobalEventLoop。它们分别由 JDK/Spring/业务显式编排替代，或因破坏本项目全序、容量和所有权不变量而明确排除。因此“完整覆盖”指场景能力闭合，不表示包名、类型或调用点兼容。

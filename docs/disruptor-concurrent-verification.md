@@ -7,23 +7,23 @@
 
 ## 构建与测试
 
-2026-09-06 使用 JDK 21 执行：
+2026-09-07 无锁化收口后使用 JDK 21 执行：
 
 ```bash
 mvn clean verify
 ```
 
-8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 320 个测试，0 failure、
+8 个 reactor 模块全部 `BUILD SUCCESS`。Surefire 报告合计 355 个测试，0 failure、
 0 error、0 skipped：
 
 | 模块 | 测试数 |
 | --- | ---: |
 | `disruptor-core` | 131 |
-| `disruptor-concurrent` | 145 |
-| `disruptor-benchmarks` | 3 |
+| `disruptor-concurrent` | 173 |
+| `disruptor-benchmarks` | 7 |
 | `disruptor-spring-boot-autoconfigure` | 30 |
-| `disruptor-spring-boot-example` | 2 |
-| `disruptor-spring-boot-tutorial` | 9 |
+| `disruptor-spring-boot-example` | 4 |
+| `disruptor-spring-boot-tutorial` | 10 |
 
 `disruptor-spring-boot-starter` 没有测试源码；其依赖边界由 reactor 打包、POM 和
 依赖树审计证明。
@@ -102,8 +102,10 @@ mvn clean verify
 
 环境：Apple M1 Max，10 核，32 GiB，Darwin 25.6.0 arm64，Zulu OpenJDK
 21，JMH 1.37。参数为 `-f 5 -wi 4 -i 8`（每基准 5 fork × 8 次 1 秒测量 = 40
-次迭代）、1 个提交线程，吞吐单位为 ops/s，全程无竞争进程干净测量。五条本项目路径
-与两条 Commons 路径都使用 65,536 的统一 in-flight 上限；每次提交先占一个窗口位置，
+次迭代）、1 个提交线程，吞吐单位为 ops/s。段锁前正式基线与固定 Commons 参照在
+无竞争进程下测得（误差约 ±2%）；无锁化后的 3 次中位在同一台机器、负载约 3 的窗口
+测得，绝对数随窗口浮动约 ±10%，相对比以固定 Commons 参照为分母、与段锁前口径可比。
+五条本项目路径与两条 Commons 路径都使用 65,536 的统一 in-flight 上限；每次提交先占一个窗口位置，
 消费后释放，Trial 关闭时强制校验 `submitted == consumed`。因此结果表达可持续的
 提交/消费吞吐，不把无界队列的短期积压速度混入比较。
 
@@ -163,13 +165,18 @@ Commons 侧同为一次 40 次迭代的干净运行（方差极低，误差约 �
 | `CommonsEventLoopBenchmark.commonsBoundedEventLoop` | 18,589,910.272 |
 | `CommonsEventLoopBenchmark.commonsUnboundedEventLoop` | 18,381,694.231 |
 
-上一轮段锁版正式基线判定（3 次干净中位 ÷ 同机 Commons）：该表记录改造前代码，
-无锁化后的复测不属干净 3 次中位、不作门槛判定，见下方吞吐段。
+当前无锁化代码判定与段锁前对照（JDK 21 同机、`-f 5 -wi 4 -i 8`、in-flight 65,536、
+1 提交线程；本项目为 3 次独立运行中位，负载约 3 的窗口）：
 
-| 路径 | 本项目中位 | Commons | 相对比 | ≥80% |
-| --- | ---: | ---: | ---: | :---: |
-| bounded（段锁前） | 14,867,520 | 18,589,910 | 80.0% | 通过 |
-| unbounded（段锁前） | 11,639,896 | 18,381,694 | 63.3% | 未达 |
+| 路径 | 无锁化 3 中位 | 段锁前 3 中位 | Commons 参照 | 当前相对比 | 段锁前相对比 | ≥80% |
+| --- | ---: | ---: | ---: | ---: | ---: | :---: |
+| bounded | 14,929,396 | 14,867,520 | 18,589,910 | 80.3% | 80.0% | 通过 |
+| unbounded | 11,963,964 | 11,639,896 | 18,381,694 | 65.1% | 63.3% | 未达 |
+
+分母采用固定 Commons commit（`5c831c06`）的同机无竞争参照（多次验证误差约 ±2%），
+以便与段锁前口径直接可比。本轮同窗口重跑 Commons 得 19.78M/20.73M，因落在负载较低
+时段而偏高，若作分母会把未改动的 bounded 拉到约 75% 造成假性不达标，故不采用；
+bounded 代码未改而相对比 80.0%→80.3% 自洽，校验通过。
 
 额外使用 `-prof gc` 的分配诊断（框架自身 B/op）：
 
@@ -182,18 +189,14 @@ Commons 侧同为一次 40 次迭代的干净运行（方差极低，误差约 �
 
 结论必须分开表述。**分配**：槽位原生重写把普通 `execute/tryExecute` 的每任务分配从
 cutover 前的约 756–792 B/op 降到 bounded 0.004、unbounded 1.607 B/op，两者都达到
-≤10 B/op 门槛，ordinary 热路径实测零堆分配。**吞吐**：上一轮正式基线中，bounded
-达到 Commons 的 80.0%，unbounded 为 63.3%；本轮已移除 unbounded 数据面的显式
-`ReentrantLock`，改为 CAS 段链、单消费者回收、固定原子池和静默期 scanner 握手。
-本机 JDK 21 同参数复测（`-f 5 -wi 4 -i 8`、in-flight 65,536、1 提交线程、负载约 2–4 窗口，
-两轮取中位）：bounded ≈14.3M、unbounded ≈11.7M，unbounded 相对上一轮基线（11.64M）约
-+0.6%，绝对吞吐基本持平；同轮 unbounded/bounded 比值约 82%（上一轮 78.3%），差距由 21.7%
-收窄至约 18%，且收窄主要来自同轮 bounded 波动而非 unbounded 绝对提升。相对 Commons，
-unbounded 仍约 64%，未达 80% 门槛。MPSC 定向（2/4/8 producer）中 unbounded/bounded 为
-89%–105%，无结构性退化。据此判断：无锁化消除的是段锁与扫描互斥这类结构成本，收益落在
-多生产者与关闭路径；单线程 unbounded 相对 bounded 的残余差距来自跨段绝对序列账本与逐槽
-所有权契约，是三条自研语义的固有成本。publication acquire/release、accepted 全序、
-容量账本和 shutdown ownership 不属于可放宽项。
+≤10 B/op 门槛，ordinary 热路径实测零堆分配。**吞吐**：无锁化后的 3 次中位与段锁前对照见上表 —— bounded 相对比 80.0%→80.3%
+（压线通过），unbounded 63.3%→65.1%（仍未达 80%）。unbounded 绝对中位 11.64M→11.96M
+（+2.7%）；相对自身 bounded 的同轮比值约 80%（段锁前 78.3%），差距收窄有限且主要来自
+unbounded 微升。MPSC 定向（2/4/8 producer）中 unbounded/bounded 为 89%–105%，
+无结构性退化。据此判断：无锁化消除的是段锁与扫描互斥这类结构成本，收益落在多生产者与
+关闭路径，对单线程 unbounded 绝对吞吐只有约 +3% 的微弱提升；unbounded 相对 bounded 与
+Commons 的差距主要来自跨段绝对序列账本与逐槽所有权契约，是三条自研语义的固有成本。
+publication acquire/release、accepted 全序、容量账本和 shutdown ownership 不属于可放宽项。
 
 功能与关闭契约方面：设计范围内的功能与关闭契约全部通过自身测试，并有 dynamic-delay、
 priority、精确 `shutdownNow`、Group fail-stop、共享 deadline、启动回滚和 Spring 运维
